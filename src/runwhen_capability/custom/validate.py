@@ -11,6 +11,7 @@ Diagnostic, not an exception.
 from __future__ import annotations
 
 import json
+import unicodedata
 
 import yaml
 from pydantic import ValidationError
@@ -30,14 +31,18 @@ from .diagnostics import (
 )
 from .manifest import (
     API_VERSION,
+    INPUT_NAME_RE,
     MAX_BUNDLE_BYTES,
     MAX_FILE_BYTES,
     MAX_FILES,
+    SLUG_RE,
     InputSpec,
     Manifest,
     OutputSpec,
     input_env_name,
     is_allowed_path,
+    is_reserved_env_name,
+    python_kwarg_name,
     task_file_language,
 )
 from .schema_notation import SchemaNotationError, compile_schema_notation
@@ -111,6 +116,7 @@ def validate(files: dict[str, str]) -> list[Diagnostic]:
     if manifest is None:
         return diagnostics
 
+    diagnostics += _check_names(raw, manifest)
     diagnostics += _check_duplicate_task_names(raw, manifest)
     diagnostics += _check_setup_file(files, raw, manifest)
     diagnostics += _check_tasks(files, raw, manifest)
@@ -223,6 +229,135 @@ def _check_paths_and_limits(files: dict[str, str]) -> list[Diagnostic]:
                 ),
             )
         )
+    diagnostics += _check_path_collisions(files)
+    return diagnostics
+
+
+def _check_path_collisions(files: dict[str, str]) -> list[Diagnostic]:
+    """Two paths that would land on the same file, or a path that would
+    have to be both a file and a directory, once written to disk. On a
+    case-insensitive or normalization-insensitive filesystem `tasks/a.sh`
+    and `tasks/A.sh` are one file -- whichever is written last would run in
+    place of the one validate() actually checked."""
+    diagnostics = []
+    seen: dict[str, str] = {}
+    for path in sorted(files):
+        key = unicodedata.normalize("NFC", path).casefold()
+        if key in seen:
+            diagnostics.append(
+                Diagnostic(
+                    code=E_DUPLICATE_NAME,
+                    file=path,
+                    message=f"{path!r} and {seen[key]!r} differ only in case or normalization",
+                )
+            )
+        else:
+            seen[key] = path
+    for path in files:
+        parts = path.split("/")
+        for depth in range(1, len(parts)):
+            prefix = "/".join(parts[:depth])
+            if prefix in files:
+                diagnostics.append(
+                    Diagnostic(
+                        code=E_PATH_NOT_ALLOWED,
+                        file=path,
+                        message=f"{path!r} needs {prefix!r} to be a directory, but it is a file",
+                    )
+                )
+                break
+    return diagnostics
+
+
+# -- names ----------------------------------------------------------------------
+
+
+def _check_names(raw, manifest: Manifest) -> list[Diagnostic]:
+    """The capability name and every task name are lowercase slugs; every
+    input name is an identifier that maps onto a non-reserved env var, and
+    no two inputs a task sees map onto the same env var or Python keyword
+    argument (one would silently overwrite the other)."""
+    diagnostics = []
+    if not SLUG_RE.match(manifest.name):
+        diagnostics.append(
+            Diagnostic(
+                code=E_MANIFEST_SCHEMA,
+                file="capability.yaml",
+                line=line_of(raw),
+                path="name",
+                message=f"name {manifest.name!r} must be a lowercase slug (a-z, 0-9, '-')",
+            )
+        )
+
+    raw_tasks = raw.get("tasks") or []
+    diagnostics += _check_input_names(manifest.inputs, "inputs", line_of(raw.get("inputs")))
+    for index, task in enumerate(manifest.tasks):
+        raw_task = raw_tasks[index] if index < len(raw_tasks) else {}
+        task_line = line_of(raw_task)
+        if not SLUG_RE.match(task.name):
+            diagnostics.append(
+                Diagnostic(
+                    code=E_MANIFEST_SCHEMA,
+                    file="capability.yaml",
+                    line=task_line,
+                    path=f"tasks[{index}].name",
+                    message=f"task name {task.name!r} must be a lowercase slug (a-z, 0-9, '-')",
+                )
+            )
+        raw_inputs = raw_task.get("inputs") if isinstance(raw_task, dict) else None
+        inputs_line = line_of(raw_inputs) or task_line
+        diagnostics += _check_input_names(task.inputs, f"tasks[{index}].inputs", inputs_line)
+        diagnostics += _check_input_collisions(
+            {**manifest.inputs, **task.inputs}, f"tasks[{index}].inputs", inputs_line
+        )
+    return diagnostics
+
+
+def _check_input_names(
+    inputs: dict[str, InputSpec], loc: str, line: int | None
+) -> list[Diagnostic]:
+    diagnostics = []
+    for name in inputs:
+        if not INPUT_NAME_RE.match(name):
+            message = (
+                f"input name {name!r} must be an identifier (a letter, then letters, digits, _)"
+            )
+        elif is_reserved_env_name(input_env_name(name)):
+            message = f"input name {name!r} would set the reserved env var {input_env_name(name)!r}"
+        else:
+            continue
+        diagnostics.append(
+            Diagnostic(
+                code=E_MANIFEST_SCHEMA,
+                file="capability.yaml",
+                line=line,
+                path=f"{loc}.{name}",
+                message=message,
+            )
+        )
+    return diagnostics
+
+
+def _check_input_collisions(
+    inputs: dict[str, InputSpec], loc: str, line: int | None
+) -> list[Diagnostic]:
+    diagnostics = []
+    for mapping in (input_env_name, python_kwarg_name):
+        seen: dict[str, str] = {}
+        for name in inputs:
+            mapped = mapping(name)
+            if mapped in seen:
+                diagnostics.append(
+                    Diagnostic(
+                        code=E_DUPLICATE_NAME,
+                        file="capability.yaml",
+                        line=line,
+                        path=f"{loc}.{name}",
+                        message=f"inputs {seen[mapped]!r} and {name!r} both arrive as {mapped!r}",
+                    )
+                )
+            else:
+                seen[mapped] = name
     return diagnostics
 
 

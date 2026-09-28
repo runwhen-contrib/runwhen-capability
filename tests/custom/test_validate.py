@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from bundle_fixtures import load_bundle
 
 from runwhen_capability.custom import validate
@@ -454,3 +455,97 @@ def test_diagnostics_carry_file_and_line_when_available():
     assert diagnostics
     assert diagnostics[0].file == "capability.yaml"
     assert diagnostics[0].line is not None
+
+
+# -- paths and names the bundle host would write or export unsafely -----------
+
+_NAMED_MANIFEST = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: {name}
+inputs:
+  {input}: {{ type: secret, optional: true }}
+tasks:
+  - name: {task}
+    file: tasks/t.sh
+"""
+
+
+def _named(name="x", input_name="token", task="t") -> dict[str, str]:
+    return {
+        "capability.yaml": _NAMED_MANIFEST.format(name=name, input=input_name, task=task),
+        "tasks/t.sh": "echo hi\n",
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tasks/..",
+        "lib/x/..",
+        "tasks/./x.sh",
+        "tasks//x.sh",
+        "tasks/",
+        "tasks/a\x00b.sh",
+        "tasks/a\nb.sh",
+        "tasks\\..\\x.sh",
+        "/tasks/x.sh",
+        "tasks/" + "a" * 300,
+    ],
+)
+def test_e_path_not_allowed_on_a_path_that_is_not_a_plain_relative_file(path):
+    files = {**_named(), path: "echo\n"}
+    assert any(d.code == E_PATH_NOT_ALLOWED and d.file == path for d in validate(files))
+
+
+def test_paths_that_collide_on_a_case_insensitive_filesystem_are_duplicates():
+    files = {**_named(), "tasks/T.sh": "kubectl delete pod x\n"}
+    assert any(d.code == E_DUPLICATE_NAME for d in validate(files))
+
+
+def test_a_path_that_would_need_a_file_to_be_a_directory_is_not_allowed():
+    files = {**_named(), "lib/a": "x\n", "lib/a/b.sh": "y\n"}
+    assert any(d.code == E_PATH_NOT_ALLOWED and d.file == "lib/a/b.sh" for d in validate(files))
+
+
+@pytest.mark.parametrize("input_name", ['"/tmp/x"', '"../x"', '"a-b"', '"a b"', "_x"])
+def test_an_input_name_that_is_not_an_identifier_is_rejected(input_name):
+    diagnostics = validate(_named(input_name=input_name))
+    assert any(d.code == E_MANIFEST_SCHEMA and "identifier" in d.message for d in diagnostics)
+
+
+@pytest.mark.parametrize(
+    "input_name", ["path", "home", "ldPreload", "bashEnv", "rwOutputFd", "ifs"]
+)
+def test_an_input_name_that_maps_onto_a_reserved_env_var_is_rejected(input_name):
+    diagnostics = validate(_named(input_name=input_name))
+    assert any(d.code == E_MANIFEST_SCHEMA and "reserved" in d.message for d in diagnostics)
+
+
+def test_a_kubeconfig_credential_input_may_still_set_kubeconfig():
+    assert validate(load_bundle("pgbouncer-health")) == []
+
+
+def test_two_inputs_that_arrive_under_the_same_name_are_duplicates():
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+inputs:
+  maxWait: { type: integer, default: 1 }
+tasks:
+  - name: t
+    file: tasks/t.sh
+    inputs:
+      max_wait: { type: integer, default: 2 }
+""",
+        "tasks/t.sh": "echo $MAX_WAIT\n",
+    }
+    assert any(d.code == E_DUPLICATE_NAME for d in validate(files))
+
+
+@pytest.mark.parametrize("name", ["Bad", "has space", "under_score", "-lead", "trail-", "a" * 64])
+def test_capability_and_task_names_must_be_lowercase_slugs(name):
+    as_capability = validate(_named(name=f'"{name}"'))
+    as_task = validate(_named(task=f'"{name}"'))
+    assert any(d.code == E_MANIFEST_SCHEMA and d.path == "name" for d in as_capability)
+    assert any(d.code == E_MANIFEST_SCHEMA and d.path == "tasks[0].name" for d in as_task)

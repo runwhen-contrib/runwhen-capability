@@ -41,6 +41,14 @@ def input_env_name(name: str) -> str:
     return _CAMEL_RE.sub("_", name).upper()
 
 
+def python_kwarg_name(name: str) -> str:
+    """The keyword argument a declared input's value arrives on in a Python
+    task's `main(ctx, **inputs)`: camelCase -> snake_case ("maxWait" ->
+    "max_wait"). Shared by validate.py and bundle.py for the same reason
+    input_env_name() is."""
+    return _CAMEL_RE.sub("_", name).lower()
+
+
 class InputSpec(BaseModel):
     """One `inputs.<name>` entry, at capability or task level."""
 
@@ -94,15 +102,69 @@ class Manifest(BaseModel):
     tasks: list[TaskSpec] = Field(default_factory=list)
 
 
+MAX_PATH_CHARS = 255
+
+# No control characters (NUL, newline, ...) and no backslash anywhere in a
+# bundle path: they are never needed, they break the unambiguous encoding
+# content_hash() relies on, and a backslash is a separator on some hosts.
+_BAD_PATH_CHARS_RE = re.compile(r"[\x00-\x1f\x7f\\]")
+
+
 def is_allowed_path(path: str) -> bool:
-    """validate.py's E_PATH_NOT_ALLOWED: `path` must be relative, contain no
-    ".." segment, and sit under one of ALLOWED_DIR_PREFIXES or be one of
-    ALLOWED_ROOT_FILES."""
-    if path.startswith("/") or path.startswith("../") or "/../" in path or path == "..":
+    """validate.py's E_PATH_NOT_ALLOWED: `path` must be a plain relative
+    file path -- non-empty "/"-separated segments, none of them "." or
+    "..", no control characters or backslashes, not over MAX_PATH_CHARS --
+    and sit under one of ALLOWED_DIR_PREFIXES or be one of
+    ALLOWED_ROOT_FILES. The bundle host writes each file at exactly this
+    path under its own directory, so anything that could resolve elsewhere
+    (or to a directory) is refused here, before anything is written."""
+    if not path or len(path) > MAX_PATH_CHARS or _BAD_PATH_CHARS_RE.search(path):
+        return False
+    segments = path.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
         return False
     if path in ALLOWED_ROOT_FILES:
         return True
     return any(path.startswith(prefix) for prefix in ALLOWED_DIR_PREFIXES)
+
+
+# `name` (the capability) and every task name: a lowercase slug.
+SLUG_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+# An input name: an identifier. It becomes an env var name (bash), a
+# keyword argument (Python) and a file name (secret/credential inputs), so
+# nothing else is safe in all three places.
+INPUT_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+# Env var names an input must never map onto (input_env_name): the host's
+# own variables, and variables the shell, the dynamic loader or Python
+# act on before a task's first line runs. KUBECONFIG is deliberately not
+# here -- a `kubeconfig` credential input setting it is the documented
+# behaviour.
+RESERVED_ENV_NAMES = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "PWD",
+        "OLDPWD",
+        "SHELL",
+        "USER",
+        "LOGNAME",
+        "TMPDIR",
+        "IFS",
+        "ENV",
+        "CDPATH",
+        "GLOBIGNORE",
+        "PS4",
+        "SHELLOPTS",
+        "BASHOPTS",
+    }
+)
+RESERVED_ENV_PREFIXES = ("RW_", "BASH", "LD_", "DYLD_", "PYTHON")
+
+
+def is_reserved_env_name(env_name: str) -> bool:
+    return env_name in RESERVED_ENV_NAMES or env_name.startswith(RESERVED_ENV_PREFIXES)
 
 
 TaskFileLanguage = Literal["python", "bash"]

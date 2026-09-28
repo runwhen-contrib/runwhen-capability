@@ -63,7 +63,7 @@ from ._rw_sh import RW_SH
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT
 from .custom.hashing import content_hash
-from .custom.manifest import Manifest, input_env_name, task_file_language
+from .custom.manifest import Manifest, input_env_name, python_kwarg_name, task_file_language
 from .models import BundleRequestEnvelope, ResultEnvelope, SetupResult, TaskResult
 
 LOG_TAIL_BYTES = 64 * 1024
@@ -74,12 +74,7 @@ _DRAIN_JOIN_TIMEOUT = 5
 _READ_CHUNK = 65536
 _REDACTED = "***REDACTED***"
 
-_CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 _DURATION_RE = re.compile(r"^\d+(\.\d+)?(ms|s|m|h|d)$")
-
-
-def _camel_to_snake(name: str) -> str:
-    return _CAMEL_RE.sub("_", name).lower()
 
 
 @dataclass
@@ -600,7 +595,7 @@ def _execute(
         for name, value in resolved_inputs.items():
             env[input_env_name(name)] = value if isinstance(value, str) else json.dumps(value)
     else:
-        python_kwargs = {_camel_to_snake(name): value for name, value in resolved_inputs.items()}
+        python_kwargs = {python_kwarg_name(name): value for name, value in resolved_inputs.items()}
         argv = [sys.executable, "-m", "runwhen_capability._bundle_entrypoint"]
         env = {
             **base_env,
