@@ -83,6 +83,11 @@ from .models import BundleRequestEnvelope, ResultEnvelope, SetupResult, TaskResu
 LOG_TAIL_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 1024 * 1024
+# Output events a task may write before the rest are discarded -- well above
+# MAX_RESULT_BYTES so an oversized list can still be truncated to fit, but
+# bounded, since the host holds every event in memory until the task ends.
+MAX_EVENT_STREAM_BYTES = 8 * MAX_RESULT_BYTES
+MAX_VALUE_DEPTH = 64
 DEFAULT_TASK_DEADLINE = 300  # seconds; used when the caller gives no deadline
 _DRAIN_JOIN_TIMEOUT = 5
 _READ_CHUNK = 65536
@@ -286,7 +291,7 @@ def _run_setup_or_task(
             None,
         )
 
-        exit_code, events, log_tail, timed_out = _execute(
+        exit_code, stream, log_tail, timed_out = _execute(
             files_dir=files_dir,
             file_path=file_path,
             language=language,
@@ -312,7 +317,8 @@ def _run_setup_or_task(
                 log_tail=log_tail,
             )
 
-        skip_event = next((e for e in events if e.get("op") == "skip"), None)
+        events = stream.events
+        skip_event = next((e for e in events if e["op"] == "skip"), None)
         if skip_event is not None:
             reason = skip_event.get("reason") or ""
             if is_setup:
@@ -324,15 +330,16 @@ def _run_setup_or_task(
                 )
             return _RunOutcome(status="skipped", reason=reason, log_tail=log_tail)
 
+        # _parse_event() already guaranteed every event's shape: op is
+        # set/append/skip, name a string, reason a string.
         outputs: dict[str, Any] = {}
         for event in events:
-            op, name = event.get("op"), event.get("name")
-            if op == "set" and name is not None:
-                outputs[name] = event.get("value")
-            elif op == "append" and name is not None:
-                bucket = outputs.setdefault(name, [])
+            if event["op"] == "set":
+                outputs[event["name"]] = event["value"]
+            elif event["op"] == "append":
+                bucket = outputs.setdefault(event["name"], [])
                 if isinstance(bucket, list):
-                    bucket.append(event.get("value"))
+                    bucket.append(event["value"])
 
         if declared_outputs is not None:
             # A name the source produced but never declared already failed
@@ -343,6 +350,17 @@ def _run_setup_or_task(
         errors: list[str] = []
         if exit_code != 0:
             errors.append(f"process exited {exit_code}")
+        if stream.overflowed:
+            errors.append(
+                f"{E_OUTPUT_TOO_LARGE}: the task wrote more than {MAX_EVENT_STREAM_BYTES} bytes "
+                "of output events; everything after that was discarded"
+            )
+        if stream.malformed:
+            # Noted, not failed: every well-formed line still counts.
+            errors.append(
+                f"{stream.malformed} output line(s) were not a well-formed "
+                "rw_set/rw_append/rw_skip event and were ignored"
+            )
 
         if declared_outputs is not None:
             for name, value in outputs.items():
@@ -572,12 +590,27 @@ def _drain_text(stream, tail: _TailBuffer) -> None:
         tail.write(chunk)
 
 
-def _drain_events(fd: int, events: list[dict]) -> None:
-    """Reads the private output-fd to EOF, parsing one JSON object per line.
-    A malformed line (a task bug: `rw_append`/`rw_set` called with text that
-    is not valid JSON) is dropped rather than raised -- one bad line must not
-    lose every output line that read cleanly."""
-    buf = b""
+@dataclass
+class _EventStream:
+    """What _drain_events() read off a task's private output fd."""
+
+    events: list[dict] = field(default_factory=list)
+    malformed: int = 0
+    overflowed: bool = False
+
+
+def _drain_events(fd: int, stream: _EventStream) -> None:
+    """Reads the private output fd to EOF, one JSON event per line.
+
+    The fd is written by task code, so nothing on it is trusted: a line
+    that is not exactly one well-formed event (see _parse_event) is counted
+    and dropped rather than raised -- one bad line must not lose every
+    line that read cleanly, nor crash the host. At most
+    MAX_EVENT_STREAM_BYTES are kept; past that the stream is still drained
+    (so the writer never blocks) but discarded. Linear in the bytes read,
+    however they are split into lines."""
+    buf = bytearray()
+    total = 0
     while True:
         try:
             chunk = os.read(fd, _READ_CHUNK)
@@ -585,15 +618,86 @@ def _drain_events(fd: int, events: list[dict]) -> None:
             break
         if not chunk:
             break
+        if stream.overflowed:
+            continue
+        total += len(chunk)
+        if total > MAX_EVENT_STREAM_BYTES:
+            stream.overflowed = True
+            buf.clear()
+            continue
+        scan_from = len(buf)
         buf += chunk
-        while b"\n" in buf:
-            line, buf = buf.split(b"\n", 1)
-            if not line.strip():
-                continue
-            try:
-                events.append(json.loads(line.decode("utf-8")))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
+        start = 0
+        newline = buf.find(b"\n", scan_from)
+        while newline >= 0:
+            _parse_event(bytes(buf[start:newline]), stream)
+            start = newline + 1
+            newline = buf.find(b"\n", start)
+        del buf[:start]
+    if buf.strip() and not stream.overflowed:
+        stream.malformed += 1  # a last line with no newline: a write cut short
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _reject_constant(name: str) -> None:
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _parse_event(line: bytes, stream: _EventStream) -> None:
+    """Appends `line` to stream.events if it is exactly one event of the
+    wire format (_bundle_entrypoint.py's docstring): an object whose `op`
+    is set/append (keys exactly op, name, value; name a string) or skip
+    (keys op and optionally reason, a string). Duplicate keys are refused
+    -- rw_set/rw_append splice their value argument into the line
+    unescaped, so a value like `1,"op":"skip"` would otherwise rewrite the
+    event it sits in -- as are NaN/Infinity (not JSON; the result could not
+    be posted) and values nested deeper than MAX_VALUE_DEPTH."""
+    if not line.strip():
+        return
+    try:
+        event = json.loads(
+            line.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+        )
+    except (ValueError, RecursionError):
+        stream.malformed += 1
+        return
+    if not _is_event(event) or _nested_deeper_than(event.get("value"), MAX_VALUE_DEPTH):
+        stream.malformed += 1
+        return
+    stream.events.append(event)
+
+
+def _is_event(event: Any) -> bool:
+    if not isinstance(event, dict):
+        return False
+    op = event.get("op")
+    if op in ("set", "append"):
+        return event.keys() == {"op", "name", "value"} and isinstance(event["name"], str)
+    if op == "skip":
+        return event.keys() <= {"op", "reason"} and isinstance(event.get("reason", ""), str)
+    return False
+
+
+def _nested_deeper_than(value: Any, limit: int) -> bool:
+    stack = [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict | list):
+            if depth > limit:
+                return True
+            children = node.values() if isinstance(node, dict) else node
+            stack.extend((child, depth + 1) for child in children)
+    return False
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -619,11 +723,11 @@ def _execute(
     allow_anonymous: bool,
     kubeconfig_path: str | None,
     log: logging.Logger,
-) -> tuple[int, list[dict], str, bool]:
+) -> tuple[int, _EventStream, str, bool]:
     """Runs one setup/task file as a child process in its own process group,
     with `deadline_seconds` enforced by SIGKILL-ing the whole group. Returns
-    (exit code, parsed output-fd events, combined stdout+stderr tail, whether
-    the deadline was hit)."""
+    (exit code, what was read off the output fd, combined stdout+stderr
+    tail, whether the deadline was hit)."""
     read_fd, write_fd = os.pipe()
 
     base_env = {
@@ -680,10 +784,10 @@ def _execute(
     finally:
         os.close(write_fd)  # the parent's copy; the child keeps its own via pass_fds
 
-    events: list[dict] = []
+    stream = _EventStream()
     stdout_tail = _TailBuffer(LOG_TAIL_BYTES)
     stderr_tail = _TailBuffer(LOG_TAIL_BYTES)
-    events_thread = threading.Thread(target=_drain_events, args=(read_fd, events), daemon=True)
+    events_thread = threading.Thread(target=_drain_events, args=(read_fd, stream), daemon=True)
     stdout_thread = threading.Thread(
         target=_drain_text, args=(proc.stdout, stdout_tail), daemon=True
     )
@@ -730,7 +834,8 @@ def _execute(
         proc.stderr.close()
 
     log_tail = (stdout_tail.get() + stderr_tail.get())[-LOG_TAIL_BYTES:]
-    return proc.returncode, list(events), log_tail, timed_out
+    snapshot = _EventStream(list(stream.events), stream.malformed, stream.overflowed)
+    return proc.returncode, snapshot, log_tail, timed_out
 
 
 # -- bundle materialisation -----------------------------------------------------

@@ -204,3 +204,84 @@ def test_a_python_tasks_subprocess_does_not_outlive_it(tmp_path):
     result = _run(_files("t.py", source), tmp_path / "scope")
     assert result.tasks[0].status == "ok"
     assert _wait_until_gone(int(pid_file.read_text()))
+
+
+# -- the private output channel is untrusted input ------------------------------
+
+_BASH = 'source "$RW_SDK/rw.sh"\n'
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[1, 2]",
+        '"just a string"',
+        '{"op": "set", "name": ["o"], "value": 1}',
+        '{"op": "skip", "reason": {"a": 1}}',
+        '{"op": "set", "name": "o", "value": NaN}',
+        '{"op": "set", "name": "o", "value": 1, "extra": 2}',
+        '{"op": "explode"}',
+        '{"op": "set", "name": "o", "value": ' + "[" * 100 + "]" * 100 + "}",
+    ],
+)
+def test_a_malformed_event_line_is_ignored_not_fatal(tmp_path, line):
+    source = _BASH + f'echo {json.dumps(line)} >&"$RW_OUTPUT_FD"\nrw_set o \'"kept"\'\n'
+    result = _run(_files("t.sh", source), tmp_path)
+    [task] = result.tasks
+    assert task.status == "ok"
+    assert task.outputs == {"o": "kept"}
+    assert any("were ignored" in e for e in task.errors)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"x","op":"skip","reason":"spoofed"',  # rewrites the event via a duplicate key
+        '"x"}\n{"op":"skip","reason":"spoofed"',  # a second event smuggled on a new line
+    ],
+    ids=["duplicate-key", "newline"],
+)
+def test_a_value_cannot_inject_a_second_event(tmp_path, value):
+    source = _BASH + f'v={json.dumps(value)}\nrw_set o "$v"\n'
+    source = source.replace("\\n", "\n")  # a real newline inside the value
+    result = _run(_files("t.sh", source), tmp_path)
+    [task] = result.tasks
+    assert task.status == "ok"
+    assert task.reason is None
+    assert task.outputs == {}
+
+
+def test_an_endless_output_stream_is_capped_and_fails_the_task(tmp_path):
+    source = (
+        "import os\n"
+        "def main(ctx):\n"
+        "    fd = int(os.environ['RW_OUTPUT_FD'])\n"
+        "    chunk = b'x' * (1 << 20)\n"
+        "    for _ in range(12):\n"  # one 12 MiB line with no newline
+        "        os.write(fd, chunk)\n"
+        "    return {'o': 'done'}\n"
+    )
+    started = time.monotonic()
+    result = _run(_files("t.py", source), tmp_path)
+    [task] = result.tasks
+    assert time.monotonic() - started < 10
+    assert task.status == "failed"
+    assert any(e.startswith("E_OUTPUT_TOO_LARGE") for e in task.errors)
+
+
+def test_many_small_events_are_parsed_in_linear_time(tmp_path):
+    source = (
+        "import json, os\n"
+        "def main(ctx):\n"
+        "    fd = int(os.environ['RW_OUTPUT_FD'])\n"
+        "    line = json.dumps({'op': 'append', 'name': 'o', 'value': 1}) + '\\n'\n"
+        "    os.write(fd, (line * 100000).encode())\n"
+        "    return {}\n"
+    )
+    files = _files("t.py", source, schema="integer[]")
+    started = time.monotonic()
+    result = _run(files, tmp_path)
+    assert time.monotonic() - started < 10
+    [task] = result.tasks
+    assert task.status == "ok"
+    assert len(task.outputs["o"]) > 1000

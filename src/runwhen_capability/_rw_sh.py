@@ -20,6 +20,12 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 # rw_append/rw_set/rw_skip write one JSON line to the private file
 # descriptor the host opened for this task ($RW_OUTPUT_FD) -- never to
 # stdout/stderr, which are logs only and never parsed for output data.
+#
+# The <json> argument must be exactly one JSON value; build it with jq (or
+# printf with values you control) rather than by pasting untrusted text
+# into a JSON string. Newlines in it are turned into spaces, so one call is
+# always one line, and the host rejects any line that is not exactly one
+# well-formed event.
 
 set -u
 
@@ -32,12 +38,14 @@ rw_input() {
 
 rw_append() {
     local name="$1" value="$2"
+    value=${value//$'\n'/ }
     printf '{"op":"append","name":%s,"value":%s}\n' "$(_rw_json_string "$name")" "$value" \
         >&"${RW_OUTPUT_FD}"
 }
 
 rw_set() {
     local name="$1" value="$2"
+    value=${value//$'\n'/ }
     printf '{"op":"set","name":%s,"value":%s}\n' "$(_rw_json_string "$name")" "$value" \
         >&"${RW_OUTPUT_FD}"
 }
@@ -50,12 +58,14 @@ rw_skip() {
 
 # Minimal JSON string escaping for a plain-text argument (an output name or
 # a skip reason) -- values passed to rw_append/rw_set are the caller's own
-# JSON already and are never touched here.
+# JSON already and never go through this.
 _rw_json_string() {
     local s=$1
     s=${s//\\/\\\\}
     s=${s//\"/\\\"}
     s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
     printf '"%s"' "$s"
 }
 """
