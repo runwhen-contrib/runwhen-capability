@@ -208,6 +208,25 @@ tasks:
     assert E_UNDECLARED_INPUT not in _codes(files)
 
 
+def test_e_undeclared_input_bash_local_variable_is_not_flagged():
+    """A plain shell variable the script assigns itself (`content=...`, a
+    `for` loop binding) is not an input read, even if nothing declares an
+    input of the same name."""
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+""",
+        "tasks/t.sh": (
+            'content=$(cat somefile)\necho "$content"\nfor item in a b c; do echo "$item"; done\n'
+        ),
+    }
+    assert E_UNDECLARED_INPUT not in _codes(files)
+
+
 def test_e_output_undeclared_python_return():
     files = {
         "capability.yaml": """\
@@ -322,6 +341,65 @@ tasks:
     }
     diagnostics = validate(files)
     assert any(d.code == E_DUPLICATE_NAME and d.path == "tasks[1].name" for d in diagnostics)
+
+
+def test_a_comment_mentioning_rw_append_is_not_an_undeclared_output():
+    """A `#` comment that happens to say "rw_append errors ..." as prose
+    (documenting the real call below it) must not itself be scanned as a
+    call -- regression: the naive regex matched across the comment's
+    trailing newline into the next line's first word too."""
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+    outputs:
+      message: { schema: "string" }
+""",
+        "tasks/t.sh": (
+            "# rw_append errors is how you would append, but this task uses rw_set\n"
+            'source "$RW_SDK/rw.sh"\n'
+            'rw_set message "\\"hi\\""\n'
+        ),
+    }
+    assert validate(files) == []
+
+
+def test_kubectl_delete_in_a_comment_is_not_a_readonly_violation():
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+    readOnly: true
+""",
+        "tasks/t.sh": "# do not run kubectl delete here, only reads below\nkubectl get pods\n",
+    }
+    assert E_READONLY_WRITE not in _codes(files)
+
+
+def test_a_heredoc_body_is_not_scanned_for_calls_or_readonly_writes():
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+    readOnly: true
+""",
+        "tasks/t.sh": (
+            "cat <<EOF\n"
+            "Example: rw_append errors 1, or kubectl delete pod x\n"
+            "EOF\n"
+            "kubectl get pods\n"
+        ),
+    }
+    assert validate(files) == []
 
 
 def test_diagnostics_carry_file_and_line_when_available():

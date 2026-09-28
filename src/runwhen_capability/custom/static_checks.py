@@ -78,6 +78,65 @@ def python_returned_output_names(source: str) -> list[tuple[int, str]] | None:
     return hits
 
 
+# -- stripping comments and heredoc bodies before any regex scan ------------
+# Both the bash-input/output scan below and mutating_kubectl_calls() run
+# against this, not the raw source: a `#` comment mentioning "rw_append" or
+# "kubectl delete" as prose, or a heredoc body quoting either as example
+# text, is not a call -- scanning it as one is a false positive, not a
+# missed one, which this module's own docstring says must not happen.
+
+_HEREDOC_START_RE = re.compile(r"<<-?\s*([\"']?)(\w+)\1")
+
+
+def _split_comment(line: str) -> tuple[str, int]:
+    """(code prefix, length of the trailing `#...` comment, 0 if none) --
+    quote-tracked (a `#` inside a '...' or "..." string is not a comment)
+    and, like bash itself, only a `#` starting a word (preceded by
+    whitespace or at column 0) begins one -- `foo#bar` is not a comment."""
+    in_single = in_double = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and not in_single:
+            i += 2  # an escaped character never toggles quote state or starts a comment
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double and (i == 0 or line[i - 1] in " \t"):
+            return line[:i], len(line) - i
+        i += 1
+    return line, 0
+
+
+def _strip_comments_and_heredocs(text: str) -> str:
+    """Blanks out (replaces with spaces, same length, same line breaks) every
+    `#` comment and every heredoc body (`<<EOF ... EOF`, `<<-EOF ... EOF`) in
+    `text`, so a downstream regex scan never sees either as code. Line-based
+    and quote-tracked per line, not a shell parser -- see this module's
+    docstring for why that trade is the right one here. A heredoc's own
+    delimiter line is matched literally (no shell word-expansion), which
+    covers every task script this SDK has seen; a delimiter built from a
+    variable is out of scope."""
+    out_lines: list[str] = []
+    heredoc_terminator: str | None = None
+    for line in text.split("\n"):
+        if heredoc_terminator is not None:
+            out_lines.append(" " * len(line))
+            if line.strip() == heredoc_terminator:
+                heredoc_terminator = None
+            continue
+
+        code, comment_len = _split_comment(line)
+        out_lines.append(code + " " * comment_len)
+
+        heredoc_match = _HEREDOC_START_RE.search(code)
+        if heredoc_match:
+            heredoc_terminator = heredoc_match.group(2)
+    return "\n".join(out_lines)
+
+
 # -- bash: env-var/rw_input reads and rw_append/rw_set writes ----------------
 
 # $VAR / ${VAR} / ${VAR:-default} / ${VAR:?msg} -- the last two carry a
@@ -94,19 +153,39 @@ _RW_SET_RE = re.compile(r"\brw_set\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
 # its own exit status or argv.
 _SPECIAL_BASH_VARS = frozenset({"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"})
 
+# A name assigned anywhere in the script (`name=...`, `local name=...`,
+# `export name=...`, `readonly name=...`) or bound by a `for name in ...`
+# loop is an ordinary local variable, not an input read -- $VAR references to
+# it must not be flagged as E_UNDECLARED_INPUT just because no input happens
+# to share its name.
+_ASSIGNMENT_RE = re.compile(r"(?m)^[ \t]*(?:local|export|readonly)?[ \t]*([A-Za-z_][A-Za-z0-9_]*)=")
+_FOR_LOOP_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+
 
 def _line_of(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + 1
 
 
+def bash_locally_assigned_names(text: str) -> set[str]:
+    """Every name the script itself assigns -- ordinary variables and
+    `for`-loop bindings -- as opposed to a name read from the environment."""
+    text = _strip_comments_and_heredocs(text)
+    names = {m.group(1) for m in _ASSIGNMENT_RE.finditer(text)}
+    names |= {m.group(1) for m in _FOR_LOOP_RE.finditer(text)}
+    return names
+
+
 def bash_env_reads(text: str) -> list[tuple[int, str]]:
-    """(line, VAR) for every `$VAR`/`${VAR}` reference -- the raw name as
-    written, uppercase or not (the caller compares against each declared
-    input's computed env-var name)."""
+    """(line, VAR) for every `$VAR`/`${VAR}` reference that is NOT one of
+    this script's own local variables -- the raw name as written, uppercase
+    or not (the caller compares against each declared input's computed
+    env-var name). Comments and heredoc bodies are never scanned."""
+    text = _strip_comments_and_heredocs(text)
+    local_names = bash_locally_assigned_names(text)
     hits = []
     for m in _VAR_REF_RE.finditer(text):
         name = m.group(1) or m.group(2)
-        if name in _SPECIAL_BASH_VARS:
+        if name in _SPECIAL_BASH_VARS or name in local_names:
             continue
         hits.append((_line_of(text, m.start()), name))
     return hits
@@ -114,12 +193,17 @@ def bash_env_reads(text: str) -> list[tuple[int, str]]:
 
 def bash_rw_input_reads(text: str) -> list[tuple[int, str]]:
     """(line, name) for every `rw_input <name>` call -- `name` as declared
-    (not uppercased): rw_input takes the input's own manifest name."""
+    (not uppercased): rw_input takes the input's own manifest name. Comments
+    and heredoc bodies are never scanned."""
+    text = _strip_comments_and_heredocs(text)
     return [(_line_of(text, m.start()), m.group(1)) for m in _RW_INPUT_RE.finditer(text)]
 
 
 def bash_output_writes(text: str) -> list[tuple[int, str]]:
-    """(line, output name) for every `rw_append`/`rw_set` call."""
+    """(line, output name) for every `rw_append`/`rw_set` call. Comments and
+    heredoc bodies are never scanned -- a comment mentioning either by name
+    (documentation, an example) is not a call."""
+    text = _strip_comments_and_heredocs(text)
     hits = [(_line_of(text, m.start()), m.group(1)) for m in _RW_APPEND_RE.finditer(text)]
     hits += [(_line_of(text, m.start()), m.group(1)) for m in _RW_SET_RE.finditer(text)]
     return hits
@@ -164,7 +248,10 @@ def mutating_kubectl_calls(text: str) -> list[tuple[int, str]]:
     """(line, "kubectl <verb>") for every kubectl invocation in `text` whose
     verb mutates cluster state. Works over both bash and Python source: a
     Python task's `ctx.run(["kubectl", "delete", ...])` call still reads as
-    plain text containing "kubectl" and "delete" on the same statement."""
+    plain text containing "kubectl" and "delete" on the same statement.
+    Comments and heredoc bodies are never scanned -- "kubectl delete" in a
+    docstring or a help message is not an invocation."""
+    text = _strip_comments_and_heredocs(text)
     hits = []
     for m in _KUBECTL_STATEMENT_RE.finditer(text):
         statement = m.group(0)
