@@ -24,7 +24,9 @@ with the wheel and sdist attached to the GitHub Release.
   - Python: `main(ctx, **inputs)`, with the new `ctx.skip(reason)` (equivalent to `raise
     SkipTask(reason)`). Bash: inputs as upper-cased env vars, plus `rw.sh` (`rw_input`, `rw_append`,
     `rw_set`, `rw_skip`) sourced via `$RW_SDK`, writing to a private file descriptor.
-  - Each setup/task runs as its own child process, in its own process group, under a deadline.
+  - Each setup/task runs as its own child process, in its own process group, killed with its
+    whole group when it exits or when the request's deadline passes. `deadlineMs` is one budget for
+    the whole request: setup and every task share it.
   - Outputs are checked against their compiled schema (`E_OUTPUT_SCHEMA`, with the JSON path) and
     capped (`E_OUTPUT_TOO_LARGE`; a list output is truncated instead of failing the task).
   - Every credential/secret value used by the run is redacted from outputs and the log tail.

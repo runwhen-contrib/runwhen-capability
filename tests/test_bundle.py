@@ -4,6 +4,8 @@ both Python and bash tasks, and setup."""
 
 from __future__ import annotations
 
+import time
+
 from bundle_fixtures import load_bundle
 
 from runwhen_capability.bundle import run_bundle_request
@@ -136,6 +138,17 @@ def test_timeout_kills_the_whole_process_group(tmp_path):
     [task] = result.tasks
     assert task.status == "timeout"
     assert "E_TIMEOUT" in task.error
+
+
+def test_the_deadline_is_one_budget_for_the_whole_request(tmp_path):
+    """Two slow tasks under a 1s request deadline: the first uses it up and
+    is killed, the second never starts -- the request as a whole never runs
+    past the deadline the runner gave it."""
+    started = time.monotonic()
+    result = _run(EXEC, ["slow", "slow", "ok-py"], tmp_path, deadline_seconds=1)
+    assert time.monotonic() - started < 3
+    assert [task.status for task in result.tasks] == ["timeout", "timeout", "timeout"]
+    assert "before this started" in result.tasks[1].error
 
 
 def test_redacts_a_secret_from_task_outputs(tmp_path):

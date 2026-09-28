@@ -92,7 +92,9 @@ MAX_EVENT_STREAM_BYTES = 8 * MAX_RESULT_BYTES
 MAX_VALUE_DEPTH = 64
 MAX_SCHEMA_ERRORS = 20
 MAX_SCHEMA_ERROR_CHARS = 500
-DEFAULT_TASK_DEADLINE = 300  # seconds; used when the caller gives no deadline
+# seconds for the whole request (setup and every task together); used when
+# the caller gives no deadline
+DEFAULT_REQUEST_DEADLINE = 300
 _DRAIN_JOIN_TIMEOUT = 5
 _READ_CHUNK = 65536
 
@@ -114,12 +116,22 @@ def run_bundle_request(
     credentials: dict[str, str],
     scope_dir: Path,
     log: logging.Logger | None = None,
-    deadline_seconds: float = DEFAULT_TASK_DEADLINE,
+    deadline_seconds: float = DEFAULT_REQUEST_DEADLINE,
     allow_anonymous_credentials: bool = False,
 ) -> ResultEnvelope:
+    """Runs `request`'s bundle: setup, then each requested task.
+
+    `deadline_seconds` is ONE budget for the whole request, not a fresh
+    allowance per task: setup and the tasks share it, each running with
+    whatever is left when it starts, and a task that would start after it
+    has run out is reported as a timeout without running. The runner gives
+    the whole request that long (its deadlineMs); a per-task allowance let
+    setup plus N tasks run (N + 1) times over it, long after the runner had
+    given up on the result."""
     log = log or logging.getLogger("runwhen_capability.bundle")
     scope_dir = Path(scope_dir)
     result = ResultEnvelope()
+    deadline_at = time.monotonic() + deadline_seconds
 
     files: dict[str, str] = {}
     for bundle_file in request.bundle.files:
@@ -182,7 +194,7 @@ def run_bundle_request(
             operation="setup",
             scope_dir=scope_dir,
             rw_sdk_dir=rw_sdk_dir,
-            deadline_seconds=deadline_seconds,
+            deadline_seconds=deadline_at - time.monotonic(),
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
             log=log.getChild("setup"),
@@ -221,7 +233,7 @@ def run_bundle_request(
             operation=task_name,
             scope_dir=scope_dir,
             rw_sdk_dir=rw_sdk_dir,
-            deadline_seconds=deadline_seconds,
+            deadline_seconds=deadline_at - time.monotonic(),
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
             log=log.getChild(task_name),
@@ -270,6 +282,9 @@ def _run_setup_or_task(
     language = task_file_language(file_path)
     if language is None:
         return _RunOutcome(status="failed", error=f"{file_path}: unsupported file type")
+    if deadline_seconds <= 0:
+        message = f"{E_TIMEOUT}: the request's deadline passed before this started"
+        return _RunOutcome(status="timeout", error=message, errors=[message])
 
     # Each invocation's secret files live in their own fresh, randomly named
     # 0700 directory, removed as soon as the invocation ends -- a later task
@@ -325,12 +340,10 @@ def _run_setup_or_task(
         log_tail = redactor.text(log_tail)[-LOG_TAIL_BYTES:] if log_tail else log_tail
 
         if timed_out:
-            return _RunOutcome(
-                status="timeout",
-                error=f"{E_TIMEOUT}: exceeded the {deadline_seconds}s deadline",
-                errors=[f"{E_TIMEOUT}: exceeded the {deadline_seconds}s deadline"],
-                log_tail=log_tail,
+            message = (
+                f"{E_TIMEOUT}: killed after {deadline_seconds:.1f}s, at the request's deadline"
             )
+            return _RunOutcome(status="timeout", error=message, errors=[message], log_tail=log_tail)
 
         events = stream.events
         skip_event = next((e for e in events if e["op"] == "skip"), None)
@@ -852,7 +865,9 @@ def _execute(
     except subprocess.TimeoutExpired:
         timed_out = True
         log.warning(
-            "%s: exceeded the %ss deadline; killing its process group", file_path, deadline_seconds
+            "%s: reached the request's deadline after %.1fs; killing its process group",
+            file_path,
+            deadline_seconds,
         )
     # Kill the group on EVERY exit, not only on a timeout: a task's
     # background children (`cmd &`, a daemon it started) stay in its

@@ -316,7 +316,8 @@ def _poll_once(
             # pod's image -- see bundle.py's module docstring. deadlineMs is
             # otherwise unused by this loop (host.run_request() has no
             # per-request deadline of its own); bundle mode is the first
-            # thing that actually enforces it, as each task's own deadline.
+            # thing that actually enforces it, as one budget shared by the
+            # request's setup and all of its tasks.
             os.chmod(scope_dir, 0o700)
             result = run_bundle_request(
                 task_request.request,
