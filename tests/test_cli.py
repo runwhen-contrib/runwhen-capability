@@ -8,6 +8,7 @@ else arrives as environment variables.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -112,3 +113,22 @@ def _credentials_file(credentials: dict) -> str:
     with open(fd, "w") as f:
         json.dump(credentials, f)
     return path
+
+
+def test_run_local_never_follows_a_symlink_out_of_the_bundle_dir(tmp_path):
+    from runwhen_capability.run_local import _read_bundle_dir
+
+    bundle = tmp_path / "bundle"
+    shutil.copytree(BUNDLES / "pgbouncer-health", bundle)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "id_rsa").write_text("PRIVATE KEY MATERIAL")
+    (bundle / "lib" / "linked.sh").symlink_to(outside / "id_rsa")
+    (bundle / "tests").mkdir(exist_ok=True)
+    (bundle / "tests" / "linked-dir").symlink_to(outside, target_is_directory=True)
+
+    files = _read_bundle_dir(bundle)
+    assert "lib/linked.sh" not in files
+    assert not any(path.startswith("tests/linked-dir") for path in files)
+    assert "PRIVATE KEY MATERIAL" not in "".join(files.values())
+    assert "capability.yaml" in files

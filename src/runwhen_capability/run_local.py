@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -81,14 +82,21 @@ def _read_bundle_dir(bundle_dir: Path) -> dict[str, str]:
     bundle_dir-relative, forward-slash path -- exactly the `files` shape
     content_hash()/compile_manifest() take. Anything else in the directory
     (an editor swap file, a stray `.git/`) is silently not part of the
-    bundle, same as it would not be part of a real upload."""
+    bundle, same as it would not be part of a real upload.
+
+    Symlinks are never followed, to files or to directories: a bundle is
+    only what is inside `bundle_dir`, so a link out of it (to a key under
+    ~/.ssh, say) must not pull that file into the bundle's contents."""
     files = {}
-    for path in sorted(bundle_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(bundle_dir).as_posix()
-        if is_allowed_path(rel):
-            files[rel] = path.read_text(encoding="utf-8")
+    for root, dirs, names in os.walk(bundle_dir, followlinks=False):
+        dirs.sort()
+        for name in sorted(names):
+            path = Path(root) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            rel = path.relative_to(bundle_dir).as_posix()
+            if is_allowed_path(rel):
+                files[rel] = path.read_text(encoding="utf-8")
     return files
 
 
