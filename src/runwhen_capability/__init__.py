@@ -13,6 +13,10 @@ from .context import Context
 from .decorators import setup, task
 from .errors import SkipTask
 from .models import (
+    Bundle,
+    BundleFile,
+    BundleRequestEnvelope,
+    BundleTarget,
     Finding,
     GrepMatch,
     GrepResult,
@@ -48,4 +52,8 @@ __all__ = [
     "TaskHostResult",
     "TaskResult",
     "TaskSpec",
+    "Bundle",
+    "BundleFile",
+    "BundleRequestEnvelope",
+    "BundleTarget",
 ]

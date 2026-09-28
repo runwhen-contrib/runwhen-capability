@@ -63,9 +63,10 @@ from pathlib import Path
 
 import requests
 
+from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
-from .models import TaskHostRequest
+from .models import BundleRequestEnvelope, TaskHostRequest
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
@@ -306,23 +307,44 @@ def _poll_once(
         )
         return
 
+    is_bundle = isinstance(task_request.request, BundleRequestEnvelope)
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
     try:
-        result = run_request(
-            capability,
-            task_request.request,
-            task_request.credentials,
-            scope_dir,
-            log=log.getChild(task_request.requestId),
-        )
+        if is_bundle:
+            # A bundle's code travels with the request, not baked into this
+            # pod's image -- see bundle.py's module docstring. deadlineMs is
+            # otherwise unused by this loop (host.run_request() has no
+            # per-request deadline of its own); bundle mode is the first
+            # thing that actually enforces it, as each task's own deadline.
+            result = run_bundle_request(
+                task_request.request,
+                task_request.credentials,
+                scope_dir,
+                log=log.getChild(task_request.requestId),
+                deadline_seconds=task_request.deadlineMs / 1000,
+            )
+        else:
+            result = run_request(
+                capability,
+                task_request.request,
+                task_request.credentials,
+                scope_dir,
+                log=log.getChild(task_request.requestId),
+            )
         payload = {"status": "ok", "result": result.model_dump(mode="json")}
     except Exception as exc:  # noqa: BLE001 -- one request must never take down the loop
         log.exception("request %s failed", task_request.requestId)
         payload = {"status": "failed", "error": str(exc)}
     finally:
-        _retain_or_wipe_scope(
-            capability, scope_dir, workdir, stateful_scopes, max_stateful_scopes, log
-        )
+        if is_bundle:
+            # No execution.mode concept applies to a bundle request -- it
+            # never shares a scope with a later request, so it is always
+            # wiped, exactly like a stateless packaged capability.
+            shutil.rmtree(scope_dir, ignore_errors=True)
+        else:
+            _retain_or_wipe_scope(
+                capability, scope_dir, workdir, stateful_scopes, max_stateful_scopes, log
+            )
 
     _post_result(session, relay, task_request.requestId, payload, token_file, token, log)

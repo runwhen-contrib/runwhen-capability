@@ -7,7 +7,12 @@ else arrives as environment variables.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
+
+BUNDLES = Path(__file__).parent / "fixtures" / "bundles"
 
 
 def test_serve_takes_relay_and_pool_from_env_when_no_flags_are_passed(monkeypatch):
@@ -55,3 +60,55 @@ def test_version_prints_the_package_version(capsys):
 
     assert exc_info.value.code == 0
     assert capsys.readouterr().out.strip() == f"rwtask {__version__}"
+
+
+def test_run_local_runs_a_bundle_task_and_prints_its_result(capsys):
+    from runwhen_capability.cli import main
+
+    exit_code = main(
+        [
+            "run",
+            "--local",
+            str(BUNDLES / "pgbouncer-health"),
+            "--task",
+            "pool-errors",
+            "--inputs",
+            json.dumps({"since": "45m", "maxWait": 5}),
+            "--target",
+            json.dumps({"urn": "urn:resource:pgbouncer"}),
+            "--credentials",
+            _credentials_file({"kubeconfig": "kubeconfig-value"}),
+        ]
+    )
+
+    assert exit_code == 0
+    result = json.loads(capsys.readouterr().out)
+    [task] = result["tasks"]
+    assert task["task"] == "pool-errors"
+    assert task["status"] == "ok"
+    assert task["outputs"]["summary"] == {"windowMinutes": 30, "pods": 2, "total": 3}
+
+
+def test_run_local_needs_at_least_one_task(capsys):
+    from runwhen_capability.cli import main
+
+    with pytest.raises(SystemExit):
+        main(["run", "--local", str(BUNDLES / "pgbouncer-health")])
+    assert "--task" in capsys.readouterr().err
+
+
+def test_run_without_local_still_needs_capability_dir_and_request(capsys):
+    from runwhen_capability.cli import main
+
+    with pytest.raises(SystemExit):
+        main(["run"])
+    assert "capability_dir" in capsys.readouterr().err
+
+
+def _credentials_file(credentials: dict) -> str:
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with open(fd, "w") as f:
+        json.dump(credentials, f)
+    return path
