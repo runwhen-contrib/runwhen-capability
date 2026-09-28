@@ -10,7 +10,12 @@ import time
 
 import pytest
 
-from runwhen_capability.bundle import run_bundle_request
+from runwhen_capability.bundle import (
+    MAX_SCHEMA_ERROR_CHARS,
+    MAX_SCHEMA_ERRORS,
+    _validate_output_schema,
+    run_bundle_request,
+)
 from runwhen_capability.custom.hashing import content_hash
 from runwhen_capability.models import Bundle, BundleFile, BundleRequestEnvelope
 
@@ -285,3 +290,32 @@ def test_many_small_events_are_parsed_in_linear_time(tmp_path):
     [task] = result.tasks
     assert task.status == "ok"
     assert len(task.outputs["o"]) > 1000
+
+
+# -- output schemas are evaluated locally and contained ---------------------------
+
+
+def test_a_non_local_ref_is_never_fetched(tmp_path):
+    target = tmp_path / "leak.json"
+    target.write_text('{"type": "string", "enum": ["only-this"]}')
+    messages = _validate_output_schema("o", "x", {"$ref": target.as_uri()})
+    assert messages and "could not be evaluated" in messages[0]
+    assert "only-this" not in messages[0]
+
+
+def test_a_local_ref_still_resolves():
+    schema = {"$defs": {"n": {"type": "integer"}}, "$ref": "#/$defs/n"}
+    assert _validate_output_schema("o", 1, schema) == []
+    assert _validate_output_schema("o", "x", schema)
+
+
+def test_an_invalid_schema_fails_only_its_output():
+    messages = _validate_output_schema("o", 1, {"type": 5})
+    assert messages and messages[0].startswith("E_OUTPUT_SCHEMA outputs.o")
+
+
+def test_schema_errors_are_capped_in_number_and_length():
+    schema = {"type": "array", "items": {"type": "integer"}}
+    messages = _validate_output_schema("o", ["x" * 5000] * 1000, schema)
+    assert len(messages) == MAX_SCHEMA_ERRORS + 1
+    assert all(len(m) <= MAX_SCHEMA_ERROR_CHARS for m in messages)

@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
+import referencing
 
 from ._rw_sh import RW_SH
 from .custom.compiler import CompileError, compile_manifest
@@ -88,6 +89,8 @@ MAX_RESULT_BYTES = 1024 * 1024
 # bounded, since the host holds every event in memory until the task ends.
 MAX_EVENT_STREAM_BYTES = 8 * MAX_RESULT_BYTES
 MAX_VALUE_DEPTH = 64
+MAX_SCHEMA_ERRORS = 20
+MAX_SCHEMA_ERROR_CHARS = 500
 DEFAULT_TASK_DEADLINE = 300  # seconds; used when the caller gives no deadline
 _DRAIN_JOIN_TIMEOUT = 5
 _READ_CHUNK = 65536
@@ -478,14 +481,32 @@ def _matches_input_type(spec_type: str, value: Any) -> bool:
 
 
 def _validate_output_schema(name: str, value: Any, schema: dict) -> list[str]:
-    validator_cls = jsonschema.validators.validator_for(schema)
-    validator = validator_cls(schema)
+    """E_OUTPUT_SCHEMA messages for `value`, at most MAX_SCHEMA_ERRORS of
+    them, each at most MAX_SCHEMA_ERROR_CHARS long (a message quotes the
+    offending value, and a list can fail once per item).
+
+    References resolve only within `schema` itself: an empty Registry
+    means jsonschema never fetches a URL or reads a file to follow a
+    `$ref` -- by default it would. A schema that cannot be evaluated at all
+    fails this one output, never the whole request."""
     messages = []
-    for error in validator.iter_errors(value):
-        json_path = "".join(
-            f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.absolute_path
+    try:
+        validator_cls = jsonschema.validators.validator_for(schema)
+        validator = validator_cls(schema, registry=referencing.Registry())
+        for error in validator.iter_errors(value):
+            if len(messages) == MAX_SCHEMA_ERRORS:
+                messages.append(f"{E_OUTPUT_SCHEMA} outputs.{name}: more errors not shown")
+                break
+            json_path = "".join(
+                f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.absolute_path
+            )
+            message = f"{E_OUTPUT_SCHEMA} outputs.{name}{json_path}: {error.message}"
+            messages.append(message[:MAX_SCHEMA_ERROR_CHARS])
+    except Exception as exc:  # noqa: BLE001 -- the schema is bundle-authored; contain it
+        messages.append(
+            f"{E_OUTPUT_SCHEMA} outputs.{name}: the schema could not be evaluated "
+            f"({type(exc).__name__})"
         )
-        messages.append(f"{E_OUTPUT_SCHEMA} outputs.{name}{json_path}: {error.message}")
     return messages
 
 
