@@ -68,6 +68,28 @@ rwtask serve [--capability-dir DIR]        # RELAY_URL, POOL_ID, EXECUTOR_TOKEN_
 `rwtask run` is the same code path as `rwtask serve`, against the local filesystem: a capability
 author needs no cluster.
 
+### Image labels
+
+A capability image carries its own manifest and schemas as OCI labels, so a catalog reads them
+straight off the pushed image:
+
+```
+rwtask label capabilities/<name>             # com.runwhen.capability.manifest.v1
+rwtask label --schemas capabilities/<name>   # com.runwhen.capability.schemas.v1
+```
+
+Both print base64 on stdout and nothing else, for use as build args. The manifest label is
+`manifest.yaml`, verbatim; it is refused while the manifest has a top-level `image:` key (an image
+cannot know its own digest). The schemas label is a compact, sorted-key JSON object of every file
+under `schemas/`, keyed `schemas/<file>`; every `schema:` ref in the manifest must be one of them.
+
+To read a label back off a published image:
+
+```
+crane config --platform linux/amd64 <ref> \
+  | jq -r '.config.Labels["com.runwhen.capability.manifest.v1"]' | base64 -d
+```
+
 ## Development
 
 ```

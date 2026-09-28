@@ -1,9 +1,10 @@
-"""`rwtask` -- the task host CLI. Two modes:
+"""`rwtask` -- the task host CLI:
 
     rwtask serve --relay <url> --pool <poolId> --workdir /work
     rwtask run <capability-dir> --request request.json [--credentials creds.json]
+    rwtask label [--schemas] <capability-dir>
 
-See serve.py and run_local.py.
+See serve.py, run_local.py and label.py.
 """
 
 from __future__ import annotations
@@ -78,6 +79,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "repos without a credentials.json; never available to `rwtask serve`",
     )
 
+    label_p = sub.add_parser(
+        "label",
+        help="print a capability's OCI label value (base64) on stdout, for an image build arg",
+    )
+    label_p.add_argument("capability_dir", help="path to the capability directory")
+    label_p.add_argument(
+        "--schemas",
+        action="store_true",
+        help="print the com.runwhen.capability.schemas.v1 value (every file under schemas/) "
+        "instead of com.runwhen.capability.manifest.v1 (manifest.yaml)",
+    )
+
     return parser
 
 
@@ -126,6 +139,21 @@ def main(argv: list[str] | None = None) -> int:
             allow_anonymous=args.allow_anonymous,
         )
         print(json.dumps(result.model_dump(mode="json"), indent=2))
+        return 0
+
+    if args.command == "label":
+        from .label import ManifestLabelError, encode_manifest, schemas_label
+
+        capability_dir = Path(args.capability_dir)
+        try:
+            value = (
+                schemas_label(capability_dir) if args.schemas else encode_manifest(capability_dir)
+            )
+        except ManifestLabelError as exc:
+            mode = "label --schemas" if args.schemas else "label"
+            print(f"rwtask {mode}: {exc}", file=sys.stderr)
+            return 1
+        sys.stdout.write(value)
         return 0
 
     parser.error(f"unknown command {args.command!r}")
