@@ -90,6 +90,24 @@ crane config --platform linux/amd64 <ref> \
   | jq -r '.config.Labels["com.runwhen.capability.manifest.v1"]' | base64 -d
 ```
 
+### Output schemas
+
+A task output's JSON Schema is exported from the pydantic model that produces it, never written by
+hand. List the files to export in the capability repo's `pyproject.toml`:
+
+```toml
+[tool.rwtask.schemas."capabilities/rw-checks"]
+"findings.v1.json" = "runwhen_capability.models:FindingsResult"
+```
+
+```
+rwtask schemas           # write capabilities/rw-checks/schemas/findings.v1.json
+rwtask schemas --check   # CI: fail if any listed file is missing or differs from its model
+```
+
+Files under `schemas/` that are not listed are left alone, so an older published version can stay
+on disk after the listing moves on to a new one.
+
 ## Development
 
 ```

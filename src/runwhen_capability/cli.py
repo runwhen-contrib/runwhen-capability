@@ -3,8 +3,9 @@
     rwtask serve --relay <url> --pool <poolId> --workdir /work
     rwtask run <capability-dir> --request request.json [--credentials creds.json]
     rwtask label [--schemas] <capability-dir>
+    rwtask schemas [--check] [--project-dir DIR]
 
-See serve.py, run_local.py and label.py.
+See serve.py, run_local.py, label.py and schemas.py.
 """
 
 from __future__ import annotations
@@ -91,6 +92,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "instead of com.runwhen.capability.manifest.v1 (manifest.yaml)",
     )
 
+    schemas_p = sub.add_parser(
+        "schemas",
+        help="export the output schemas listed under [tool.rwtask.schemas] in pyproject.toml",
+    )
+    schemas_p.add_argument(
+        "--check",
+        action="store_true",
+        help="write nothing; fail if a listed schema file is missing or out of date",
+    )
+    schemas_p.add_argument(
+        "--project-dir",
+        default=".",
+        help="directory holding pyproject.toml (default: the current directory)",
+    )
+
     return parser
 
 
@@ -154,6 +170,31 @@ def main(argv: list[str] | None = None) -> int:
             print(f"rwtask {mode}: {exc}", file=sys.stderr)
             return 1
         sys.stdout.write(value)
+        return 0
+
+    if args.command == "schemas":
+        from .schemas import SchemaConfigError, check_schemas, write_schemas
+
+        project_dir = Path(args.project_dir)
+        try:
+            if not args.check:
+                for relpath in write_schemas(project_dir):
+                    print(f"wrote {relpath}")
+                return 0
+            checked, problems = check_schemas(project_dir)
+        except SchemaConfigError as exc:
+            print(f"rwtask schemas: {exc}", file=sys.stderr)
+            return 1
+        if problems:
+            for problem in problems:
+                print(problem, file=sys.stderr)
+            print(
+                "rwtask schemas: the files above do not match their models; run "
+                "`rwtask schemas` and commit the result",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{checked} schema file(s) up to date")
         return 0
 
     parser.error(f"unknown command {args.command!r}")
