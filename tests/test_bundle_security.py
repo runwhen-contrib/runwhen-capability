@@ -369,3 +369,36 @@ def test_the_log_tail_cut_never_leaves_part_of_a_secret(tmp_path):
     assert len(task.logTail) <= LOG_TAIL_BYTES
     assert _TOKEN[10:] not in task.logTail
     assert _TOKEN[-8:] not in task.logTail
+
+
+def test_rw_input_finds_a_camel_case_input_under_the_same_env_name_as_the_host(tmp_path):
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: probe
+inputs:
+  maxWait: { type: integer, default: 7 }
+  since: { type: duration, default: 30m }
+tasks:
+  - name: t
+    file: tasks/t.sh
+    outputs:
+      o: { schema: "string" }
+""",
+        "tasks/t.sh": _BASH + 'rw_set o "\\"$(rw_input maxWait)/$(rw_input since)/$MAX_WAIT\\""\n',
+    }
+    result = run_bundle_request(_request(files), {}, tmp_path)
+    [task] = result.tasks
+    assert task.outputs == {"o": "7/30m/7"}
+
+
+def test_rw_input_refuses_a_name_that_is_not_an_identifier(tmp_path):
+    marker = tmp_path / "evaluated"
+    source = (
+        _BASH
+        + f"n='x[$(touch {marker})]'\n"
+        + 'if rw_input "$n"; then rw_set o \'"read"\'; else rw_set o \'"refused"\'; fi\n'
+    )
+    result = _run(_files("t.sh", source), tmp_path / "scope")
+    assert result.tasks[0].outputs == {"o": "refused"}
+    assert not marker.exists()

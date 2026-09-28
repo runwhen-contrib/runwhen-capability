@@ -30,10 +30,26 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 set -u
 
 rw_input() {
-    local name upper
-    name="${1:-}"
-    upper=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')
-    printf '%s' "${!upper-}"
+    # The env var name is derived exactly as the host derives it from the
+    # manifest's input name: an underscore before every capital letter but
+    # the first, then upper-cased ("maxWait" -> MAX_WAIT).
+    local name="${1:-}" env_name="" ch i
+    case "$name" in
+        [A-Za-z]*) ;;
+        *) printf 'rw_input: invalid input name %s\n' "$name" >&2; return 1 ;;
+    esac
+    case "$name" in
+        *[!A-Za-z0-9_]*) printf 'rw_input: invalid input name %s\n' "$name" >&2; return 1 ;;
+    esac
+    for (( i = 0; i < ${#name}; i++ )); do
+        ch=${name:i:1}
+        case "$ch" in
+            [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) if (( i > 0 )); then env_name+="_"; fi ;;
+        esac
+        env_name+=$ch
+    done
+    env_name=$(printf '%s' "$env_name" | tr '[:lower:]' '[:upper:]')
+    printf '%s' "${!env_name-}"
 }
 
 rw_append() {
