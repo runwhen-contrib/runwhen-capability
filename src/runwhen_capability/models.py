@@ -228,10 +228,21 @@ class SetupResult(BaseModel):
 
 
 class TaskResult(BaseModel):
+    """`status`, in full:
+
+    - `ok` -- the task ran; `outputs` holds what it returned.
+    - `failed` -- the task raised; `error` says why.
+    - `skipped` -- the task decided not to run (it raised SkipTask);
+      `reason` says why, and may be empty. `outputs` is empty.
+
+    `reason` is None unless the task was skipped.
+    """
+
     task: str
-    status: Literal["ok", "failed"]
+    status: Literal["ok", "failed", "skipped"]
     outputs: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
+    reason: str | None = None
 
 
 class ResultEnvelope(BaseModel):

@@ -43,3 +43,17 @@ class OutputTooLargeError(ValueError):
     propagates to host.py's generic handler and becomes a failed
     TaskResult -- a disclosed failure, never a silent empty/partial
     findings list."""
+
+
+class SkipTask(Exception):  # noqa: N818 -- a control-flow signal, not an error
+    """Raised by a task that decides not to run -- nothing in its scope to
+    check, a precondition that makes the work meaningless. The task host
+    records it as `TaskResult(status="skipped", reason=<message>)`: distinct
+    from `ok` (the task did its work) and from `failed` (the task tried and
+    could not). The rest of the request still runs.
+
+    Only tasks can skip. A setup that raises this is an ordinary setup
+    failure: it has not materialised anything the tasks could use.
+
+        raise SkipTask("no Python files in the diff")
+    """

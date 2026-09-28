@@ -1,0 +1,11 @@
+# Minimal fixture capability used by tests/test_host.py: tasks that decide
+# not to run (SkipTask), next to one that runs, and a setup that raises
+# SkipTask -- which setup does not support.
+capability: rw-skips-fixture
+version: "0.0.0"
+setup:
+  task: prep
+tasks:
+  - name: nothing_to_do
+  - name: no_reason
+  - name: good

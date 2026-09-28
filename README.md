@@ -30,7 +30,7 @@ pip install --no-deps -e .
 ## Writing tasks
 
 ```python
-from runwhen_capability import Context, setup, task
+from runwhen_capability import Context, SkipTask, setup, task
 
 
 @setup(outputs=["tree", "changed"])
@@ -41,6 +41,8 @@ def checkout(ctx: Context, repo_url: str, sha: str, base_sha: str | None = None)
 
 @task(outputs={"findings": "rw.findings.v1"})
 def lint(ctx: Context, tree: str, changed: list[str] | None = None):
+    if changed == []:
+        raise SkipTask("no changed files to check")
     proc = ctx.run(["ruff", "check", "--output-format=sarif", "."], cwd=tree)
     return {"findings": {"findings": ctx.sarif.parse(proc.stdout, root=tree)}}
 ```
@@ -52,7 +54,9 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
 - `Context` is the task's only boundary: `ctx.credential(name)`, `ctx.run(argv)` (bounded output,
   timeouts, process-group kill), `ctx.git`, `ctx.sarif`, `ctx.findings`, `ctx.repo_fs`,
   `ctx.workdir`, `ctx.log`.
-- A task that raises is recorded `failed`; the rest of the request still runs.
+- Each task ends `ok`, `failed` (it raised; `error` says why) or `skipped` (it raised
+  `SkipTask(reason)`; `reason` says why). Either way the rest of the request still runs. Only
+  tasks can skip: a setup that raises `SkipTask` has failed.
 
 ## rwtask
 

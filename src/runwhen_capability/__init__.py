@@ -9,8 +9,9 @@ host that runs them, in a pod (`rwtask serve`) or locally (`rwtask run`).
 # (setuptools dynamic version) and `rwtask --version` prints it.
 __version__ = "0.1.0"
 
-from .context import Context  # noqa: E402 -- after __version__, which the build reads
+from .context import Context
 from .decorators import setup, task
+from .errors import SkipTask
 from .models import (
     Finding,
     GrepMatch,
@@ -32,6 +33,7 @@ __all__ = [
     "Context",
     "setup",
     "task",
+    "SkipTask",
     "Finding",
     "GrepMatch",
     "GrepResult",

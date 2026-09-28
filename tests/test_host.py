@@ -369,3 +369,88 @@ def test_an_unserialisable_setup_output_does_not_turn_a_successful_setup_into_a_
 
     assert result.setup.status == "ok"
     assert result.setup.outputs == {"greeting": "hello world", "items": ["a", "b"]}
+
+
+# -- task-level skipped status ----------------------------------------------
+
+
+def _skips_request(*task_names: str, setup_inputs: dict | None = None) -> RequestEnvelope:
+    return RequestEnvelope.model_validate(
+        {
+            "version": 1,
+            "setup": {"task": "prep", "inputs": setup_inputs or {}},
+            "tasks": [{"task": name, "inputs": {}} for name in task_names],
+        }
+    )
+
+
+def test_a_task_raising_skiptask_is_recorded_skipped_with_its_reason(tmp_path):
+    capability = load_capability(FIXTURES / "skips")
+
+    result = run_request(
+        capability, _skips_request("nothing_to_do"), credentials={}, scope_dir=tmp_path
+    )
+
+    task = result.tasks[0]
+    assert task.status == "skipped"
+    assert task.reason == "no matching files in the diff"
+    assert task.error is None
+    assert task.outputs == {}
+
+
+def test_a_skipped_task_does_not_stop_the_tasks_after_it(tmp_path):
+    capability = load_capability(FIXTURES / "skips")
+
+    result = run_request(
+        capability, _skips_request("nothing_to_do", "good"), credentials={}, scope_dir=tmp_path
+    )
+
+    assert [t.status for t in result.tasks] == ["skipped", "ok"]
+    assert result.tasks[1].outputs == {"ok": "fine"}
+    assert result.tasks[1].reason is None
+
+
+def test_skiptask_without_a_reason_records_an_empty_reason(tmp_path):
+    """Decided by status, never by the reason's truthiness: an empty reason
+    is still a skip."""
+    capability = load_capability(FIXTURES / "skips")
+
+    result = run_request(
+        capability, _skips_request("no_reason"), credentials={}, scope_dir=tmp_path
+    )
+
+    assert result.tasks[0].status == "skipped"
+    assert result.tasks[0].reason == ""
+
+
+def test_a_skipped_task_serialises_its_status_and_reason(tmp_path):
+    capability = load_capability(FIXTURES / "skips")
+
+    result = run_request(
+        capability, _skips_request("nothing_to_do"), credentials={}, scope_dir=tmp_path
+    )
+
+    assert result.model_dump(mode="json")["tasks"][0] == {
+        "task": "nothing_to_do",
+        "status": "skipped",
+        "outputs": {},
+        "error": None,
+        "reason": "no matching files in the diff",
+    }
+
+
+def test_setup_cannot_be_skipped_and_fails_instead(tmp_path):
+    """`skipped` is a task status only: a setup that raises SkipTask has not
+    materialised anything the tasks could use, so it is an ordinary setup
+    failure."""
+    capability = load_capability(FIXTURES / "skips")
+
+    result = run_request(
+        capability,
+        _skips_request("good", setup_inputs={"skip": True}),
+        credentials={},
+        scope_dir=tmp_path,
+    )
+
+    assert result.setup.status == "failed"
+    assert "setup has nothing to do" in result.setup.error

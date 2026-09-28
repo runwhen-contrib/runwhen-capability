@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from .context import Context
-from .errors import CredentialNotFoundError, UnknownTaskError
+from .errors import CredentialNotFoundError, SkipTask, UnknownTaskError
 from .loader import LoadedCapability
 from .models import RequestEnvelope, ResultEnvelope, SetupResult, TaskResult
 from .repo_fs import TreeNotMaterializedError
@@ -245,6 +245,10 @@ def run_request(
             result.tasks.append(
                 TaskResult(task=task_spec.task, status="ok", outputs=_to_jsonable(outputs))
             )
+        except SkipTask as exc:
+            reason = str(exc.args[0]) if exc.args else ""
+            log.info("task %r skipped: %s", task_spec.task, reason or "(no reason given)")
+            result.tasks.append(TaskResult(task=task_spec.task, status="skipped", reason=reason))
         except TreeNotMaterializedError as exc:
             # Scope eviction is normal, invisible recovery, not a failure -- a reaped scope
             # must come back on the next request, not surface as a hard
