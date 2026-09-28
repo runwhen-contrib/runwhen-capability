@@ -37,8 +37,11 @@ def content_hash(files: dict[str, str]) -> str:
 
 def task_files(files: dict[str, str], task: str) -> list[str]:
     """The paths task_hash() covers for `task`: capability.yaml, every file
-    under lib/, the setup file (if any), and the named task's own file.
-    Raises KeyError if `task` does not exist in capability.yaml's `tasks`."""
+    under lib/, the setup file (if any), the named task's own file, and
+    every schema file one of its outputs references (`schema: ./x.json`) --
+    editing an output's schema changes what the task's results are checked
+    against, so it must invalidate the task's evidence too. Raises KeyError
+    if `task` does not exist in capability.yaml's `tasks`."""
     manifest = Manifest.model_validate(safe_load(files["capability.yaml"]))
     task_spec = next((t for t in manifest.tasks if t.name == task), None)
     if task_spec is None:
@@ -48,6 +51,11 @@ def task_files(files: dict[str, str], task: str) -> list[str]:
     if manifest.setup is not None:
         paths.add(manifest.setup.file)
     paths.update(path for path in files if path.startswith("lib/"))
+    paths.update(
+        output.schema_[2:]
+        for output in task_spec.outputs.values()
+        if output.schema_.startswith("./")
+    )
     return sorted(paths)
 
 

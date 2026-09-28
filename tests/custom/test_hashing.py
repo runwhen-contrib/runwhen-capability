@@ -113,3 +113,33 @@ def test_task_hash_raises_key_error_for_an_unknown_task():
     files = load_bundle("pgbouncer-health")
     with pytest.raises(KeyError):
         task_hash(files, "no-such-task")
+
+
+def test_task_hash_changes_when_a_schema_file_the_task_references_changes():
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: a
+    file: tasks/a.sh
+    outputs:
+      detail: { schema: ./schemas/detail.json }
+  - name: b
+    file: tasks/b.sh
+    outputs:
+      other: { schema: ./schemas/other.json }
+""",
+        "schemas/detail.json": '{"type": "object"}',
+        "schemas/other.json": '{"type": "string"}',
+        "tasks/a.sh": "echo a\n",
+        "tasks/b.sh": "echo b\n",
+    }
+    assert "schemas/detail.json" in task_files(files, "a")
+    assert "schemas/other.json" not in task_files(files, "a")
+
+    changed = dict(files)
+    changed["schemas/detail.json"] = '{"type": "object", "required": ["pods"]}'
+    assert task_hash(changed, "a") != task_hash(files, "a")
+    # a task that does not reference the edited schema keeps its evidence
+    assert task_hash(changed, "b") == task_hash(files, "b")
