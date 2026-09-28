@@ -320,23 +320,26 @@ def _run_setup_or_task(
             None,
         )
 
-        exit_code, stream, log_tail, timed_out = _execute(
-            files_dir=files_dir,
-            file_path=file_path,
-            language=language,
-            resolved_inputs=resolved,
-            capability=capability,
-            operation=operation,
-            scope_dir=scope_dir,
-            rw_sdk_dir=rw_sdk_dir,
-            secrets_dir=secrets_dir,
-            credentials=task_credentials,
-            deadline_seconds=deadline_seconds,
-            allow_anonymous=allow_anonymous,
-            kubeconfig_path=kubeconfig_path,
-            tail_guard=redactor.longest,
-            log=log,
-        )
+        try:
+            exit_code, stream, log_tail, timed_out = _execute(
+                files_dir=files_dir,
+                file_path=file_path,
+                language=language,
+                resolved_inputs=resolved,
+                capability=capability,
+                operation=operation,
+                scope_dir=scope_dir,
+                rw_sdk_dir=rw_sdk_dir,
+                secrets_dir=secrets_dir,
+                credentials=task_credentials,
+                deadline_seconds=deadline_seconds,
+                allow_anonymous=allow_anonymous,
+                kubeconfig_path=kubeconfig_path,
+                tail_guard=redactor.longest,
+                log=log,
+            )
+        except (_LaunchError, OSError) as exc:
+            return _RunOutcome(status="failed", error=str(exc), errors=[str(exc)])
         log_tail = redactor.text(log_tail)[-LOG_TAIL_BYTES:] if log_tail else log_tail
 
         if timed_out:
@@ -649,6 +652,10 @@ def _drain_text(stream, tail: _TailBuffer) -> None:
         tail.write(chunk)
 
 
+class _LaunchError(RuntimeError):
+    """The child process for a setup/task could not be started."""
+
+
 @dataclass
 class _EventStream:
     """What _drain_events() read off a task's private output fd."""
@@ -788,9 +795,7 @@ def _execute(
     with `deadline_seconds` enforced by SIGKILL-ing the whole group. Returns
     (exit code, what was read off the output fd, combined stdout+stderr
     tail -- up to 2 * LOG_TAIL_BYTES, unredacted -- whether the deadline was
-    hit)."""
-    read_fd, write_fd = os.pipe()
-
+    hit). Raises _LaunchError if the child could not be started at all."""
     base_env = {
         **_inherited_env(),
         "HOME": str(scope_dir / _HOME_DIR),
@@ -798,7 +803,6 @@ def _execute(
         "RW_WORKDIR": str(scope_dir),
         "RW_CAPABILITY": capability,
         "RW_OPERATION": operation,
-        "RW_OUTPUT_FD": str(write_fd),
     }
     if kubeconfig_path:
         base_env["KUBECONFIG"] = kubeconfig_path
@@ -828,6 +832,8 @@ def _execute(
             "RW_ALLOW_ANONYMOUS": "1" if allow_anonymous else "0",
         }
 
+    read_fd, write_fd = os.pipe()
+    env["RW_OUTPUT_FD"] = str(write_fd)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is this module's own construction
             argv,
@@ -842,6 +848,11 @@ def _execute(
             # proc.pid is also the process group id -- see _kill_process_group.
             start_new_session=True,
         )
+    except OSError as exc:
+        # E.g. E2BIG: an input value too large for the environment. This
+        # task fails; the rest of the request still runs.
+        os.close(read_fd)
+        raise _LaunchError(f"could not start {file_path}: {exc}") from exc
     finally:
         os.close(write_fd)  # the parent's copy; the child keeps its own via pass_fds
 

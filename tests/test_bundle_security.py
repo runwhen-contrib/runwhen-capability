@@ -402,3 +402,27 @@ def test_rw_input_refuses_a_name_that_is_not_an_identifier(tmp_path):
     result = _run(_files("t.sh", source), tmp_path / "scope")
     assert result.tasks[0].outputs == {"o": "refused"}
     assert not marker.exists()
+
+
+def test_a_task_that_cannot_be_started_fails_alone(tmp_path):
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: probe
+tasks:
+  - name: big
+    file: tasks/t.sh
+    inputs:
+      blob: { type: string, runtime: true }
+  - name: ok
+    file: tasks/ok.sh
+""",
+        "tasks/t.sh": "echo $BLOB\n",
+        "tasks/ok.sh": "echo fine\n",
+    }
+    request = _request(files)
+    request.tasks = ["big", "ok"]
+    request.inputs = {"blob": "x" * (4 * 1024 * 1024)}  # over any exec() environment limit
+    result = run_bundle_request(request, {}, tmp_path)
+    assert [task.status for task in result.tasks] == ["failed", "ok"]
+    assert "could not start" in result.tasks[0].error
