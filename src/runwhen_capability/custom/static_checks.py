@@ -18,9 +18,12 @@ import re
 # -- python: main()'s signature and what it returns --------------------------
 
 
-def python_main_params(source: str) -> tuple[list[str], bool] | None:
-    """(named parameters after `ctx`, has **kwargs) for the module-level
-    `main` function in a Python task/setup file. None if `source` doesn't
+def python_main_params(source: str) -> tuple[list[tuple[str, int]], bool] | None:
+    """((name, line) for every named parameter after `ctx`, has **kwargs)
+    for the module-level `main` function in a Python task/setup file -- the
+    line is the parameter's own `ast.arg` node, e.g. `def main(ctx,
+    mystery):`'s `mystery` reports its own line, not `main`'s, so an editor
+    can point straight at the offending parameter. None if `source` doesn't
     parse or declares no top-level `main` -- both are runtime errors the
     host itself raises, not something validate() flags."""
     try:
@@ -30,10 +33,10 @@ def python_main_params(source: str) -> tuple[list[str], bool] | None:
     for node in tree.body:
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "main":
             args = node.args
-            positional = [a.arg for a in [*args.posonlyargs, *args.args]]
+            positional = [*args.posonlyargs, *args.args]
             named = positional[1:] if positional else []  # drop `ctx`
-            named += [a.arg for a in args.kwonlyargs]
-            return named, args.kwarg is not None
+            named += list(args.kwonlyargs)
+            return [(a.arg, a.lineno) for a in named], args.kwarg is not None
     return None
 
 

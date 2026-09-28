@@ -156,6 +156,41 @@ tasks:
     assert any(d.code == E_UNDECLARED_INPUT and "mystery" in d.message for d in diagnostics)
 
 
+def test_e_undeclared_input_python_parameter_carries_its_own_line():
+    """The line reported is the offending parameter's own -- so an editor
+    (or an agent's edit tool) can point straight at it -- not main()'s
+    def line or the file's first line."""
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.py
+""",
+        "tasks/t.py": "def main(\n    ctx,\n    mystery,\n):\n    return {}\n",
+    }
+    [diag] = [d for d in validate(files) if d.code == E_UNDECLARED_INPUT and "mystery" in d.message]
+    assert diag.file == "tasks/t.py"
+    assert diag.line == 3
+
+
+def test_e_undeclared_input_bash_carries_its_line():
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+""",
+        "tasks/t.sh": 'echo start\necho "$MYSTERY"\n',
+    }
+    [diag] = [d for d in validate(files) if d.code == E_UNDECLARED_INPUT]
+    assert diag.file == "tasks/t.sh"
+    assert diag.line == 2
+
+
 def test_e_undeclared_input_python_kwargs_is_not_flagged():
     files = {
         "capability.yaml": """\

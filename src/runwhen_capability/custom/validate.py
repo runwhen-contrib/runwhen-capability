@@ -422,12 +422,13 @@ def _check_source(
         if signature is not None:
             params, has_var_keyword = signature
             if not has_var_keyword:
-                for param in params:
+                for param, line in params:
                     if param not in declared_inputs:
                         diagnostics.append(
                             Diagnostic(
                                 code=E_UNDECLARED_INPUT,
                                 file=file_path,
+                                line=line,
                                 message=f"main() parameter {param!r} has no declared input",
                             )
                         )
