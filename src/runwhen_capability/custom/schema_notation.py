@@ -37,6 +37,11 @@ _SCALARS: dict[str, dict] = {
 
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+# Nesting (objects and `[]` lists together) deeper than this is refused: the
+# parser is recursive, a schema string is untrusted input to validate(), and
+# the compiled schema is later serialized and evaluated recursively too.
+MAX_DEPTH = 32
+
 
 class SchemaNotationError(ValueError):
     """A compact schema string could not be parsed (E_SCHEMA_NOTATION)."""
@@ -50,6 +55,7 @@ class _Parser:
         self.text = text
         self.pos = 0
         self.end = len(text)
+        self.depth = 0
 
     def parse(self) -> dict:
         self._skip_ws()
@@ -91,7 +97,11 @@ class _Parser:
         self._skip_ws()
         node = self._parse_object() if self._peek() == "{" else self._parse_named()
         self._skip_ws()
+        levels = 0
         while self.text[self.pos : self.pos + 2] == "[]":
+            levels += 1
+            if self.depth + levels > MAX_DEPTH:
+                raise SchemaNotationError(f"schema nested deeper than {MAX_DEPTH} levels")
             node = {"type": "array", "items": node}
             self.pos += 2
             self._skip_ws()
@@ -99,6 +109,15 @@ class _Parser:
 
     def _parse_object(self) -> dict:
         self._expect("{")
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            raise SchemaNotationError(f"objects nested deeper than {MAX_DEPTH} levels")
+        try:
+            return self._parse_object_body()
+        finally:
+            self.depth -= 1
+
+    def _parse_object_body(self) -> dict:
         properties: dict[str, dict] = {}
         required: list[str] = []
         self._skip_ws()

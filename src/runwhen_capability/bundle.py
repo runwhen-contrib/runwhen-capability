@@ -57,13 +57,13 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
-import yaml
 
 from ._rw_sh import RW_SH
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT
 from .custom.hashing import content_hash
 from .custom.manifest import Manifest, input_env_name, python_kwarg_name, task_file_language
+from .custom.yaml_lines import safe_load
 from .models import BundleRequestEnvelope, ResultEnvelope, SetupResult, TaskResult
 
 LOG_TAIL_BYTES = 64 * 1024
@@ -116,7 +116,7 @@ def run_bundle_request(
         result.setup = SetupResult(status="failed", error=f"invalid bundle: {exc}")
         return result
 
-    manifest = Manifest.model_validate(yaml.safe_load(files["capability.yaml"]))
+    manifest = Manifest.model_validate(safe_load(files["capability.yaml"]))
     compiled_tasks = {t["name"]: t for t in compiled["tasks"]}
 
     files_dir = scope_dir / "bundle"

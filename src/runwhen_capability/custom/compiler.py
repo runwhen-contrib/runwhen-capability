@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import json
 
-import yaml
-
 from .diagnostics import Diagnostic
 from .manifest import Manifest, TaskSpec
 from .schema_notation import compile_schema_notation
 from .validate import validate
+from .yaml_lines import safe_load
 
 
 class CompileError(RuntimeError):
@@ -41,7 +40,7 @@ def compile_manifest(files: dict[str, str]) -> dict:
     # every task file/schema resolves, and every input is well-formed --
     # re-parsing here is cheap and keeps this function self-contained rather
     # than threading the already-validated model back out of validate().
-    manifest = Manifest.model_validate(yaml.safe_load(files["capability.yaml"]))
+    manifest = Manifest.model_validate(safe_load(files["capability.yaml"]))
 
     return {
         "capability": manifest.name,

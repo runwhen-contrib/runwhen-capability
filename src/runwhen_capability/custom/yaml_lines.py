@@ -32,7 +32,23 @@ class _LineList(list):
         self.line = line
 
 
-class _LineLoader(yaml.SafeLoader):
+class _NoAliasSafeLoader(yaml.SafeLoader):
+    """yaml.SafeLoader, except an alias (`*name`) is a YAMLError. A manifest
+    never needs one, and aliases are how a few hundred bytes of YAML expand
+    into gigabytes once something walks or serializes the result (the
+    "billion laughs" shape) -- which compile_manifest()'s callers and the
+    bundle host both do."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise yaml.composer.ComposerError(
+                None, None, "YAML aliases (*name) are not allowed", event.start_mark
+            )
+        return super().compose_node(parent, index)
+
+
+class _LineLoader(_NoAliasSafeLoader):
     pass
 
 
@@ -49,9 +65,16 @@ _LineLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_SEQUENCE_TAG, _co
 
 
 def load_with_lines(text: str) -> Any:
-    """yaml.safe_load, except every mapping/sequence node also carries
+    """safe_load(), except every mapping/sequence node also carries
     `.line` (1-indexed, the line its opening brace/dash is on)."""
-    return yaml.load(text, Loader=_LineLoader)
+    return yaml.load(text, Loader=_LineLoader)  # noqa: S506 -- a SafeLoader subclass
+
+
+def safe_load(text: str) -> Any:
+    """yaml.safe_load, with aliases refused (see _NoAliasSafeLoader). Every
+    parse of a bundle's capability.yaml goes through this or
+    load_with_lines()."""
+    return yaml.load(text, Loader=_NoAliasSafeLoader)  # noqa: S506 -- a SafeLoader subclass
 
 
 def line_of(node: Any) -> int | None:

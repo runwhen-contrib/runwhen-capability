@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import unicodedata
 
+import jsonschema
 import yaml
 from pydantic import ValidationError
 
@@ -74,7 +75,30 @@ _STANDARD_BASH_ENV = frozenset(
 )
 
 
+# An escape-hatch JSON Schema file nested deeper than this is refused -- the
+# same bound the compact notation has (schema_notation.MAX_DEPTH), with room
+# for JSON Schema's own wrapper objects (properties, items, ...).
+MAX_SCHEMA_DEPTH = 64
+
+# Keywords whose value is a URI reference the validator would resolve.
+_REF_KEYWORDS = frozenset({"$ref", "$dynamicRef", "$recursiveRef"})
+
+
 def validate(files: dict[str, str]) -> list[Diagnostic]:
+    try:
+        return _validate(files)
+    except RecursionError:
+        # Every known deep-nesting path is bounded above; this is the net
+        # under them, so validate() still returns rather than raises.
+        return [
+            Diagnostic(
+                code=E_MANIFEST_SCHEMA,
+                message="the bundle is nested too deeply to analyse",
+            )
+        ]
+
+
+def _validate(files: dict[str, str]) -> list[Diagnostic]:
     diagnostics = _check_paths_and_limits(files)
 
     if "capability.yaml" not in files:
@@ -89,6 +113,15 @@ def validate(files: dict[str, str]) -> list[Diagnostic]:
 
     try:
         raw = load_with_lines(files["capability.yaml"])
+    except RecursionError:
+        diagnostics.append(
+            Diagnostic(
+                code=E_MANIFEST_SCHEMA,
+                file="capability.yaml",
+                message="capability.yaml is nested too deeply to load",
+            )
+        )
+        return diagnostics
     except yaml.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None)
         diagnostics.append(
@@ -494,24 +527,14 @@ def _check_output_schema(
                     ),
                 )
             ]
-        try:
-            parsed = json.loads(files[ref])
-        except json.JSONDecodeError as exc:
+        problem = _json_schema_file_problem(files[ref])
+        if problem is not None:
             return [
                 Diagnostic(
                     code=E_SCHEMA_NOTATION,
                     file=ref,
                     path=loc_path,
-                    message=f"{ref} is not valid JSON: {exc}",
-                )
-            ]
-        if not isinstance(parsed, dict):
-            return [
-                Diagnostic(
-                    code=E_SCHEMA_NOTATION,
-                    file=ref,
-                    path=loc_path,
-                    message=f"{ref} must be a JSON Schema object",
+                    message=f"{ref}: {problem}",
                 )
             ]
         return []
@@ -529,6 +552,41 @@ def _check_output_schema(
             )
         ]
     return []
+
+
+def _json_schema_file_problem(text: str) -> str | None:
+    """Why an escape-hatch schema file is unusable, or None. It must be a
+    JSON object, nested no deeper than MAX_SCHEMA_DEPTH, a valid JSON Schema
+    (its own metaschema), and every `$ref` in it must be local ("#...") --
+    the bundle host evaluates this schema against task output, and a
+    non-local `$ref` would make it fetch a URL or read a file to do so."""
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError) as exc:
+        return f"not valid JSON: {exc}"
+    if not isinstance(parsed, dict):
+        return "must be a JSON Schema object"
+
+    stack: list[tuple[object, int]] = [(parsed, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_SCHEMA_DEPTH:
+            return f"nested deeper than {MAX_SCHEMA_DEPTH} levels"
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in _REF_KEYWORDS and not (isinstance(value, str) and value.startswith("#")):
+                    return f"{key} {value!r} is not a local reference (must start with '#')"
+                stack.append((value, depth + 1))
+        elif isinstance(node, list):
+            stack.extend((item, depth + 1) for item in node)
+
+    try:
+        jsonschema.validators.validator_for(parsed).check_schema(parsed)
+    except jsonschema.exceptions.SchemaError as exc:
+        return f"not a valid JSON Schema: {exc.message}"
+    except Exception as exc:  # noqa: BLE001 -- untrusted input; report, never raise
+        return f"not a valid JSON Schema: {type(exc).__name__}"
+    return None
 
 
 def _check_source(

@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import hashlib
 
-import yaml
-
 from .manifest import Manifest
+from .yaml_lines import safe_load
 
 
 def _file_sha256(content: str) -> str:
@@ -40,7 +39,7 @@ def task_files(files: dict[str, str], task: str) -> list[str]:
     """The paths task_hash() covers for `task`: capability.yaml, every file
     under lib/, the setup file (if any), and the named task's own file.
     Raises KeyError if `task` does not exist in capability.yaml's `tasks`."""
-    manifest = Manifest.model_validate(yaml.safe_load(files["capability.yaml"]))
+    manifest = Manifest.model_validate(safe_load(files["capability.yaml"]))
     task_spec = next((t for t in manifest.tasks if t.name == task), None)
     if task_spec is None:
         raise KeyError(f"no task {task!r} in capability.yaml")

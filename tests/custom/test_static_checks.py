@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from runwhen_capability.custom.static_checks import (
     _strip_comments_and_heredocs,
+    bash_env_reads,
+    bash_locally_assigned_names,
     bash_output_writes,
     mutating_kubectl_calls,
 )
@@ -49,3 +51,12 @@ def test_bash_output_writes_ignores_a_comment_mentioning_rw_append():
 def test_mutating_kubectl_calls_ignores_a_heredoc_example():
     text = "cat <<EOF\nkubectl delete pod x\nEOF\nkubectl get pods\n"
     assert mutating_kubectl_calls(text) == []
+
+
+def test_a_default_that_reads_another_variable_reports_both_names():
+    assert [name for _, name in bash_env_reads('echo "${A:-$B}"\n')] == ["A", "B"]
+
+
+def test_assignments_with_and_without_a_keyword_are_local_names():
+    source = "x=1\n  local y=2\nexport  Z=3\nlocalq=4\n"
+    assert bash_locally_assigned_names(source) == {"x", "y", "Z", "localq"}

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from bundle_fixtures import load_bundle
 
@@ -549,3 +551,91 @@ def test_capability_and_task_names_must_be_lowercase_slugs(name):
     as_task = validate(_named(task=f'"{name}"'))
     assert any(d.code == E_MANIFEST_SCHEMA and d.path == "name" for d in as_capability)
     assert any(d.code == E_MANIFEST_SCHEMA and d.path == "tasks[0].name" for d in as_task)
+
+
+# -- validate() on crafted input: bounded time, never raises ------------------
+
+_ONE_TASK = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/{file}
+    outputs:
+      o: {{ schema: "{schema}" }}
+"""
+
+
+def _one_task(source: str, file: str = "t.sh", schema: str = "string", **extra) -> dict:
+    return {
+        "capability.yaml": _ONE_TASK.format(file=file, schema=schema),
+        f"tasks/{file}": source,
+        **extra,
+    }
+
+
+def _timed_validate(files):
+    started = time.monotonic()
+    diagnostics = validate(files)
+    return diagnostics, time.monotonic() - started
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "# " + "a" * 60000 + "\n",  # a long comment line is blanked to spaces before scanning
+        " " * 60000 + "x\n",
+        "echo " + "${a-" * 15000 + "\n",  # unclosed expansions
+    ],
+    ids=["long-comment", "long-blank-run", "unclosed-expansions"],
+)
+def test_bash_scans_stay_linear_on_crafted_source(source):
+    _, elapsed = _timed_validate(_one_task(source))
+    assert elapsed < 2
+
+
+def test_deeply_nested_python_does_not_raise():
+    source = "def main(ctx):\n    x = 1" + "+1" * 20000 + "\n    return {}\n"
+    diagnostics = validate(_one_task(source, file="t.py"))
+    assert all(d.code != E_MANIFEST_SCHEMA for d in diagnostics)
+
+
+@pytest.mark.parametrize("schema", ["{a:" * 40 + "string" + "}" * 40, "integer" + "[]" * 40])
+def test_a_compact_schema_nested_too_deep_is_e_schema_notation(schema):
+    assert E_SCHEMA_NOTATION in _codes(_one_task("echo\n", schema=schema))
+
+
+def test_deeply_nested_yaml_is_e_manifest_schema_not_an_exception():
+    assert E_MANIFEST_SCHEMA in _codes({"capability.yaml": "a: " + "[" * 5000 + "]" * 5000})
+
+
+def test_yaml_aliases_are_refused():
+    bomb = "\n".join(
+        ["a0: &a0 [x, x, x, x, x, x, x, x, x, x]"]
+        + [f"a{i}: &a{i} [" + ", ".join([f"*a{i - 1}"] * 10) + "]" for i in range(1, 9)]
+    )
+    manifest = bomb + "\n" + _ONE_TASK.format(file="t.sh", schema="string")
+    diagnostics = validate({"capability.yaml": manifest, "tasks/t.sh": "echo\n"})
+    assert any(d.code == E_MANIFEST_SCHEMA and "alias" in d.message for d in diagnostics)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("[" * 20000 + "]" * 20000, "not valid JSON"),
+        ('{"$ref": "file:///etc/hosts"}', "not a local reference"),
+        ('{"$ref": "https://example.com/s.json"}', "not a local reference"),
+        ('{"type": 5}', "not a valid JSON Schema"),
+        ("{" + '"items": {' * 70 + "}" * 71, "nested deeper"),
+    ],
+)
+def test_an_escape_hatch_schema_file_must_be_local_valid_and_bounded(content, expected):
+    files = _one_task("echo\n", schema="./schemas/s.json", **{"schemas/s.json": content})
+    diagnostics = [d for d in validate(files) if d.code == E_SCHEMA_NOTATION]
+    assert diagnostics and expected in diagnostics[0].message
+
+
+def test_an_escape_hatch_schema_with_a_local_ref_is_fine():
+    content = '{"$defs": {"n": {"type": "integer"}}, "$ref": "#/$defs/n"}'
+    files = _one_task("echo\n", schema="./schemas/s.json", **{"schemas/s.json": content})
+    assert validate(files) == []
