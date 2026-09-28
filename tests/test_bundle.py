@@ -179,6 +179,20 @@ def test_missing_required_secret_fails_before_running(tmp_path):
     assert any("E_INPUT_TYPE" in e for e in task.errors)
 
 
+def test_a_runtime_input_of_the_wrong_type_fails_with_e_input_type(tmp_path):
+    result = _run(
+        PGBOUNCER,
+        ["pool-errors"],
+        tmp_path,
+        inputs={"since": "45m", "maxWait": "not-an-integer"},
+        target={"urn": "urn:resource:pgbouncer"},
+        credentials={"kubeconfig": "kubeconfig-value"},
+    )
+    [task] = result.tasks
+    assert task.status == "failed"
+    assert any("E_INPUT_TYPE" in e and "maxWait" in e for e in task.errors)
+
+
 def test_an_unknown_requested_task_fails_only_that_entry(tmp_path):
     result = _run(EXEC, ["ok-py", "no-such-task"], tmp_path)
     assert result.tasks[0].status == "ok"

@@ -106,6 +106,14 @@ def test_e_limit_on_too_many_files():
     assert E_LIMIT in _codes(files)
 
 
+def test_e_limit_on_total_bundle_size():
+    files = dict(load_bundle("pgbouncer-health"))
+    # Five ~60 KiB files, each under the per-file cap on its own, together
+    # well over the 256 KiB bundle cap.
+    files.update({f"tests/f{i}.txt": "x" * (60 * 1024) for i in range(5)})
+    assert E_LIMIT in _codes(files)
+
+
 def test_e_task_file_missing():
     files = {
         "capability.yaml": """\
