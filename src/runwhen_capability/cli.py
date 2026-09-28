@@ -17,9 +17,12 @@ import os
 import sys
 from pathlib import Path
 
+from . import __version__
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rwtask")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve_p = sub.add_parser("serve", help="long-poll the runner and execute requests")

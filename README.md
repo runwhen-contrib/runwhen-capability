@@ -117,6 +117,17 @@ make lint      # ruff check
 make fmt-check # ruff format --check
 ```
 
+## Releasing
+
+Versions follow semver. The version is written in exactly one place, `__version__` in
+`src/runwhen_capability/__init__.py`; `rwtask --version` prints it.
+
+1. Bump `__version__` and add a `CHANGELOG.md` entry; merge to `main`.
+2. Tag that commit `v<version>` and push the tag.
+
+The release workflow tests the tagged commit, refuses a tag that differs from `__version__`,
+builds the wheel and sdist, and attaches them to a GitHub Release. Nothing is published to PyPI.
+
 ## License
 
 Apache-2.0.

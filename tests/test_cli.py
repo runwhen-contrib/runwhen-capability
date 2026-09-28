@@ -44,3 +44,14 @@ def test_serve_errors_clearly_when_neither_flag_nor_env_is_present(monkeypatch, 
     with pytest.raises(SystemExit):
         main(["serve", "--capability-dir", "capabilities/example"])
     assert "RELAY_URL" in capsys.readouterr().err
+
+
+def test_version_prints_the_package_version(capsys):
+    from runwhen_capability import __version__
+    from runwhen_capability.cli import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == f"rwtask {__version__}"

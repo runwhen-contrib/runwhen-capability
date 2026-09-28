@@ -1,0 +1,78 @@
+name: Release
+
+# Pushing a semver tag (v0.1.0, v0.2.0-rc.1, ...) publishes a GitHub Release
+# with the wheel and sdist attached. The tag must equal
+# runwhen_capability.__version__ -- the package version has exactly one
+# source, and a release whose files disagree with its tag is refused.
+#
+# Capability repos install a release straight from the tag:
+#   runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@v0.1.0
+# and call .github/workflows/capability-image.yml at the same tag.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python3 -m pip install --quiet -e ".[dev]"
+
+      - name: Test
+        run: |
+          python3 -m pytest -q
+          ruff check .
+          ruff format --check .
+
+      - name: Check the tag matches the package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(python3 -c 'import runwhen_capability; print(runwhen_capability.__version__)')"
+          if [ "${TAG}" != "v${version}" ]; then
+            echo "::error::tag ${TAG} does not match runwhen_capability.__version__ (${version})"
+            exit 1
+          fi
+
+      - name: Build the wheel and sdist
+        run: python3 -m build
+
+      - name: Smoke-test the wheel
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "${RUNNER_TEMP}/wheel"
+          "${RUNNER_TEMP}/wheel/bin/pip" install --quiet dist/*.whl
+          got="$("${RUNNER_TEMP}/wheel/bin/rwtask" --version)"
+          if [ "${got}" != "rwtask ${TAG#v}" ]; then
+            echo "::error::installed wheel reports '${got}', expected 'rwtask ${TAG#v}'"
+            exit 1
+          fi
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          flags=()
+          case "${TAG}" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "${TAG}" dist/* --title "${TAG}" --generate-notes --verify-tag "${flags[@]}"

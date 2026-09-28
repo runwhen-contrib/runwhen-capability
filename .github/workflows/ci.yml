@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python3 -m pip install --quiet -e ".[dev]"
+
+      - name: pytest
+        run: python3 -m pytest -q
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+      - name: Build the wheel and sdist
+        run: python3 -m build
+
+  # This repo ships a reusable workflow that other repos call by tag, so a
+  # workflow that does not parse is a release-blocking bug.
+  workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: actionlint
+        run: docker run --rm -v "${PWD}:/repo" -w /repo rhysd/actionlint:1.7.12 -color
