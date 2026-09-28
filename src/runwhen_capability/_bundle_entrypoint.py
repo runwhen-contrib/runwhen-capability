@@ -18,18 +18,22 @@ its stderr, captured by bundle.py as part of the task's log) is how bundle.py
 learns the task failed -- there is no separate error channel.
 
 Everything this process needs arrives by environment variable -- see
-bundle.py's _python_env() for exactly what it sets:
+bundle.py's _execute() for exactly what it sets:
 
-    RW_TASK_FILE        absolute path to the .py file to run
-    RW_FUNC             the function to call (default "main")
+    RW_TASK_FILE         absolute path to the .py file to run
+    RW_FUNC              the function to call (default "main")
     RW_INPUTS_JSON       inputs, JSON-encoded
-    RW_OUTPUT_FD          the private fd to write wire events to
-    RW_WORKDIR            Context.workdir
-    RW_CAPABILITY          Context.capability
-    RW_OPERATION            Context.operation
-    RW_CREDENTIALS_JSON      Context credentials, JSON-encoded
-    RW_ALLOW_ANONYMOUS       "1" to degrade unresolved credentials (rwtask
-                              run --allow-anonymous only)
+    RW_OUTPUT_FD         the private fd to write wire events to
+    RW_WORKDIR           Context.workdir
+    RW_CAPABILITY        Context.capability
+    RW_OPERATION         Context.operation
+    RW_CREDENTIALS_FILE  a 0600 file holding Context credentials as JSON;
+                         read and deleted before the task's code runs
+    RW_ALLOW_ANONYMOUS   "1" to degrade unresolved credentials (rwtask
+                         run --allow-anonymous only)
+
+The variables only this wrapper needs are removed from os.environ before the
+task's module is even imported, so nothing the task starts inherits them.
 """
 
 from __future__ import annotations
@@ -50,19 +54,41 @@ def _write_event(fd: int, event: dict) -> None:
     os.write(fd, (json.dumps(event) + "\n").encode("utf-8"))
 
 
+_WRAPPER_ONLY_ENV = (
+    "RW_TASK_FILE",
+    "RW_FUNC",
+    "RW_INPUTS_JSON",
+    "RW_CREDENTIALS_FILE",
+    "RW_ALLOW_ANONYMOUS",
+)
+
+
+def _read_credentials() -> dict[str, str]:
+    path = os.environ.get("RW_CREDENTIALS_FILE")
+    if not path:
+        return {}
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
 def main() -> int:
     task_file = Path(os.environ["RW_TASK_FILE"])
     func_name = os.environ.get("RW_FUNC", "main")
     inputs = json.loads(os.environ.get("RW_INPUTS_JSON", "{}"))
     output_fd = int(os.environ["RW_OUTPUT_FD"])
-    credentials = json.loads(os.environ.get("RW_CREDENTIALS_JSON", "{}"))
+    credentials = _read_credentials()
+    allow_anonymous = os.environ.get("RW_ALLOW_ANONYMOUS") == "1"
+    for name in _WRAPPER_ONLY_ENV:
+        os.environ.pop(name, None)
 
     ctx = Context(
         capability=os.environ.get("RW_CAPABILITY", ""),
         operation=os.environ.get("RW_OPERATION", ""),
         workdir=Path(os.environ.get("RW_WORKDIR", ".")),
         credentials=credentials,
-        allow_anonymous_credentials=os.environ.get("RW_ALLOW_ANONYMOUS") == "1",
+        allow_anonymous_credentials=allow_anonymous,
     )
 
     module_name = f"runwhen_capability_bundle_{uuid.uuid4().hex}"

@@ -317,6 +317,7 @@ def _poll_once(
             # otherwise unused by this loop (host.run_request() has no
             # per-request deadline of its own); bundle mode is the first
             # thing that actually enforces it, as each task's own deadline.
+            os.chmod(scope_dir, 0o700)
             result = run_bundle_request(
                 task_request.request,
                 task_request.credentials,

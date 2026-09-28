@@ -36,9 +36,14 @@ Inputs/outputs cross that boundary two ways:
 
 A `resource`-typed input's value is the run's target resource (dict, JSON
 over the wire); a `secret`/`credential`-typed input's value is always a file
-path (the raw value is written to `<scope>/secrets/<name>`, 0600) -- never
+path (the raw value is written to a new 0600 file in a fresh, randomly
+named 0700 directory that is removed when the invocation ends) -- never
 inlined, in either language. A `credential` of kind `k8s.kubeconfig` also
 sets `KUBECONFIG` to that same path.
+
+Each child also gets its own HOME and TMPDIR inside the scope, stdin from
+/dev/null, and the host's environment minus the variables that locate the
+relay and its token (see _inherited_env).
 """
 
 from __future__ import annotations
@@ -47,9 +52,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -62,7 +69,13 @@ from ._rw_sh import RW_SH
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT
 from .custom.hashing import content_hash
-from .custom.manifest import Manifest, input_env_name, python_kwarg_name, task_file_language
+from .custom.manifest import (
+    Manifest,
+    input_env_name,
+    is_allowed_path,
+    python_kwarg_name,
+    task_file_language,
+)
 from .custom.yaml_lines import safe_load
 from .models import BundleRequestEnvelope, ResultEnvelope, SetupResult, TaskResult
 
@@ -99,7 +112,16 @@ def run_bundle_request(
     scope_dir = Path(scope_dir)
     result = ResultEnvelope()
 
-    files = {f.path: f.content for f in request.bundle.files}
+    files: dict[str, str] = {}
+    for bundle_file in request.bundle.files:
+        if bundle_file.path in files:
+            # Two entries for one path: which one "is" the bundle depends on
+            # list order, so the hash no longer pins what runs. Fail closed.
+            result.setup = SetupResult(
+                status="failed", error=f"bundle lists {bundle_file.path!r} more than once"
+            )
+            return result
+        files[bundle_file.path] = bundle_file.content
     computed = content_hash(files)
     if computed != request.bundle.hash:
         result.setup = SetupResult(
@@ -120,9 +142,15 @@ def run_bundle_request(
     compiled_tasks = {t["name"]: t for t in compiled["tasks"]}
 
     files_dir = scope_dir / "bundle"
-    _materialize(files_dir, files)
     rw_sdk_dir = scope_dir / ".rw-sdk"
-    _write_rw_sdk(rw_sdk_dir)
+    try:
+        _prepare_scope(scope_dir)
+        _materialize(files_dir, files)
+        _fresh_dir(rw_sdk_dir, marker="rw.sh")
+        _write_private_file(rw_sdk_dir, "rw.sh", RW_SH)
+    except (OSError, ValueError) as exc:
+        result.setup = SetupResult(status="failed", error=f"could not write the bundle: {exc}")
+        return result
 
     target = request.target.model_dump(mode="json") if request.target else None
 
@@ -222,105 +250,127 @@ def _run_setup_or_task(
     if language is None:
         return _RunOutcome(status="failed", error=f"{file_path}: unsupported file type")
 
-    resolved, type_errors = _resolve_inputs(
-        input_specs, provided_inputs, target, credentials, scope_dir, allow_anonymous
-    )
-    secrets = [v for v in credentials.values() if v]
-    if type_errors:
-        return _RunOutcome(status="failed", error="; ".join(type_errors), errors=type_errors)
+    # Each invocation's secret files live in their own fresh, randomly named
+    # 0700 directory, removed as soon as the invocation ends -- a later task
+    # (or anything an earlier one left behind) never finds them at a known
+    # path, and they never outlive the process that needed them.
+    with tempfile.TemporaryDirectory(
+        prefix=".secrets-", dir=scope_dir, ignore_cleanup_errors=True
+    ) as secrets_tmp:
+        secrets_dir = Path(secrets_tmp)
+        resolved, type_errors = _resolve_inputs(
+            input_specs, provided_inputs, target, credentials, secrets_dir, allow_anonymous
+        )
+        secrets = [v for v in credentials.values() if v]
+        if type_errors:
+            return _RunOutcome(status="failed", error="; ".join(type_errors), errors=type_errors)
 
-    kubeconfig_path = next(
-        (
-            resolved[name]
+        # A Python task's ctx.credential() sees only the secrets/credentials its
+        # own declared inputs name -- exactly what a bash task gets as files --
+        # never every credential the request happens to carry.
+        task_credentials = {
+            name: credentials[name]
             for name, spec in input_specs.items()
-            if spec.get("type") == "credential"
-            and spec.get("kind") == "k8s.kubeconfig"
-            and name in resolved
-        ),
-        None,
-    )
+            if spec.get("type") in ("secret", "credential") and name in credentials
+        }
 
-    exit_code, events, log_tail, timed_out = _execute(
-        files_dir=files_dir,
-        file_path=file_path,
-        language=language,
-        resolved_inputs=resolved,
-        capability=capability,
-        operation=operation,
-        scope_dir=scope_dir,
-        rw_sdk_dir=rw_sdk_dir,
-        credentials=credentials,
-        deadline_seconds=deadline_seconds,
-        allow_anonymous=allow_anonymous,
-        kubeconfig_path=kubeconfig_path,
-        log=log,
-    )
-    log_tail = _redact_text(log_tail, secrets) if log_tail else log_tail
-
-    if timed_out:
-        return _RunOutcome(
-            status="timeout",
-            error=f"{E_TIMEOUT}: exceeded the {deadline_seconds}s deadline",
-            errors=[f"{E_TIMEOUT}: exceeded the {deadline_seconds}s deadline"],
-            log_tail=log_tail,
+        kubeconfig_path = next(
+            (
+                resolved[name]
+                for name, spec in input_specs.items()
+                if spec.get("type") == "credential"
+                and spec.get("kind") == "k8s.kubeconfig"
+                and name in resolved
+            ),
+            None,
         )
 
-    skip_event = next((e for e in events if e.get("op") == "skip"), None)
-    if skip_event is not None:
-        reason = skip_event.get("reason") or ""
-        if is_setup:
-            # "Only tasks can skip" -- a setup that skips has not
-            # materialised anything, exactly like a packaged capability's
-            # setup raising SkipTask (host.py, SkipTask's own docstring).
-            return _RunOutcome(status="failed", error=reason or "setup skipped", log_tail=log_tail)
-        return _RunOutcome(status="skipped", reason=reason, log_tail=log_tail)
-
-    outputs: dict[str, Any] = {}
-    for event in events:
-        op, name = event.get("op"), event.get("name")
-        if op == "set" and name is not None:
-            outputs[name] = event.get("value")
-        elif op == "append" and name is not None:
-            bucket = outputs.setdefault(name, [])
-            if isinstance(bucket, list):
-                bucket.append(event.get("value"))
-
-    if declared_outputs is not None:
-        # A name the source produced but never declared already failed
-        # validate() at authoring time (E_OUTPUT_UNDECLARED) -- at runtime
-        # it is simply dropped rather than failing an otherwise-good result.
-        outputs = {name: value for name, value in outputs.items() if name in declared_outputs}
-
-    errors: list[str] = []
-    if exit_code != 0:
-        errors.append(f"process exited {exit_code}")
-
-    if declared_outputs is not None:
-        for name, value in outputs.items():
-            errors.extend(_validate_output_schema(name, value, declared_outputs[name]["schema"]))
-
-    outputs, size_errors = _apply_size_caps(outputs)
-    errors.extend(size_errors)
-
-    outputs = _redact_value(outputs, secrets)
-
-    # A list output cut to fit its size cap is noted in `errors` but does
-    # NOT fail the task -- only a non-list output/whole result still over
-    # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code or a schema
-    # violation. Truncation notices carry neither prefix, so this is exactly
-    # "every error EXCEPT a plain truncation notice".
-    failed = exit_code != 0 or any(
-        msg.startswith(E_OUTPUT_SCHEMA) or msg.startswith(E_OUTPUT_TOO_LARGE) for msg in errors
-    )
-    if failed:
-        return _RunOutcome(
-            status="failed",
-            outputs=outputs,
-            error="; ".join(errors),
-            errors=errors,
-            log_tail=log_tail,
+        exit_code, events, log_tail, timed_out = _execute(
+            files_dir=files_dir,
+            file_path=file_path,
+            language=language,
+            resolved_inputs=resolved,
+            capability=capability,
+            operation=operation,
+            scope_dir=scope_dir,
+            rw_sdk_dir=rw_sdk_dir,
+            secrets_dir=secrets_dir,
+            credentials=task_credentials,
+            deadline_seconds=deadline_seconds,
+            allow_anonymous=allow_anonymous,
+            kubeconfig_path=kubeconfig_path,
+            log=log,
         )
-    return _RunOutcome(status="ok", outputs=outputs, errors=errors, log_tail=log_tail)
+        log_tail = _redact_text(log_tail, secrets) if log_tail else log_tail
+
+        if timed_out:
+            return _RunOutcome(
+                status="timeout",
+                error=f"{E_TIMEOUT}: exceeded the {deadline_seconds}s deadline",
+                errors=[f"{E_TIMEOUT}: exceeded the {deadline_seconds}s deadline"],
+                log_tail=log_tail,
+            )
+
+        skip_event = next((e for e in events if e.get("op") == "skip"), None)
+        if skip_event is not None:
+            reason = skip_event.get("reason") or ""
+            if is_setup:
+                # "Only tasks can skip" -- a setup that skips has not
+                # materialised anything, exactly like a packaged capability's
+                # setup raising SkipTask (host.py, SkipTask's own docstring).
+                return _RunOutcome(
+                    status="failed", error=reason or "setup skipped", log_tail=log_tail
+                )
+            return _RunOutcome(status="skipped", reason=reason, log_tail=log_tail)
+
+        outputs: dict[str, Any] = {}
+        for event in events:
+            op, name = event.get("op"), event.get("name")
+            if op == "set" and name is not None:
+                outputs[name] = event.get("value")
+            elif op == "append" and name is not None:
+                bucket = outputs.setdefault(name, [])
+                if isinstance(bucket, list):
+                    bucket.append(event.get("value"))
+
+        if declared_outputs is not None:
+            # A name the source produced but never declared already failed
+            # validate() at authoring time (E_OUTPUT_UNDECLARED) -- at runtime
+            # it is simply dropped rather than failing an otherwise-good result.
+            outputs = {name: value for name, value in outputs.items() if name in declared_outputs}
+
+        errors: list[str] = []
+        if exit_code != 0:
+            errors.append(f"process exited {exit_code}")
+
+        if declared_outputs is not None:
+            for name, value in outputs.items():
+                errors.extend(
+                    _validate_output_schema(name, value, declared_outputs[name]["schema"])
+                )
+
+        outputs, size_errors = _apply_size_caps(outputs)
+        errors.extend(size_errors)
+
+        outputs = _redact_value(outputs, secrets)
+
+        # A list output cut to fit its size cap is noted in `errors` but does
+        # NOT fail the task -- only a non-list output/whole result still over
+        # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code or a schema
+        # violation. Truncation notices carry neither prefix, so this is exactly
+        # "every error EXCEPT a plain truncation notice".
+        failed = exit_code != 0 or any(
+            msg.startswith(E_OUTPUT_SCHEMA) or msg.startswith(E_OUTPUT_TOO_LARGE) for msg in errors
+        )
+        if failed:
+            return _RunOutcome(
+                status="failed",
+                outputs=outputs,
+                error="; ".join(errors),
+                errors=errors,
+                log_tail=log_tail,
+            )
+        return _RunOutcome(status="ok", outputs=outputs, errors=errors, log_tail=log_tail)
 
 
 # -- input resolution -----------------------------------------------------------
@@ -331,12 +381,11 @@ def _resolve_inputs(
     provided: dict[str, Any],
     target: dict | None,
     credentials: dict[str, str],
-    scope_dir: Path,
+    secrets_dir: Path,
     allow_anonymous: bool = False,
 ) -> tuple[dict[str, Any], list[str]]:
     resolved: dict[str, Any] = {}
     errors: list[str] = []
-    secrets_dir = scope_dir / "secrets"
 
     for name, spec in input_specs.items():
         spec_type = spec.get("type")
@@ -361,11 +410,7 @@ def _resolve_inputs(
                 if not optional and not allow_anonymous:
                     errors.append(f"{E_INPUT_TYPE} inputs.{name}: no {spec_type} resolved")
                 continue
-            secrets_dir.mkdir(parents=True, exist_ok=True)
-            path = secrets_dir / name
-            path.write_text(raw, encoding="utf-8")
-            os.chmod(path, 0o600)
-            resolved[name] = str(path)
+            resolved[name] = str(_write_private_file(secrets_dir, name, raw))
             continue
 
         value = provided.get(name, spec.get("default"))
@@ -567,6 +612,7 @@ def _execute(
     operation: str,
     scope_dir: Path,
     rw_sdk_dir: Path,
+    secrets_dir: Path,
     credentials: dict[str, str],
     deadline_seconds: float,
     allow_anonymous: bool,
@@ -580,7 +626,9 @@ def _execute(
     read_fd, write_fd = os.pipe()
 
     base_env = {
-        **os.environ,
+        **_inherited_env(),
+        "HOME": str(scope_dir / _HOME_DIR),
+        "TMPDIR": str(scope_dir / _TMP_DIR),
         "RW_WORKDIR": str(scope_dir),
         "RW_CAPABILITY": capability,
         "RW_OPERATION": operation,
@@ -596,12 +644,21 @@ def _execute(
             env[input_env_name(name)] = value if isinstance(value, str) else json.dumps(value)
     else:
         python_kwargs = {python_kwarg_name(name): value for name, value in resolved_inputs.items()}
-        argv = [sys.executable, "-m", "runwhen_capability._bundle_entrypoint"]
+        # -P: the working directory (the writable scope) is not put on
+        # sys.path, so nothing a task writes there can shadow this entry
+        # point's own imports. -s: no per-user site-packages.
+        argv = [sys.executable, "-P", "-s", "-m", "runwhen_capability._bundle_entrypoint"]
+        # Credentials travel as a 0600 file the entry point reads and
+        # deletes -- never in the environment, where every process the task
+        # starts would inherit them and /proc/<pid>/environ would show them.
+        credentials_file = _write_private_file(
+            secrets_dir, ".credentials.json", json.dumps(credentials)
+        )
         env = {
             **base_env,
             "RW_TASK_FILE": str(files_dir / file_path),
             "RW_INPUTS_JSON": json.dumps(python_kwargs),
-            "RW_CREDENTIALS_JSON": json.dumps(credentials),
+            "RW_CREDENTIALS_FILE": str(credentials_file),
             "RW_ALLOW_ANONYMOUS": "1" if allow_anonymous else "0",
         }
 
@@ -610,6 +667,7 @@ def _execute(
             argv,
             cwd=str(scope_dir),
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -665,13 +723,76 @@ def _execute(
 # -- bundle materialisation -----------------------------------------------------
 
 
+# Host-side variables a task has no business seeing: where the relay is, which
+# pool this executor serves, and where its bearer token is mounted.
+_HOST_ONLY_ENV = frozenset({"EXECUTOR_TOKEN_FILE", "RELAY_URL", "POOL_ID"})
+
+
+def _inherited_env() -> dict[str, str]:
+    """The host's environment, minus what a task must not inherit: the
+    host-only variables above, any RW_* variable (the host sets its own for
+    each child), and XDG_* base directories (so they fall back to the
+    per-request HOME instead of a directory every run shares)."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _HOST_ONLY_ENV and not key.startswith(("RW_", "XDG_"))
+    }
+
+
+_HOME_DIR = ".rw-home"
+_TMP_DIR = ".rw-tmp"
+
+
+def _prepare_scope(scope_dir: Path) -> None:
+    """Gives the request a fresh, private HOME and TMPDIR inside its scope,
+    so anything a task writes there -- dotfiles, tool config, caches, temp
+    files -- is wiped with the scope rather than left for the next request
+    on this pod to pick up."""
+    scope_dir.mkdir(parents=True, exist_ok=True)
+    for name in (_HOME_DIR, _TMP_DIR):
+        _fresh_dir(scope_dir / name)
+
+
+def _fresh_dir(path: Path, marker: str | None = None) -> None:
+    """An empty 0700 directory at `path`, replacing whatever was there -- a
+    reused `rwtask run --workdir` may hold an earlier run's tree, symlinks
+    included (a symlink is removed, never followed). With `marker`, an
+    existing non-empty directory is only replaced if it contains that file,
+    i.e. it is one this module wrote; anything else is refused rather than
+    deleted."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        if marker is not None and any(path.iterdir()) and not (path / marker).is_file():
+            raise ValueError(f"refusing to replace {path}: it is not a bundle directory")
+        shutil.rmtree(path)
+    path.mkdir(mode=0o700)
+
+
+def _write_private_file(directory: Path, name: str, content: str) -> Path:
+    """Creates `directory/name` as a new 0600 file -- never following a
+    symlink or reusing an existing file, and never briefly readable by
+    anyone else, as a write-then-chmod would be."""
+    if name in ("", ".", "..") or "/" in name or "\x00" in name:
+        raise ValueError(f"unsafe file name {name!r}")
+    path = directory / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return path
+
+
 def _materialize(files_dir: Path, files: dict[str, str]) -> None:
+    """Writes `files` under a fresh `files_dir`. Every path already passed
+    validate()'s is_allowed_path (compile_manifest() runs first); it is
+    checked again here because this is the one place a bad path would
+    turn into a write outside the scope."""
+    _fresh_dir(files_dir, marker="capability.yaml")
     for path, content in files.items():
-        dest = files_dir / path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-
-
-def _write_rw_sdk(rw_sdk_dir: Path) -> None:
-    rw_sdk_dir.mkdir(parents=True, exist_ok=True)
-    (rw_sdk_dir / "rw.sh").write_text(RW_SH, encoding="utf-8")
+        if not is_allowed_path(path):
+            raise ValueError(f"refusing to write {path!r}")
+        *parents, name = path.split("/")
+        directory = files_dir.joinpath(*parents)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _write_private_file(directory, name, content)
