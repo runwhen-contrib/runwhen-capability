@@ -13,7 +13,7 @@ import subprocess
 import threading
 from pathlib import Path
 
-from .errors import CredentialNotFoundError, OutputTooLargeError
+from .errors import CredentialNotFoundError, OutputTooLargeError, SkipTask
 from .findings import FindingsClient
 from .git import GitClient
 from .repo_fs import RepoFsClient
@@ -172,6 +172,15 @@ class Context:
                 )
                 return None
             raise CredentialNotFoundError(f"no credential resolved for {name!r}") from None
+
+    def skip(self, reason: str = "") -> None:
+        """Raises SkipTask(reason) -- the same mechanism a packaged
+        capability's task already has via `raise SkipTask(...)`, spelled as
+        `ctx.skip(reason)` for a custom bundle task's `main(ctx, **inputs)`
+        (see bundle.py). Only a task may skip: called from setup, this is an
+        ordinary setup failure, exactly like `raise SkipTask(...)` from
+        setup already is -- see SkipTask's docstring."""
+        raise SkipTask(reason)
 
     def run(
         self,

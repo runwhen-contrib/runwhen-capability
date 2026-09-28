@@ -1,0 +1,22 @@
+apiVersion: runwhen.com/custom-capability/v1
+name: pgbouncer-health
+description: Pool health for pgbouncer
+appliesTo:
+  - { platform: kubernetes, type: deployment, where: { namespace: runwhen-env-staging, labels.app: pgbouncer } }
+inputs:
+  target:     { type: resource }
+  kubeconfig: { type: credential, kind: k8s.kubeconfig }
+  statsDsn:   { type: secret, optional: true }
+setup: { file: lib/setup.py }
+tasks:
+  - name: pool-errors
+    file: tasks/pool_errors.sh
+    description: Count pool-exhaustion errors in the last window
+    readOnly: true
+    inputs:
+      since:   { type: duration, default: 30m, runtime: true }
+      maxWait: { type: integer, default: 20, runtime: true }
+    outputs:
+      errors:  { schema: "{ pattern: string, count: integer, firstSeen: datetime?, lastSeen: datetime?, sample: string? }[]" }
+      summary: { schema: "{ windowMinutes: integer, pods: integer, total: integer }" }
+      detail:  { schema: ./schemas/detail.json }

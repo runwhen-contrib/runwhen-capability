@@ -56,13 +56,54 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to the executor bearer token; default: the EXECUTOR_TOKEN_FILE "
         "env var, else /var/run/executor/token",
     )
+    serve_p.add_argument(
+        "--allow-bundles",
+        action="store_true",
+        default=None,
+        help="also run bundle requests -- a custom capability's code carried inside the "
+        "request -- instead of refusing them; default: off, unless RW_ALLOW_BUNDLES=1. "
+        "Only an image built to run custom capabilities should enable this.",
+    )
 
-    run_p = sub.add_parser("run", help="run a request against a capability directory, locally")
-    run_p.add_argument(
-        "capability_dir", help="path to the capability directory (has manifest.yaml, tasks.py)"
+    run_p = sub.add_parser(
+        "run",
+        help="run a request against a capability directory, or --local a bundle "
+        "directory's task(s), locally",
     )
     run_p.add_argument(
-        "--request", required=True, help="path to a request.json (a RequestEnvelope)"
+        "capability_dir",
+        nargs="?",
+        default=None,
+        help="path to the capability directory (has manifest.yaml, tasks.py) -- omit with --local",
+    )
+    run_p.add_argument("--request", default=None, help="path to a request.json (a RequestEnvelope)")
+    run_p.add_argument(
+        "--local",
+        default=None,
+        metavar="DIR",
+        help="run a custom capability bundle directory (has capability.yaml, tasks/, ...) "
+        "instead of a packaged capability -- the same code path bundle mode uses in "
+        "`rwtask serve`. Combine with --task/--inputs, not --request.",
+    )
+    run_p.add_argument(
+        "--task",
+        dest="tasks",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help="a bundle task to run (repeatable); required with --local",
+    )
+    run_p.add_argument(
+        "--inputs",
+        default=None,
+        metavar="JSON",
+        help="the bundle's runtime inputs, as a JSON object; --local only",
+    )
+    run_p.add_argument(
+        "--target",
+        default=None,
+        metavar="JSON",
+        help="the run's target resource, as a JSON object; --local only",
     )
     run_p.add_argument(
         "--credentials", default=None, help="path to a credentials.json ({name: value})"
@@ -143,11 +184,36 @@ def main(argv: list[str] | None = None) -> int:
             workdir=Path(args.workdir),
             capability_dir=Path(args.capability_dir) if args.capability_dir else None,
             token_file=Path(args.token_file) if args.token_file else None,
+            allow_bundles=bool(args.allow_bundles) or os.environ.get("RW_ALLOW_BUNDLES") == "1",
         )
         return 0
 
     if args.command == "run":
+        if args.local:
+            from .run_local import run_local_bundle
+
+            if not args.tasks:
+                parser.error("run --local needs at least one --task")
+            if args.capability_dir or args.request:
+                parser.error("run --local takes no capability_dir/--request; use --local DIR")
+
+            result = run_local_bundle(
+                bundle_dir=Path(args.local),
+                tasks=args.tasks,
+                inputs=json.loads(args.inputs) if args.inputs else None,
+                target=json.loads(args.target) if args.target else None,
+                credentials_path=Path(args.credentials) if args.credentials else None,
+                workdir=Path(args.workdir) if args.workdir else None,
+                keep_workdir=args.keep_workdir,
+                allow_anonymous=args.allow_anonymous,
+            )
+            print(json.dumps(result.model_dump(mode="json"), indent=2))
+            return 0
+
         from .run_local import run_local
+
+        if not args.capability_dir or not args.request:
+            parser.error("run needs capability_dir and --request (or use --local)")
 
         result = run_local(
             capability_dir=Path(args.capability_dir),

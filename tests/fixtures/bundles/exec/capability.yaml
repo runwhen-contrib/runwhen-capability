@@ -1,0 +1,56 @@
+apiVersion: runwhen.com/custom-capability/v1
+name: exec-bundle
+description: Fixture bundle exercising every bundle-execution path
+inputs:
+  target:     { type: resource, optional: true }
+  token:      { type: secret, optional: true }
+  kubeconfig: { type: credential, kind: k8s.kubeconfig, optional: true }
+tasks:
+  - name: ok-py
+    file: tasks/ok.py
+    outputs:
+      greeting: { schema: "string" }
+  - name: ok-bash
+    file: tasks/ok.sh
+    outputs:
+      greeting: { schema: "string" }
+  - name: skip-py
+    file: tasks/skip.py
+  - name: skip-bash
+    file: tasks/skip.sh
+  - name: fail-py
+    file: tasks/fail.py
+  - name: fail-bash
+    file: tasks/fail.sh
+  - name: schema-bad
+    file: tasks/schema_bad.py
+    outputs:
+      count: { schema: "integer" }
+  - name: slow
+    file: tasks/slow.sh
+  - name: secret-echo
+    file: tasks/secret_echo.py
+    inputs:
+      token: { type: secret, optional: false }
+    outputs:
+      leaked: { schema: "string" }
+  - name: kubeconfig-echo
+    file: tasks/kubeconfig_echo.sh
+    outputs:
+      content: { schema: "string" }
+  - name: target-echo
+    file: tasks/target_echo.py
+    outputs:
+      urn: { schema: "string" }
+  - name: secret-log
+    file: tasks/secret_log.sh
+    inputs:
+      token: { type: secret, optional: false }
+  - name: big-list
+    file: tasks/big_list.py
+    outputs:
+      items: { schema: "integer[]" }
+  - name: big-scalar
+    file: tasks/big_scalar.py
+    outputs:
+      blob: { schema: "string" }

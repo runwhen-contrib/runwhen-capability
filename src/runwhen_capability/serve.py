@@ -28,6 +28,11 @@ dropping the result (see _post_result). The token file path comes from
 A missing/unreadable token file at GetTask time is logged and the loop
 keeps polling -- it never falls back to an unauthenticated request.
 
+A `request` that carries a `bundle` (a custom capability's code, inline --
+see bundle.py) is run only when this executor was started with
+`--allow-bundles` (or RW_ALLOW_BUNDLES=1); otherwise it is refused with a
+failed result. Packaged-capability images never set it.
+
 `scopeId` must be a single path segment (see _is_safe_scope_id): the loop
 creates and later deletes <workdir>/<scopeId>/, so anything else -- empty,
 absolute, containing "/" or ".." -- is refused as a failed request before
@@ -63,15 +68,21 @@ from pathlib import Path
 
 import requests
 
+from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
-from .models import TaskHostRequest
+from .models import BundleRequestEnvelope, TaskHostRequest
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
 RETRY_DELAY = 5  # seconds, on a poll/post transport failure
 
 DEFAULT_TOKEN_FILE = "/var/run/executor/token"
+
+BUNDLES_NOT_ALLOWED = (
+    "this executor does not run bundle requests: it was started without --allow-bundles "
+    "(or RW_ALLOW_BUNDLES=1). Route custom capabilities to an image built to run them."
+)
 
 # Bounds how many distinct scopeIds a stateful pod keeps warm at once. Each
 # one holds a full checkout on disk, and one pod is handed several scopeIds
@@ -93,17 +104,26 @@ def serve(
     session: requests.Session | None = None,
     log: logging.Logger | None = None,
     max_stateful_scopes: int = DEFAULT_MAX_STATEFUL_SCOPES,
+    allow_bundles: bool = False,
 ) -> None:
     """Runs the long-poll loop. `max_iterations` (None = forever) and
     `session` exist so tests can drive this deterministically without a real
     relay or an infinite loop. `max_stateful_scopes` bounds how many warm
     scopes a `stateful` capability keeps on disk at once (n/a for
     `stateless` capabilities, which never keep one); tests lower it to
-    exercise eviction without dozens of iterations."""
+    exercise eviction without dozens of iterations.
+
+    `allow_bundles` (CLI: `--allow-bundles`, or RW_ALLOW_BUNDLES=1) opts
+    this executor into bundle mode. Off by default: a bundle request
+    carries arbitrary code, and only an image built to run custom
+    capabilities should ever execute one. With it off, a bundle request
+    is refused with a failed result before anything touches the
+    filesystem."""
     log = log or logging.getLogger("runwhen_capability.serve")
     session = session or requests.Session()
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    _wipe_stale_bundle_scopes(workdir, log)
 
     token_file = (
         Path(token_file)
@@ -114,10 +134,11 @@ def serve(
     cap_dir = Path(capability_dir) if capability_dir else discover_capability_dir()
     capability = load_capability(cap_dir)
     log.info(
-        "serving capability %r (execution.mode=%s) from %s",
+        "serving capability %r (execution.mode=%s) from %s; bundle requests %s",
         capability.capability_id,
         capability.execution_mode,
         cap_dir,
+        "accepted" if allow_bundles else "refused",
     )
 
     # LRU of scopeIds this pod is currently keeping warm, for `stateful`
@@ -138,7 +159,25 @@ def serve(
             log,
             stateful_scopes,
             max_stateful_scopes,
+            allow_bundles,
         )
+
+
+def _wipe_stale_bundle_scopes(workdir: Path, log) -> None:
+    """A bundle request's scope is wiped as soon as the request ends, so
+    one still here at startup was left by a host that died mid-request
+    (an OOM kill, an evicted container restarting onto the same volume) --
+    and may still hold that request's bundle and secret files. A bundle
+    scope is recognised by the `.rw-sdk/rw.sh` bundle.py writes into every
+    one; nothing else in `workdir` -- a stateful packaged capability's warm
+    scopes included -- is touched. Assumes, as the stateful LRU already
+    does, that `workdir` belongs to this one serve process."""
+    for child in workdir.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            continue
+        if (child / ".rw-sdk" / "rw.sh").is_file():
+            log.info("removing bundle scope %r left behind by an earlier run", child.name)
+            shutil.rmtree(child, ignore_errors=True)
 
 
 def _is_safe_scope_id(scope_id: str) -> bool:
@@ -254,6 +293,7 @@ def _poll_once(
     log,
     stateful_scopes: OrderedDict[str, None],
     max_stateful_scopes: int,
+    allow_bundles: bool = False,
 ) -> None:
     token = _read_token(token_file, log)
     if token is None:
@@ -306,23 +346,66 @@ def _poll_once(
         )
         return
 
+    is_bundle = isinstance(task_request.request, BundleRequestEnvelope)
+    if is_bundle and not allow_bundles:
+        # Refused, not ignored: the runner must learn why nothing ran.
+        # Nothing has touched the filesystem, and none of the bundle's code
+        # has been looked at.
+        log.error(
+            "request %s: refusing a bundle request -- this executor was not started "
+            "with --allow-bundles",
+            task_request.requestId,
+        )
+        _post_result(
+            session,
+            relay,
+            task_request.requestId,
+            {"status": "failed", "error": BUNDLES_NOT_ALLOWED},
+            token_file,
+            token,
+            log,
+        )
+        return
+
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
     try:
-        result = run_request(
-            capability,
-            task_request.request,
-            task_request.credentials,
-            scope_dir,
-            log=log.getChild(task_request.requestId),
-        )
+        if is_bundle:
+            # A bundle's code travels with the request, not baked into this
+            # pod's image -- see bundle.py's module docstring. deadlineMs is
+            # otherwise unused by this loop (host.run_request() has no
+            # per-request deadline of its own); bundle mode is the first
+            # thing that actually enforces it, as one budget shared by the
+            # request's setup and all of its tasks.
+            os.chmod(scope_dir, 0o700)
+            result = run_bundle_request(
+                task_request.request,
+                task_request.credentials,
+                scope_dir,
+                log=log.getChild(task_request.requestId),
+                deadline_seconds=task_request.deadlineMs / 1000,
+            )
+        else:
+            result = run_request(
+                capability,
+                task_request.request,
+                task_request.credentials,
+                scope_dir,
+                log=log.getChild(task_request.requestId),
+            )
         payload = {"status": "ok", "result": result.model_dump(mode="json")}
     except Exception as exc:  # noqa: BLE001 -- one request must never take down the loop
         log.exception("request %s failed", task_request.requestId)
         payload = {"status": "failed", "error": str(exc)}
     finally:
-        _retain_or_wipe_scope(
-            capability, scope_dir, workdir, stateful_scopes, max_stateful_scopes, log
-        )
+        if is_bundle:
+            # No execution.mode concept applies to a bundle request -- it
+            # never shares a scope with a later request, so it is always
+            # wiped, exactly like a stateless packaged capability.
+            shutil.rmtree(scope_dir, ignore_errors=True)
+        else:
+            _retain_or_wipe_scope(
+                capability, scope_dir, workdir, stateful_scopes, max_stateful_scopes, log
+            )
 
     _post_result(session, relay, task_request.requestId, payload, token_file, token, log)
