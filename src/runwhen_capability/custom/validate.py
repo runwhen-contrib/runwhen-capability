@@ -156,6 +156,7 @@ def _validate(files: dict[str, str]) -> list[Diagnostic]:
     diagnostics += _check_duplicate_task_names(raw, manifest)
     diagnostics += _check_setup_file(files, raw, manifest)
     diagnostics += _check_tasks(files, raw, manifest)
+    diagnostics += _check_read_only_shared_code(files, manifest)
     return diagnostics
 
 
@@ -509,6 +510,40 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
                 output.schema_,
                 loc_path=f"tasks[{index}].outputs.{name}.schema",
                 line=line_of(raw_outputs.get(name)),
+            )
+    return diagnostics
+
+
+def _check_read_only_shared_code(files: dict[str, str], manifest: Manifest) -> list[Diagnostic]:
+    """E_READONLY_WRITE for code a readOnly task runs besides its own file:
+    the setup file, which runs before every task in a request, and every
+    file under lib/, which any task may source or import -- whatever its
+    language. A mutating kubectl call there runs on a readOnly task's
+    behalf just as surely as one in the task's own file (checked in
+    _check_source). Each offending line is reported once, at its own file
+    and line, naming the readOnly tasks it affects."""
+    read_only = [task for task in manifest.tasks if task.readOnly]
+    if not read_only:
+        return []
+    shared = {path for path in files if path.startswith("lib/")}
+    if manifest.setup is not None and manifest.setup.file in files:
+        shared.add(manifest.setup.file)
+    # A readOnly task's own file is already scanned, and reported, as such.
+    shared -= {task.file for task in read_only}
+    names = ", ".join(repr(task.name) for task in read_only)
+    diagnostics = []
+    for path in sorted(shared):
+        for line, call in static_checks.mutating_kubectl_calls(files[path]):
+            diagnostics.append(
+                Diagnostic(
+                    code=E_READONLY_WRITE,
+                    file=path,
+                    line=line,
+                    message=(
+                        f"{call!r} mutates cluster state, but {path} runs as part of "
+                        f"readOnly task(s) {names}"
+                    ),
+                )
             )
     return diagnostics
 

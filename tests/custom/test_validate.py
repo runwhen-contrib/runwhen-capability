@@ -705,3 +705,54 @@ tasks:
         "tasks[0].inputs.port.patternProperties",
     }
     assert all(d.hint == _REGEX_HINT for d in diagnostics)
+
+
+# -- readOnly covers every file a readOnly task can run --------------------------
+
+_READ_ONLY_WITH_SHARED_CODE = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+setup: {{ file: {setup} }}
+tasks:
+  - name: t
+    file: tasks/t.sh
+    readOnly: {read_only}
+"""
+
+
+def _shared_code_bundle(*, setup="lib/setup.py", read_only="true", **extra) -> dict[str, str]:
+    return {
+        "capability.yaml": _READ_ONLY_WITH_SHARED_CODE.format(setup=setup, read_only=read_only),
+        "tasks/t.sh": 'source "$RW_SDK/rw.sh"\nkubectl get pods\n',
+        "lib/setup.py": "def main(ctx):\n    return {}\n",
+        **extra,
+    }
+
+
+@pytest.mark.parametrize(
+    ("path", "source", "line"),
+    [
+        ("lib/helpers.sh", 'helper() {\n  kubectl delete pod "$1"\n}\n', 2),
+        ("lib/k8s.py", "def restart(ctx):\n    ctx.run(['kubectl', 'rollout', 'restart'])\n", 2),
+        ("lib/setup.py", "def main(ctx):\n    ctx.run(['kubectl', 'apply', '-f', 'x'])\n", 2),
+    ],
+    ids=["lib-bash", "lib-python", "setup"],
+)
+def test_a_mutating_command_in_shared_code_fails_a_read_only_task(path, source, line):
+    files = _shared_code_bundle(**{path: source})
+    diagnostics = [d for d in validate(files) if d.code == E_READONLY_WRITE]
+    assert [(d.file, d.line) for d in diagnostics] == [(path, line)]
+    assert "'t'" in diagnostics[0].message
+
+
+def test_a_mutating_command_in_a_setup_outside_lib_fails_a_read_only_task():
+    files = _shared_code_bundle(
+        setup="tasks/setup.sh", **{"tasks/setup.sh": "kubectl scale deploy/x --replicas=0\n"}
+    )
+    diagnostics = [d for d in validate(files) if d.code == E_READONLY_WRITE]
+    assert [(d.file, d.line) for d in diagnostics] == [("tasks/setup.sh", 1)]
+
+
+def test_shared_code_may_mutate_when_no_task_is_read_only():
+    files = _shared_code_bundle(read_only="false", **{"lib/helpers.sh": "kubectl delete pod x\n"})
+    assert E_READONLY_WRITE not in _codes(files)

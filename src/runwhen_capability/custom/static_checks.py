@@ -279,7 +279,9 @@ MUTATING_KUBECTL_VERBS = (
 # separator (newline, pipe, `;`, `&`) -- a rough but adequate boundary for a
 # regex-based scan over normally-formatted shell.
 _KUBECTL_STATEMENT_RE = re.compile(r"\bkubectl\b[^\n;|&]*")
-_ROLLOUT_RESTART_RE = re.compile(r"\brollout\s+restart\b")
+# `\W+`, not `\s+`: in a Python argv list the two words are separated by
+# quotes and a comma (`"rollout", "restart"`), not only by blanks.
+_ROLLOUT_RESTART_RE = re.compile(r"\brollout\W+restart\b")
 _VERB_RE = re.compile(r"\b(" + "|".join(MUTATING_KUBECTL_VERBS) + r")\b")
 
 
