@@ -17,6 +17,8 @@ with the wheel and sdist attached to the GitHub Release.
     `appliesTo`, `needs.credentials`, `tasks[]` with every output's schema compiled to JSON Schema).
     Raises `CompileError` if `validate()` found an error.
   - `content_hash(files)` / `task_hash(files, task)`.
+  - Bundles are untrusted input: `validate()` runs in linear time, never raises, refuses YAML
+    aliases, unsafe paths and names, and schema files with non-local `$ref`s.
 - **Bundle mode**: a request whose envelope carries a `bundle` (its files inline, content-hash
   verified) is materialised, compiled, and run -- `rwtask serve` dispatches to it automatically;
   `rwtask run --local <bundle-dir> --task <name> --inputs '<json>'` runs the same path locally, with
@@ -29,7 +31,14 @@ with the wheel and sdist attached to the GitHub Release.
     the whole request: setup and every task share it.
   - Outputs are checked against their compiled schema (`E_OUTPUT_SCHEMA`, with the JSON path) and
     capped (`E_OUTPUT_TOO_LARGE`; a list output is truncated instead of failing the task).
-  - Every credential/secret value used by the run is redacted from outputs and the log tail.
+  - Every credential/secret value the request carries is redacted from outputs (keys included),
+    errors, skip reasons and the log tail, including common encodings (base64, JSON, URL) and
+    single lines of multi-line values. Values under 8 characters are redacted only as whole words.
+  - Isolation: bundle files and secret files are written 0600 without following symlinks; each
+    task gets its own HOME and TMPDIR inside the request's scope, stdin from /dev/null, and none of
+    the host's relay variables; Python tasks receive credentials through a file, never the
+    environment. The private output channel accepts only well-formed events and is capped at
+    8 MiB. `rwtask serve` removes bundle scopes a crashed run left behind.
   - `TaskResult`/`SetupResult` gain `errors` (the full runtime diagnostic list) and `logTail`
     (bundle mode only); `TaskResult.status`/`SetupResult.status` gain `"timeout"`.
 - `Context.skip(reason="")`.
