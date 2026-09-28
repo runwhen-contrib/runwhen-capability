@@ -1,0 +1,66 @@
+"""Diagnostic -- one static-check finding against a custom capability bundle,
+and the error codes `validate()`/`compile_manifest()` (validate.py, compiler.py)
+raise them under.
+
+Static codes (validate() only, no execution):
+
+- E_MANIFEST_SCHEMA -- the manifest doesn't match its schema.
+- E_SCHEMA_NOTATION -- a compact schema can't be parsed.
+- E_PATH_NOT_ALLOWED -- a file is outside the allowed paths.
+- E_LIMIT -- a size or file-count limit is exceeded.
+- E_TASK_FILE_MISSING -- a task's (or setup's) `file` doesn't exist.
+- E_UNDECLARED_INPUT -- a Python main() parameter, or a bash $VAR read (directly
+  or via rw_input), with no declared input.
+- E_OUTPUT_UNDECLARED -- a returned or rw_append/rw_set output name that isn't
+  declared.
+- E_READONLY_WRITE -- kubectl delete/apply/patch/edit/scale/rollout restart/exec
+  and similar in a readOnly task.
+- E_DUPLICATE_NAME -- a name is used twice.
+
+Runtime codes (the bundle host, bundle.py) reuse the same string constants:
+E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel
+
+Severity = Literal["error", "warning"]
+
+# -- static codes: validate() -------------------------------------------------
+E_MANIFEST_SCHEMA = "E_MANIFEST_SCHEMA"
+E_SCHEMA_NOTATION = "E_SCHEMA_NOTATION"
+E_PATH_NOT_ALLOWED = "E_PATH_NOT_ALLOWED"
+E_LIMIT = "E_LIMIT"
+E_TASK_FILE_MISSING = "E_TASK_FILE_MISSING"
+E_UNDECLARED_INPUT = "E_UNDECLARED_INPUT"
+E_OUTPUT_UNDECLARED = "E_OUTPUT_UNDECLARED"
+E_READONLY_WRITE = "E_READONLY_WRITE"
+E_DUPLICATE_NAME = "E_DUPLICATE_NAME"
+
+# -- runtime codes: the bundle host (bundle.py) --------------------------------
+E_INPUT_TYPE = "E_INPUT_TYPE"
+E_OUTPUT_SCHEMA = "E_OUTPUT_SCHEMA"
+E_OUTPUT_TOO_LARGE = "E_OUTPUT_TOO_LARGE"
+E_TIMEOUT = "E_TIMEOUT"
+
+
+class Diagnostic(BaseModel):
+    """One validate() finding. `file` is the bundle-relative path the finding
+    is about (e.g. "capability.yaml", "tasks/pool_errors.sh"); `line` is
+    1-indexed and `None` when no location could be attributed. `path` is a
+    dotted/bracketed pointer into the manifest's data (e.g.
+    "tasks[0].outputs.errors.schema"), independent of `file`/`line` -- it is
+    set for manifest-shaped findings and `None` for source-file findings
+    (undeclared input/output, readOnly writes), which carry their location in
+    `file`/`line` instead."""
+
+    code: str
+    severity: Severity = "error"
+    file: str | None = None
+    line: int | None = None
+    path: str | None = None
+    message: str
+    hint: str | None = None
