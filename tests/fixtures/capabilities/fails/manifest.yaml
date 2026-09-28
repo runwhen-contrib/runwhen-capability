@@ -1,0 +1,7 @@
+# Minimal fixture capability used by tests/test_host.py: one task raises,
+# one succeeds -- the host must survive and report both outcomes.
+capability: rw-fails-fixture
+version: "0.0.0"
+tasks:
+  - name: boom
+  - name: good

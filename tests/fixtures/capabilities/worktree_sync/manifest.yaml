@@ -1,0 +1,16 @@
+# Minimal fixture capability used by tests/test_host.py and
+# tests/test_serve.py: mimics rw-worktree's stateful open(setup)+read(task)
+# shape (a declared credential in setup, a task reading the materialised
+# tree, execution.mode: stateful) to exercise host.run_request's
+# setup-output caching across requests to the same scope -- a synchronous
+# call -- and serve.py's warm-scope reuse across polls.
+capability: rw-worktree-sync-fixture
+version: "0.0.0"
+execution:
+  mode: stateful
+setup:
+  task: open
+tasks:
+  - name: read
+  - name: grep
+  - name: wreck

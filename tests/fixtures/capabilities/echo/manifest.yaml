@@ -1,0 +1,8 @@
+# Minimal fixture capability used by tests/test_host.py to exercise
+# ${setup.<name>} resolution and camelCase input -> snake_case kwarg mapping.
+capability: rw-echo-fixture
+version: "0.0.0"
+setup:
+  task: prep
+tasks:
+  - name: echo

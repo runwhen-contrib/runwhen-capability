@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "gitleaks",
+          "informationUri": "https://github.com/gitleaks/gitleaks",
+          "rules": [
+            { "id": "generic-api-key" }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "generic-api-key",
+          "level": "error",
+          "message": { "text": "generic-api-key has detected secret for file src/config.py." },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "src/config.py" },
+                "region": { "startLine": 3 }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

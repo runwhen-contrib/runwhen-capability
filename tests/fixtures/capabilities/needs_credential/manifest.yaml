@@ -1,0 +1,7 @@
+# Minimal fixture capability used by tests/test_host.py: exercises a task
+# resolving a declared credential ("token") through Context.credential(),
+# including the run_request(allow_anonymous_credentials=...) escape hatch.
+capability: rw-needs-credential-fixture
+version: "0.0.0"
+tasks:
+  - name: need_token

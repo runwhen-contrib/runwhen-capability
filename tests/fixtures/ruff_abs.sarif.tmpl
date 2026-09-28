@@ -1,0 +1,36 @@
+{{
+  "version": "2.1.0",
+  "runs": [
+    {{
+      "tool": {{ "driver": {{ "name": "ruff", "rules": [ {{ "id": "F401" }} ] }} }},
+      "results": [
+        {{
+          "ruleId": "F401",
+          "level": "warning",
+          "message": {{ "text": "`os` imported but unused" }},
+          "locations": [
+            {{
+              "physicalLocation": {{
+                "artifactLocation": {{ "uri": "file://{ROOT}/src/x.py" }},
+                "region": {{ "startLine": 1, "snippet": {{ "text": "import os" }} }}
+              }}
+            }}
+          ]
+        }},
+        {{
+          "ruleId": "no-loc-outside-root",
+          "level": "error",
+          "message": {{ "text": "should be dropped: escapes the worktree" }},
+          "locations": [
+            {{
+              "physicalLocation": {{
+                "artifactLocation": {{ "uri": "file:///etc/passwd" }},
+                "region": {{ "startLine": 1 }}
+              }}
+            }}
+          ]
+        }}
+      ]
+    }}
+  ]
+}}

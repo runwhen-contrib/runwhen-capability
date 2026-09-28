@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "runwhen-capability"
+dynamic = ["version"]
+description = "SDK and task host (rwtask) for RunWhen capability images"
+requires-python = ">=3.12"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "pydantic>=2,<3",
+    "PyYAML>=6",
+    "requests>=2.31",
+]
+
+[project.urls]
+Source = "https://github.com/runwhen-contrib/runwhen-capability"
+
+[project.scripts]
+rwtask = "runwhen_capability.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "build>=1",
+    "pytest>=8",
+    "responses>=0.25",
+    "ruff>=0.16",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "runwhen_capability.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# tests/fixtures/repo is deliberately "dirty" fixture data that static-check
+# tools are meant to flag -- not code we lint.
+extend-exclude = ["tests/fixtures/repo"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
