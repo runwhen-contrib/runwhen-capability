@@ -436,6 +436,10 @@ def test_a_skipped_task_serialises_its_status_and_reason(tmp_path):
         "outputs": {},
         "error": None,
         "reason": "no matching files in the diff",
+        # errors/logTail are bundle-mode only (see bundle.py); a packaged
+        # capability's task always carries their empty/None defaults.
+        "errors": [],
+        "logTail": None,
     }
 
 
