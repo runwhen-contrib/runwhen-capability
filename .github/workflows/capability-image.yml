@@ -1,0 +1,496 @@
+name: Capability image
+
+# Reusable workflow: build ONE capability image, smoke-test it, and push it
+# to GHCR as a multi-arch manifest. A repo that ships several capabilities
+# calls it once per image (a matrix over the calling job works).
+#
+#   jobs:
+#     image:
+#       uses: runwhen-contrib/runwhen-capability/.github/workflows/capability-image.yml@v0.1.0
+#       with:
+#         capability: my-capability           # capabilities/my-capability/
+#         dockerfile: Dockerfile.my-capability
+#         image-name: my-capability-codecollection
+#         push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+#
+# The calling job needs `permissions: {contents: read, packages: write}`.
+#
+# What the calling repo provides:
+#   - capabilities/<capability>/manifest.yaml, with no top-level `image:` key;
+#   - a pyproject.toml whose dependencies include runwhen-capability, so
+#     `pip install .` puts the same `rwtask` the repo pins on PATH;
+#   - a Dockerfile that turns the CAPABILITY_MANIFEST_B64 and
+#     CAPABILITY_SCHEMAS_B64 build args into the com.runwhen.capability.manifest.v1
+#     and com.runwhen.capability.schemas.v1 labels, and whose WORKDIR holds
+#     capabilities/<capability>/ (so `rwtask serve` finds it with no flags).
+#     REVISION and CREATED are passed too, for the OCI annotations.
+#
+# Tags (GHCR rejects uppercase, so the owner is lower-cased):
+#   branch push      <ref>-<sha7> (canonical, immutable), <ref>, and latest on main
+#   pull request     pr-<n>-<sha7> (canonical), pr-<n>
+#   semver tag (v*)  the tag itself, e.g. v1.2.0 -- canonical, no aliases
+# where <ref> is the branch name with anything outside [A-Za-z0-9_.-] turned
+# into '-'.
+#
+# Jobs:
+#   prepare -- tags, push decision, manifest checks and both label values,
+#              computed once so the two platform builds cannot drift.
+#   build   -- one native runner per platform (linux/amd64, linux/arm64; no
+#              QEMU): build and load, smoke-test, then push by digest.
+#   merge   -- stitch the per-platform digests into one multi-arch manifest
+#              under every tag (a registry-side operation; no rebuild).
+
+on:
+  workflow_call:
+    inputs:
+      capability:
+        description: Capability directory under capabilities/, and the manifest's `capability` id.
+        type: string
+        required: true
+      dockerfile:
+        description: Dockerfile that builds this capability's image.
+        type: string
+        required: true
+      image-name:
+        description: Image name, published as ghcr.io/<owner>/<image-name>.
+        type: string
+        required: true
+      push:
+        description: Push the image. A pull request from a fork never pushes, whatever this says.
+        type: boolean
+        default: true
+      execution-mode:
+        description: Expected manifest execution.mode (stateless or stateful). Empty skips the check.
+        type: string
+        default: ''
+      sbom:
+        description: >-
+          Repository path of an SBOM the image ships. When set, the smoke test checks that the
+          image's io.runwhen.sbom label names a file identical to it.
+        type: string
+        default: ''
+      smoke-command:
+        description: Extra bash run after the standard smoke test, with $IMG set to the local image.
+        type: string
+        default: ''
+      python-version:
+        description: Python used to run rwtask on the build host.
+        type: string
+        default: '3.12'
+    outputs:
+      image:
+        description: The pushed image under its canonical tag (empty when nothing was pushed).
+        value: ${{ jobs.merge.outputs.image }}
+      digest:
+        description: The multi-arch manifest digest (empty when nothing was pushed).
+        value: ${{ jobs.merge.outputs.digest }}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      should_push: ${{ steps.push_flag.outputs.should_push }}
+      canonical_tag: ${{ steps.meta.outputs.canonical_tag }}
+      extra_tags: ${{ steps.meta.outputs.extra_tags }}
+      owner_lc: ${{ steps.meta.outputs.owner_lc }}
+      created: ${{ steps.meta.outputs.created }}
+      manifest_b64: ${{ steps.labels.outputs.manifest_b64 }}
+      schemas_b64: ${{ steps.labels.outputs.schemas_b64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install the repository (and the runwhen-capability it pins)
+        run: python3 -m pip install --quiet .
+
+      - name: Decide whether to push
+        id: push_flag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          THIS_REPO: ${{ github.repository }}
+          PUSH: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          should_push="${PUSH}"
+          # A fork's pull request gets a read-only GITHUB_TOKEN, so a push
+          # could only fail the contributor's build.
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${HEAD_REPO}" != "${THIS_REPO}" ]; then
+            should_push=false
+          fi
+          echo "should_push=${should_push}" >> "$GITHUB_OUTPUT"
+
+      - name: Compute tags
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.sha }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          sha7="${SHA:0:7}"
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            ref_name="pr-${PR_NUMBER}"   # github.ref_name is "<n>/merge" here
+          else
+            ref_name="${REF_NAME}"
+          fi
+          sanitized_ref="$(printf '%s' "${ref_name}" | tr '/' '-' | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^-*//;s/-*$//')"
+          owner_lc="$(printf '%s' "${OWNER}" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "${REF_TYPE}" = "tag" ]; then
+            # A release tag is itself immutable: no sha suffix, no aliases.
+            canonical_tag="${sanitized_ref}"
+            extra=()
+          else
+            canonical_tag="${sanitized_ref}-${sha7}"
+            extra=( "${sanitized_ref}" )
+            if [ "${EVENT_NAME}" != "pull_request" ] && [ "${REF_NAME}" = "main" ]; then
+              extra+=( "latest" )
+            fi
+          fi
+
+          {
+            echo "canonical_tag=${canonical_tag}"
+            printf 'extra_tags=%s\n' "$(IFS=,; echo "${extra[*]:-}")"
+            echo "owner_lc=${owner_lc}"
+            echo "created=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Will publish"
+            echo
+            echo "- Canonical tag: \`${canonical_tag}\`"
+            echo "- Alias tags:    $(IFS=,; echo "${extra[*]:-none}")"
+            echo "- Commit:        \`${SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the capability manifest
+        env:
+          CAPABILITY: ${{ inputs.capability }}
+          EXECUTION_MODE: ${{ inputs.execution-mode }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import sys
+
+          import yaml
+
+          capability = os.environ["CAPABILITY"]
+          expected_mode = os.environ["EXECUTION_MODE"]
+          path = f"capabilities/{capability}/manifest.yaml"
+          # The top-level keys every capability manifest carries. No
+          # "image": the manifest rides the image as a label instead.
+          required = {
+              "apiVersion", "capability", "version", "description",
+              "execution", "appliesTo", "needs", "setup", "tasks", "retention",
+          }
+
+          with open(path) as f:
+              manifest = yaml.safe_load(f)
+          if not isinstance(manifest, dict):
+              sys.exit(f"{path}: not a YAML mapping")
+          missing = required - manifest.keys()
+          if missing:
+              sys.exit(f"{path}: missing required keys: {sorted(missing)}")
+          if manifest["capability"] != capability:
+              sys.exit(f"{path}: 'capability' must be {capability!r}, got {manifest['capability']!r}")
+          execution = manifest["execution"]
+          if not isinstance(execution, dict):
+              sys.exit(f"{path}: execution must be a mapping")
+          mode = execution.get("mode")
+          if mode not in ("stateless", "stateful"):
+              sys.exit(f"{path}: execution.mode must be stateless or stateful, got {mode!r}")
+          if expected_mode and mode != expected_mode:
+              sys.exit(f"{path}: execution.mode must be {expected_mode!r}, got {mode!r}")
+          resources = execution.get("resources")
+          if resources is not None and not isinstance(resources, dict):
+              sys.exit(f"{path}: execution.resources must be a mapping")
+          work_size_limit = execution.get("workSizeLimit")
+          if work_size_limit is not None and not isinstance(work_size_limit, str):
+              sys.exit(f"{path}: execution.workSizeLimit must be a string")
+          print(f"{path}: capability={capability}, mode={mode}")
+          PY
+
+      # rwtask label also refuses a top-level `image:` key and any manifest
+      # `schema:` ref that is missing, absolute, escapes the capability
+      # directory, or is not a JSON object.
+      - name: Compute the image labels
+        id: labels
+        env:
+          CAPABILITY: ${{ inputs.capability }}
+        run: |
+          set -euo pipefail
+          manifest_b64="$(rwtask label "capabilities/${CAPABILITY}")"
+          schemas_b64="$(rwtask label --schemas "capabilities/${CAPABILITY}")"
+          {
+            echo "manifest_b64=${manifest_b64}"
+            echo "schemas_b64=${schemas_b64}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: needs.prepare.outputs.should_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Per-(image, arch) cache scope: the platform legs run in parallel on
+      # different runners and must not share one.
+      - name: Build (native, load)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: ${{ inputs.image-name }}:smoke
+          build-args: |
+            REVISION=${{ github.sha }}
+            CREATED=${{ needs.prepare.outputs.created }}
+            CAPABILITY_MANIFEST_B64=${{ needs.prepare.outputs.manifest_b64 }}
+            CAPABILITY_SCHEMAS_B64=${{ needs.prepare.outputs.schemas_b64 }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}-${{ matrix.arch }}
+
+      - name: Smoke test
+        env:
+          IMG: ${{ inputs.image-name }}:smoke
+          CAPABILITY: ${{ inputs.capability }}
+          MANIFEST_B64: ${{ needs.prepare.outputs.manifest_b64 }}
+          SCHEMAS_B64: ${{ needs.prepare.outputs.schemas_b64 }}
+          SBOM: ${{ inputs.sbom }}
+          SMOKE_COMMAND: ${{ inputs.smoke-command }}
+        run: |
+          set -euo pipefail
+          label() { docker image inspect "${IMG}" --format "{{ index .Config.Labels \"$1\" }}"; }
+
+          # rwtask is on PATH as plain argv (the image keeps ENTRYPOINT empty).
+          docker run --rm "${IMG}" rwtask --help > /dev/null
+          docker run --rm "${IMG}" rwtask --version
+
+          # The Dockerfile wires both build args into the labels a catalog reads.
+          if [ "$(label com.runwhen.capability.manifest.v1)" != "${MANIFEST_B64}" ]; then
+            echo "::error::com.runwhen.capability.manifest.v1 is not set from CAPABILITY_MANIFEST_B64"
+            exit 1
+          fi
+          if [ "$(label com.runwhen.capability.schemas.v1)" != "${SCHEMAS_B64}" ]; then
+            echo "::error::com.runwhen.capability.schemas.v1 is not set from CAPABILITY_SCHEMAS_B64"
+            exit 1
+          fi
+
+          # `rwtask serve` loads THIS capability, found by itself. It logs
+          # "serving capability ..." right after loading, before it polls,
+          # so a stub relay that answers nothing useful is enough.
+          python3 -m http.server 8877 --directory /dev/null &
+          stub_pid=$!
+          sleep 1
+          container="$(docker run -d --add-host=host.docker.internal:host-gateway "${IMG}" \
+            rwtask serve --relay http://host.docker.internal:8877 --pool smoke-pool)"
+          sleep 5
+          docker logs "${container}" > "${RUNNER_TEMP}/serve.log" 2>&1 || true
+          docker rm -f "${container}" > /dev/null 2>&1 || true
+          kill "${stub_pid}" 2> /dev/null || true
+          if ! grep -qE "serving capability '${CAPABILITY}'.* from capabilities/${CAPABILITY}" "${RUNNER_TEMP}/serve.log"; then
+            echo "::error::rwtask serve never logged loading capability '${CAPABILITY}'"
+            cat "${RUNNER_TEMP}/serve.log" >&2
+            exit 1
+          fi
+
+          if [ -n "${SBOM}" ]; then
+            sbom_path="$(label io.runwhen.sbom)"
+            if [ -z "${sbom_path}" ]; then
+              echo "::error::the image has no io.runwhen.sbom label"
+              exit 1
+            fi
+            docker run --rm "${IMG}" cat "${sbom_path}" > "${RUNNER_TEMP}/image-sbom.json"
+            if ! cmp -s "${SBOM}" "${RUNNER_TEMP}/image-sbom.json"; then
+              echo "::error::${sbom_path} in the image differs from ${SBOM}"
+              exit 1
+            fi
+            echo "SBOM ${SBOM} ships at ${sbom_path}"
+          fi
+
+          if [ -n "${SMOKE_COMMAND}" ]; then
+            export IMG
+            bash -euo pipefail -c "${SMOKE_COMMAND}"
+          fi
+
+      # Every layer is already in the buildx cache from the load build above.
+      - name: Build and push by digest
+        id: digest_push
+        if: needs.prepare.outputs.should_push == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ needs.prepare.outputs.owner_lc }}/${{ inputs.image-name }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            REVISION=${{ github.sha }}
+            CREATED=${{ needs.prepare.outputs.created }}
+            CAPABILITY_MANIFEST_B64=${{ needs.prepare.outputs.manifest_b64 }}
+            CAPABILITY_SCHEMAS_B64=${{ needs.prepare.outputs.schemas_b64 }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.runwhen.codecollection.commit=${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}-${{ matrix.arch }}
+
+      - name: Stage the digest for the merge job
+        if: needs.prepare.outputs.should_push == 'true'
+        env:
+          DIGEST: ${{ steps.digest_push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload the digest
+        if: needs.prepare.outputs.should_push == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ inputs.image-name }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_push == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.inspect.outputs.image }}
+      digest: ${{ steps.inspect.outputs.digest }}
+    steps:
+      # Two exact names rather than a glob: one image name can be a prefix
+      # of another's when a repo calls this workflow more than once.
+      - name: Download the amd64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digests-${{ inputs.image-name }}-amd64
+          path: ${{ runner.temp }}/digests
+
+      - name: Download the arm64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digests-${{ inputs.image-name }}-arm64
+          path: ${{ runner.temp }}/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the multi-arch manifest
+        id: tags
+        env:
+          REPO_LC: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.owner_lc }}/${{ inputs.image-name }}
+          CANONICAL_TAG: ${{ needs.prepare.outputs.canonical_tag }}
+          EXTRA_TAGS: ${{ needs.prepare.outputs.extra_tags }}
+        run: |
+          set -euo pipefail
+          tags=( "${REPO_LC}:${CANONICAL_TAG}" )
+          if [ -n "${EXTRA_TAGS}" ]; then
+            IFS=',' read -ra extra <<< "${EXTRA_TAGS}"
+            for suffix in "${extra[@]}"; do tags+=( "${REPO_LC}:${suffix}" ); done
+          fi
+          tag_args=()
+          for t in "${tags[@]}"; do tag_args+=( -t "${t}" ); done
+          digest_args=()
+          for f in "${RUNNER_TEMP}"/digests/*; do
+            digest_args+=( "${REPO_LC}@sha256:$(basename "${f}")" )
+          done
+          echo "Tags:    ${tags[*]}"
+          echo "Digests: ${digest_args[*]}"
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
+          printf 'tags=%s\n' "$(IFS=,; echo "${tags[*]}")" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect the multi-arch manifest
+        id: inspect
+        env:
+          REPO_LC: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.owner_lc }}/${{ inputs.image-name }}
+          CANONICAL_TAG: ${{ needs.prepare.outputs.canonical_tag }}
+        run: |
+          set -euo pipefail
+          out="$(docker buildx imagetools inspect "${REPO_LC}:${CANONICAL_TAG}")"
+          echo "${out}"
+          digest="$(echo "${out}" | awk '/^Digest:/ {print $2; exit}')"
+          if [ -z "${digest}" ]; then
+            echo "::error::could not read the manifest digest from imagetools inspect"
+            exit 1
+          fi
+          {
+            echo "digest=${digest}"
+            echo "image=${REPO_LC}:${CANONICAL_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          REPO_LC: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.owner_lc }}/${{ inputs.image-name }}
+          CANONICAL_TAG: ${{ needs.prepare.outputs.canonical_tag }}
+          TAG_CSV: ${{ steps.tags.outputs.tags }}
+          DIGEST: ${{ steps.inspect.outputs.digest }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "## ${IMAGE_NAME}"
+            echo
+            echo "- Event:         \`${EVENT_NAME}\`"
+            echo "- Ref:           \`${REF}\`"
+            echo "- Commit:        \`${SHA}\`"
+            echo "- Canonical tag: \`${REPO_LC}:${CANONICAL_TAG}\`"
+            echo "- Digest:        \`${DIGEST}\`"
+            echo
+            echo "### Published tags"
+            IFS=',' read -ra tags <<< "${TAG_CSV}"
+            for t in "${tags[@]}"; do echo "- \`${t}\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"

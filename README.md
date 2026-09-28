@@ -108,6 +108,44 @@ rwtask schemas --check   # CI: fail if any listed file is missing or differs fro
 Files under `schemas/` that are not listed are left alone, so an older published version can stay
 on disk after the listing moves on to a new one.
 
+## Building a capability image
+
+`.github/workflows/capability-image.yml` is a reusable workflow that builds one capability image
+for linux/amd64 and linux/arm64 on native runners, smoke-tests it and pushes a multi-arch manifest
+to GHCR. Call it once per image, at the same tag as the SDK the repo pins:
+
+```yaml
+jobs:
+  image:
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    uses: runwhen-contrib/runwhen-capability/.github/workflows/capability-image.yml@v0.1.0
+    with:
+      capability: my-capability            # capabilities/my-capability/
+      dockerfile: Dockerfile.my-capability
+      image-name: my-capability-codecollection
+      push: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+```
+
+| Input | Default | Meaning |
+|---|---|---|
+| `capability` | required | Directory under `capabilities/`; also the manifest's `capability` id. |
+| `dockerfile` | required | Dockerfile for this image. |
+| `image-name` | required | Published as `ghcr.io/<owner>/<image-name>`. |
+| `push` | `true` | Push the image. A pull request from a fork never pushes. |
+| `execution-mode` | `''` | Expected `execution.mode`; empty skips the check. |
+| `sbom` | `''` | Repo path of an SBOM the image ships; the smoke test checks the file named by the image's `io.runwhen.sbom` label is identical. |
+| `smoke-command` | `''` | Extra bash run against the built image, with `$IMG` set. |
+| `python-version` | `3.12` | Python used to run `rwtask` on the build host. |
+
+Tags: `<branch>-<sha7>` plus `<branch>` (and `latest` on `main`) for a branch push, `pr-<n>-<sha7>`
+plus `pr-<n>` for a pull request, and the bare tag (e.g. `v1.2.0`) with no aliases for a semver
+tag. The Dockerfile must turn the `CAPABILITY_MANIFEST_B64` and `CAPABILITY_SCHEMAS_B64` build args
+into the `com.runwhen.capability.manifest.v1` and `com.runwhen.capability.schemas.v1` labels; the
+smoke test fails if it does not.
+
 ## Development
 
 ```
