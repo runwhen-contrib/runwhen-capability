@@ -108,3 +108,27 @@ def test_serve_bundle_request_hash_mismatch_reports_a_failed_setup(tmp_path):
     assert result_body["status"] == "ok"
     assert result_body["result"]["setup"]["status"] == "failed"
     assert "hash mismatch" in result_body["result"]["setup"]["error"]
+
+
+def test_serve_startup_removes_bundle_scopes_a_crashed_run_left_but_keeps_others(tmp_path):
+    workdir = tmp_path / "work"
+    stale = workdir / "req-crashed"
+    (stale / ".rw-sdk").mkdir(parents=True)
+    (stale / ".rw-sdk" / "rw.sh").write_text("# rw.sh")
+    (stale / ".secrets-abc").mkdir()
+    (stale / ".secrets-abc" / "token").write_text("left-behind-secret")
+    warm = workdir / "rk-stateful"
+    warm.mkdir()
+    (warm / "checkout.txt").write_text("a packaged capability's warm scope")
+
+    serve(
+        relay=RELAY,
+        pool_id="pool-1",
+        workdir=workdir,
+        capability_dir=FIXTURES / "echo",
+        token_file=_token_file(tmp_path),
+        max_iterations=0,
+    )
+
+    assert not stale.exists()
+    assert (warm / "checkout.txt").exists()

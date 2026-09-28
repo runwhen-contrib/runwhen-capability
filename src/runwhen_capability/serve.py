@@ -105,6 +105,7 @@ def serve(
     session = session or requests.Session()
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    _wipe_stale_bundle_scopes(workdir, log)
 
     token_file = (
         Path(token_file)
@@ -140,6 +141,23 @@ def serve(
             stateful_scopes,
             max_stateful_scopes,
         )
+
+
+def _wipe_stale_bundle_scopes(workdir: Path, log) -> None:
+    """A bundle request's scope is wiped as soon as the request ends, so
+    one still here at startup was left by a host that died mid-request
+    (an OOM kill, an evicted container restarting onto the same volume) --
+    and may still hold that request's bundle and secret files. A bundle
+    scope is recognised by the `.rw-sdk/rw.sh` bundle.py writes into every
+    one; nothing else in `workdir` -- a stateful packaged capability's warm
+    scopes included -- is touched. Assumes, as the stateful LRU already
+    does, that `workdir` belongs to this one serve process."""
+    for child in workdir.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            continue
+        if (child / ".rw-sdk" / "rw.sh").is_file():
+            log.info("removing bundle scope %r left behind by an earlier run", child.name)
+            shutil.rmtree(child, ignore_errors=True)
 
 
 def _is_safe_scope_id(scope_id: str) -> bool:
