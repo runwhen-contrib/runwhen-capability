@@ -582,10 +582,14 @@ def _apply_size_caps(outputs: dict[str, Any]) -> tuple[dict[str, Any], list[str]
 
     total = sum(_json_size(v) for v in capped.values())
     if total > MAX_RESULT_BYTES:
+        # The task fails; its outputs are dropped rather than sent anyway --
+        # the limit exists to bound what goes back to the relay, and many
+        # outputs just under their own cap can add up to many times it.
         errors.append(
             f"{E_OUTPUT_TOO_LARGE}: result is {total} bytes, over the {MAX_RESULT_BYTES}-byte "
-            "per-result limit"
+            "per-result limit; its outputs were dropped"
         )
+        return {}, errors
     return capped, errors
 
 

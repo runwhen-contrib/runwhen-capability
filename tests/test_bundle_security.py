@@ -426,3 +426,21 @@ tasks:
     result = run_bundle_request(request, {}, tmp_path)
     assert [task.status for task in result.tasks] == ["failed", "ok"]
     assert "could not start" in result.tasks[0].error
+
+
+def test_a_result_over_the_per_result_limit_is_not_sent(tmp_path):
+    names = [f"o{i}" for i in range(6)]
+    outputs = "\n".join(f'      {n}: {{ schema: "string" }}' for n in names)
+    source = f"def main(ctx):\n    return {{n: 'x' * (200 * 1024) for n in {names!r}}}\n"
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\nname: probe\ntasks:\n"
+            "  - name: t\n    file: tasks/t.py\n    outputs:\n" + outputs + "\n"
+        ),
+        "tasks/t.py": source,
+    }
+    result = run_bundle_request(_request(files), {}, tmp_path)
+    [task] = result.tasks
+    assert task.status == "failed"
+    assert task.outputs == {}
+    assert any("per-result limit" in e for e in task.errors)
