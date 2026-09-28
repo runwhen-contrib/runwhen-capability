@@ -28,6 +28,11 @@ dropping the result (see _post_result). The token file path comes from
 A missing/unreadable token file at GetTask time is logged and the loop
 keeps polling -- it never falls back to an unauthenticated request.
 
+A `request` that carries a `bundle` (a custom capability's code, inline --
+see bundle.py) is run only when this executor was started with
+`--allow-bundles` (or RW_ALLOW_BUNDLES=1); otherwise it is refused with a
+failed result. Packaged-capability images never set it.
+
 `scopeId` must be a single path segment (see _is_safe_scope_id): the loop
 creates and later deletes <workdir>/<scopeId>/, so anything else -- empty,
 absolute, containing "/" or ".." -- is refused as a failed request before
@@ -74,6 +79,11 @@ RETRY_DELAY = 5  # seconds, on a poll/post transport failure
 
 DEFAULT_TOKEN_FILE = "/var/run/executor/token"
 
+BUNDLES_NOT_ALLOWED = (
+    "this executor does not run bundle requests: it was started without --allow-bundles "
+    "(or RW_ALLOW_BUNDLES=1). Route custom capabilities to an image built to run them."
+)
+
 # Bounds how many distinct scopeIds a stateful pod keeps warm at once. Each
 # one holds a full checkout on disk, and one pod is handed several scopeIds
 # over its life (a stateful pool is sticky-routed but not one-scope-per-pod),
@@ -94,13 +104,21 @@ def serve(
     session: requests.Session | None = None,
     log: logging.Logger | None = None,
     max_stateful_scopes: int = DEFAULT_MAX_STATEFUL_SCOPES,
+    allow_bundles: bool = False,
 ) -> None:
     """Runs the long-poll loop. `max_iterations` (None = forever) and
     `session` exist so tests can drive this deterministically without a real
     relay or an infinite loop. `max_stateful_scopes` bounds how many warm
     scopes a `stateful` capability keeps on disk at once (n/a for
     `stateless` capabilities, which never keep one); tests lower it to
-    exercise eviction without dozens of iterations."""
+    exercise eviction without dozens of iterations.
+
+    `allow_bundles` (CLI: `--allow-bundles`, or RW_ALLOW_BUNDLES=1) opts
+    this executor into bundle mode. Off by default: a bundle request
+    carries arbitrary code, and only an image built to run custom
+    capabilities should ever execute one. With it off, a bundle request
+    is refused with a failed result before anything touches the
+    filesystem."""
     log = log or logging.getLogger("runwhen_capability.serve")
     session = session or requests.Session()
     workdir = Path(workdir)
@@ -116,10 +134,11 @@ def serve(
     cap_dir = Path(capability_dir) if capability_dir else discover_capability_dir()
     capability = load_capability(cap_dir)
     log.info(
-        "serving capability %r (execution.mode=%s) from %s",
+        "serving capability %r (execution.mode=%s) from %s; bundle requests %s",
         capability.capability_id,
         capability.execution_mode,
         cap_dir,
+        "accepted" if allow_bundles else "refused",
     )
 
     # LRU of scopeIds this pod is currently keeping warm, for `stateful`
@@ -140,6 +159,7 @@ def serve(
             log,
             stateful_scopes,
             max_stateful_scopes,
+            allow_bundles,
         )
 
 
@@ -273,6 +293,7 @@ def _poll_once(
     log,
     stateful_scopes: OrderedDict[str, None],
     max_stateful_scopes: int,
+    allow_bundles: bool = False,
 ) -> None:
     token = _read_token(token_file, log)
     if token is None:
@@ -326,6 +347,26 @@ def _poll_once(
         return
 
     is_bundle = isinstance(task_request.request, BundleRequestEnvelope)
+    if is_bundle and not allow_bundles:
+        # Refused, not ignored: the runner must learn why nothing ran.
+        # Nothing has touched the filesystem, and none of the bundle's code
+        # has been looked at.
+        log.error(
+            "request %s: refusing a bundle request -- this executor was not started "
+            "with --allow-bundles",
+            task_request.requestId,
+        )
+        _post_result(
+            session,
+            relay,
+            task_request.requestId,
+            {"status": "failed", "error": BUNDLES_NOT_ALLOWED},
+            token_file,
+            token,
+            log,
+        )
+        return
+
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
     try:

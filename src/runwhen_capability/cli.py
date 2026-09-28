@@ -56,6 +56,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="path to the executor bearer token; default: the EXECUTOR_TOKEN_FILE "
         "env var, else /var/run/executor/token",
     )
+    serve_p.add_argument(
+        "--allow-bundles",
+        action="store_true",
+        default=None,
+        help="also run bundle requests -- a custom capability's code carried inside the "
+        "request -- instead of refusing them; default: off, unless RW_ALLOW_BUNDLES=1. "
+        "Only an image built to run custom capabilities should enable this.",
+    )
 
     run_p = sub.add_parser(
         "run",
@@ -176,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             workdir=Path(args.workdir),
             capability_dir=Path(args.capability_dir) if args.capability_dir else None,
             token_file=Path(args.token_file) if args.token_file else None,
+            allow_bundles=bool(args.allow_bundles) or os.environ.get("RW_ALLOW_BUNDLES") == "1",
         )
         return 0
 

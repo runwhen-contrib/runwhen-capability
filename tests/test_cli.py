@@ -41,6 +41,31 @@ def test_serve_takes_relay_and_pool_from_env_when_no_flags_are_passed(monkeypatc
     assert seen["pool_id"] == "ghcr.io/example/cap@sha256:abc"
 
 
+@pytest.mark.parametrize(
+    ("argv", "env", "expected"),
+    [
+        ([], None, False),
+        (["--allow-bundles"], None, True),
+        ([], "1", True),
+        ([], "0", False),
+    ],
+)
+def test_serve_runs_bundle_requests_only_when_opted_in(monkeypatch, argv, env, expected):
+    seen = {}
+    monkeypatch.setenv("RELAY_URL", "http://runner-relay:8000")
+    monkeypatch.setenv("POOL_ID", "pool-1")
+    if env is None:
+        monkeypatch.delenv("RW_ALLOW_BUNDLES", raising=False)
+    else:
+        monkeypatch.setenv("RW_ALLOW_BUNDLES", env)
+    monkeypatch.setattr("runwhen_capability.serve.serve", lambda **kwargs: seen.update(kwargs))
+
+    from runwhen_capability.cli import main
+
+    assert main(["serve", "--capability-dir", "capabilities/example", *argv]) == 0
+    assert seen["allow_bundles"] is expected
+
+
 def test_serve_errors_clearly_when_neither_flag_nor_env_is_present(monkeypatch, capsys):
     monkeypatch.delenv("RELAY_URL", raising=False)
     monkeypatch.delenv("POOL_ID", raising=False)

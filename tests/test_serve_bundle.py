@@ -57,6 +57,7 @@ def test_serve_dispatches_a_bundle_request_and_wipes_its_scope(tmp_path):
         capability_dir=FIXTURES / "echo",
         token_file=_token_file(tmp_path),
         max_iterations=1,
+        allow_bundles=True,
     )
 
     assert len(responses.calls) == 2
@@ -102,6 +103,7 @@ def test_serve_bundle_request_hash_mismatch_reports_a_failed_setup(tmp_path):
         capability_dir=FIXTURES / "echo",
         token_file=_token_file(tmp_path),
         max_iterations=1,
+        allow_bundles=True,
     )
 
     result_body = json.loads(responses.calls[1].request.body)
@@ -132,3 +134,47 @@ def test_serve_startup_removes_bundle_scopes_a_crashed_run_left_but_keeps_others
 
     assert not stale.exists()
     assert (warm / "checkout.txt").exists()
+
+
+@responses.activate
+def test_serve_refuses_a_bundle_request_unless_bundles_are_allowed(tmp_path, monkeypatch):
+    files = load_bundle("pgbouncer-health")
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json={
+            "requestId": "req-1",
+            "request": {
+                "bundle": {
+                    "hash": content_hash(files),
+                    "files": [{"path": p, "content": c} for p, c in files.items()],
+                },
+                "tasks": ["pool-errors"],
+            },
+            "credentials": {"kubeconfig": "kubeconfig-value"},
+            "scopeId": "scope-1",
+            "deadlineMs": 30000,
+        },
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("a refused bundle must never reach the bundle host")
+
+    monkeypatch.setattr("runwhen_capability.serve.run_bundle_request", _must_not_run)
+
+    workdir = tmp_path / "work"
+    serve(
+        relay=RELAY,
+        pool_id="pool-1",
+        workdir=workdir,
+        capability_dir=FIXTURES / "echo",
+        token_file=_token_file(tmp_path),
+        max_iterations=1,
+    )
+
+    result_body = json.loads(responses.calls[1].request.body)
+    assert result_body["status"] == "failed"
+    assert "--allow-bundles" in result_body["error"]
+    assert not (workdir / "scope-1").exists()

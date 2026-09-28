@@ -62,11 +62,25 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
 
 ```
 rwtask run <capability-dir> --request request.json [--credentials creds.json]
-rwtask serve [--capability-dir DIR]        # RELAY_URL, POOL_ID, EXECUTOR_TOKEN_FILE from the env
+rwtask run --local <bundle-dir> --task <name> [--inputs '<json>'] [--credentials creds.json]
+rwtask serve [--capability-dir DIR] [--allow-bundles]
+             # RELAY_URL, POOL_ID, EXECUTOR_TOKEN_FILE from the env
 ```
 
 `rwtask run` is the same code path as `rwtask serve`, against the local filesystem: a capability
 author needs no cluster.
+
+### Custom capability bundles
+
+A custom capability travels as a bundle -- `capability.yaml` plus its `tasks/`, `lib/`, `schemas/`
+files -- inside the request itself, rather than baked into an image
+(`runwhen_capability.custom` validates and compiles one; `rwtask run --local` runs one).
+
+`rwtask serve` runs bundle requests **only when started with `--allow-bundles`**, or with
+`RW_ALLOW_BUNDLES=1` in its environment. Without it, a request that carries a bundle is refused
+with a failed result and none of its code is written or run. A bundle is arbitrary code, so only
+an image built to run custom capabilities should turn this on; packaged-capability images leave
+it off.
 
 ### Image labels
 

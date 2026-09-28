@@ -20,7 +20,9 @@ with the wheel and sdist attached to the GitHub Release.
   - Bundles are untrusted input: `validate()` runs in linear time, never raises, refuses YAML
     aliases, unsafe paths and names, and schema files with non-local `$ref`s.
 - **Bundle mode**: a request whose envelope carries a `bundle` (its files inline, content-hash
-  verified) is materialised, compiled, and run -- `rwtask serve` dispatches to it automatically;
+  verified) is materialised, compiled, and run. `rwtask serve` runs one **only when started with
+  `--allow-bundles` (or `RW_ALLOW_BUNDLES=1`)**; otherwise it refuses the request with a failed
+  result, so a packaged-capability image never executes bundle code.
   `rwtask run --local <bundle-dir> --task <name> --inputs '<json>'` runs the same path locally, with
   no relay.
   - Python: `main(ctx, **inputs)`, with the new `ctx.skip(reason)` (equivalent to `raise
