@@ -319,3 +319,53 @@ def test_schema_errors_are_capped_in_number_and_length():
     messages = _validate_output_schema("o", ["x" * 5000] * 1000, schema)
     assert len(messages) == MAX_SCHEMA_ERRORS + 1
     assert all(len(m) <= MAX_SCHEMA_ERROR_CHARS for m in messages)
+
+
+# -- redaction reaches every field a task influences -------------------------------
+
+_TOKEN = "tok-9f8e7d6c5b4a-secret"
+
+
+def test_a_secret_quoted_in_a_schema_error_is_redacted(tmp_path):
+    source = _BASH + 'rw_set o "\\"$(cat "$TOKEN")\\""\n'
+    result = _run(_files("t.sh", source, schema="integer"), tmp_path, {"token": _TOKEN})
+    [task] = result.tasks
+    assert task.status == "failed"
+    assert _TOKEN not in task.error
+    assert all(_TOKEN not in message for message in task.errors)
+
+
+def test_a_secret_in_a_skip_reason_is_redacted(tmp_path):
+    source = _BASH + 'rw_skip "cannot log in with $(cat "$TOKEN")"\n'
+    result = _run(_files("t.sh", source), tmp_path, {"token": _TOKEN})
+    [task] = result.tasks
+    assert task.status == "skipped"
+    assert _TOKEN not in task.reason
+
+
+def test_a_secret_used_as_an_output_key_is_redacted(tmp_path):
+    source = "def main(ctx, token):\n    return {'o': {open(token).read(): 1}}\n"
+    files = _files("t.py", source, schema="./schemas/s.json", **{"schemas/s.json": "{}"})
+    result = _run(files, tmp_path, {"token": _TOKEN})
+    [task] = result.tasks
+    assert _TOKEN not in json.dumps(task.outputs)
+
+
+def test_the_log_tail_cut_never_leaves_part_of_a_secret(tmp_path):
+    from runwhen_capability.bundle import LOG_TAIL_BYTES
+
+    # The secret starts 10 characters before the point the 64 KiB tail
+    # would begin, so a plain cut keeps its last characters.
+    source = (
+        "import sys\n"
+        "def main(ctx, token):\n"
+        "    secret = open(token).read()\n"
+        f"    sys.stdout.write(secret + 'x' * ({LOG_TAIL_BYTES} - len(secret) + 10))\n"
+        "    return {}\n"
+    )
+    result = _run(_files("t.py", source), tmp_path, {"token": _TOKEN})
+    [task] = result.tasks
+    assert task.status == "ok"
+    assert len(task.logTail) <= LOG_TAIL_BYTES
+    assert _TOKEN[10:] not in task.logTail
+    assert _TOKEN[-8:] not in task.logTail

@@ -67,6 +67,7 @@ from typing import Any
 import jsonschema
 import referencing
 
+from ._redaction import Redactor
 from ._rw_sh import RW_SH
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT
@@ -94,7 +95,6 @@ MAX_SCHEMA_ERROR_CHARS = 500
 DEFAULT_TASK_DEADLINE = 300  # seconds; used when the caller gives no deadline
 _DRAIN_JOIN_TIMEOUT = 5
 _READ_CHUNK = 65536
-_REDACTED = "***REDACTED***"
 
 _DURATION_RE = re.compile(r"^\d+(\.\d+)?(ms|s|m|h|d)$")
 
@@ -162,6 +162,9 @@ def run_bundle_request(
         return result
 
     target = request.target.model_dump(mode="json") if request.target else None
+    # Every secret/credential value the request carries -- not only the ones
+    # a given task declares -- is redacted from everything any task returns.
+    redactor = Redactor([value for value in credentials.values() if value])
 
     if manifest.setup is not None:
         outcome = _run_setup_or_task(
@@ -181,8 +184,10 @@ def run_bundle_request(
             rw_sdk_dir=rw_sdk_dir,
             deadline_seconds=deadline_seconds,
             allow_anonymous=allow_anonymous_credentials,
+            redactor=redactor,
             log=log.getChild("setup"),
         )
+        outcome = _redacted(outcome, redactor)
         result.setup = SetupResult(
             # ok/failed/timeout -- never "skipped" (is_setup=True maps a skip to failed)
             status=outcome.status,
@@ -218,8 +223,10 @@ def run_bundle_request(
             rw_sdk_dir=rw_sdk_dir,
             deadline_seconds=deadline_seconds,
             allow_anonymous=allow_anonymous_credentials,
+            redactor=redactor,
             log=log.getChild(task_name),
         )
+        outcome = _redacted(outcome, redactor)
         result.tasks.append(
             TaskResult(
                 task=task_name,
@@ -253,8 +260,13 @@ def _run_setup_or_task(
     rw_sdk_dir: Path,
     deadline_seconds: float,
     allow_anonymous: bool,
+    redactor: Redactor,
     log: logging.Logger,
 ) -> _RunOutcome:
+    """Runs one setup/task file. Outputs, errors and the skip reason come
+    back unredacted -- run_bundle_request() redacts the whole outcome --
+    except the log tail, which has to be redacted before it is cut to size
+    (see _execute)."""
     language = task_file_language(file_path)
     if language is None:
         return _RunOutcome(status="failed", error=f"{file_path}: unsupported file type")
@@ -270,7 +282,6 @@ def _run_setup_or_task(
         resolved, type_errors = _resolve_inputs(
             input_specs, provided_inputs, target, credentials, secrets_dir, allow_anonymous
         )
-        secrets = [v for v in credentials.values() if v]
         if type_errors:
             return _RunOutcome(status="failed", error="; ".join(type_errors), errors=type_errors)
 
@@ -308,9 +319,10 @@ def _run_setup_or_task(
             deadline_seconds=deadline_seconds,
             allow_anonymous=allow_anonymous,
             kubeconfig_path=kubeconfig_path,
+            tail_guard=redactor.longest,
             log=log,
         )
-        log_tail = _redact_text(log_tail, secrets) if log_tail else log_tail
+        log_tail = redactor.text(log_tail)[-LOG_TAIL_BYTES:] if log_tail else log_tail
 
         if timed_out:
             return _RunOutcome(
@@ -373,8 +385,6 @@ def _run_setup_or_task(
 
         outputs, size_errors = _apply_size_caps(outputs)
         errors.extend(size_errors)
-
-        outputs = _redact_value(outputs, secrets)
 
         # A list output cut to fit its size cap is noted in `errors` but does
         # NOT fail the task -- only a non-list output/whole result still over
@@ -566,20 +576,21 @@ def _apply_size_caps(outputs: dict[str, Any]) -> tuple[dict[str, Any], list[str]
 # -- redaction ------------------------------------------------------------------
 
 
-def _redact_text(text: str, secrets: list[str]) -> str:
-    for secret in sorted((s for s in secrets if s), key=len, reverse=True):
-        text = text.replace(secret, _REDACTED)
-    return text
-
-
-def _redact_value(value: Any, secrets: list[str]) -> Any:
-    if isinstance(value, str):
-        return _redact_text(value, secrets)
-    if isinstance(value, dict):
-        return {k: _redact_value(v, secrets) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_value(v, secrets) for v in value]
-    return value
+def _redacted(outcome: _RunOutcome, redactor: Redactor) -> _RunOutcome:
+    """`outcome` with every secret removed from what a task controls or
+    can influence: outputs (keys included), the error summary, each
+    runtime error -- a schema error quotes the offending value -- and the
+    skip reason. The log tail is already redacted (_run_setup_or_task)."""
+    if not redactor:
+        return outcome
+    return _RunOutcome(
+        status=outcome.status,
+        outputs=redactor.value(outcome.outputs),
+        error=redactor.text(outcome.error) if outcome.error else outcome.error,
+        reason=redactor.text(outcome.reason) if outcome.reason else outcome.reason,
+        errors=[redactor.text(message) for message in outcome.errors],
+        log_tail=outcome.log_tail,
+    )
 
 
 # -- the subprocess boundary ---------------------------------------------------
@@ -587,23 +598,37 @@ def _redact_value(value: Any, secrets: list[str]) -> Any:
 
 class _TailBuffer:
     """Keeps only the last `max_chars` characters written to it, without
-    holding the full (potentially unbounded) stream in memory first."""
+    holding the full (potentially unbounded) stream in memory first.
 
-    def __init__(self, max_chars: int) -> None:
+    `guard` extra characters are kept in front of those, and dropped again
+    by get() whenever the stream was longer than the buffer: the cut can
+    land in the middle of a secret, and a secret's tail on its own no
+    longer matches the redactor. As long as `guard` is at least the longest
+    value being redacted, whatever partial secret the cut leaves at the
+    front falls inside the guard and is discarded."""
+
+    def __init__(self, max_chars: int, guard: int = 0) -> None:
         self._max = max_chars
+        self._guard = guard
+        self._capacity = max_chars + guard
         self._chunks: list[str] = []
         self._total = 0
+        self._cut = False
 
     def write(self, text: str) -> None:
         if not text:
             return
         self._chunks.append(text)
         self._total += len(text)
-        while self._total > self._max and len(self._chunks) > 1:
+        while self._total > self._capacity and len(self._chunks) > 1:
             self._total -= len(self._chunks.pop(0))
+            self._cut = True
 
     def get(self) -> str:
-        return "".join(self._chunks)[-self._max :]
+        text = "".join(self._chunks)
+        if self._cut or len(text) > self._capacity:
+            return text[-self._capacity :][self._guard :]
+        return text
 
 
 def _drain_text(stream, tail: _TailBuffer) -> None:
@@ -743,12 +768,14 @@ def _execute(
     deadline_seconds: float,
     allow_anonymous: bool,
     kubeconfig_path: str | None,
+    tail_guard: int,
     log: logging.Logger,
 ) -> tuple[int, _EventStream, str, bool]:
     """Runs one setup/task file as a child process in its own process group,
     with `deadline_seconds` enforced by SIGKILL-ing the whole group. Returns
     (exit code, what was read off the output fd, combined stdout+stderr
-    tail, whether the deadline was hit)."""
+    tail -- up to 2 * LOG_TAIL_BYTES, unredacted -- whether the deadline was
+    hit)."""
     read_fd, write_fd = os.pipe()
 
     base_env = {
@@ -806,8 +833,8 @@ def _execute(
         os.close(write_fd)  # the parent's copy; the child keeps its own via pass_fds
 
     stream = _EventStream()
-    stdout_tail = _TailBuffer(LOG_TAIL_BYTES)
-    stderr_tail = _TailBuffer(LOG_TAIL_BYTES)
+    stdout_tail = _TailBuffer(LOG_TAIL_BYTES, guard=tail_guard)
+    stderr_tail = _TailBuffer(LOG_TAIL_BYTES, guard=tail_guard)
     events_thread = threading.Thread(target=_drain_events, args=(read_fd, stream), daemon=True)
     stdout_thread = threading.Thread(
         target=_drain_text, args=(proc.stdout, stdout_tail), daemon=True
@@ -854,7 +881,8 @@ def _execute(
     if not stderr_thread.is_alive():
         proc.stderr.close()
 
-    log_tail = (stdout_tail.get() + stderr_tail.get())[-LOG_TAIL_BYTES:]
+    # Not cut to LOG_TAIL_BYTES here: the caller redacts it first, then cuts.
+    log_tail = stdout_tail.get() + stderr_tail.get()
     snapshot = _EventStream(list(stream.events), stream.malformed, stream.overflowed)
     return proc.returncode, snapshot, log_tail, timed_out
 
