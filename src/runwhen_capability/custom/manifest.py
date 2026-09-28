@@ -29,12 +29,6 @@ MAX_FILE_BYTES = 64 * 1024
 MAX_FILES = 40
 MAX_BUNDLE_BYTES = 256 * 1024
 
-# Input types (section 1's "Input types" list). `duration`/`datetime` are
-# strings on the wire; `enum(...)` is parsed like an output's compact schema
-# enum, so it is not listed here -- see manifest_input_type().
-SCALAR_INPUT_TYPES = ("string", "integer", "number", "boolean", "duration", "datetime")
-SPECIAL_INPUT_TYPES = ("resource", "secret", "credential")
-
 _CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 

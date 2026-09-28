@@ -311,10 +311,9 @@ class BundleRequestEnvelope(BaseModel):
     """The bundle-mode counterpart to RequestEnvelope: `tasks` names which
     of the bundle's declared tasks to run (in order), `inputs` is the flat
     set of runtime inputs shared across all of them (there is one input
-    namespace per request, not one per task -- see build-mode-contracts
-    section 2's example). Setup, if the manifest declares one, always runs
-    first. Distinguished from RequestEnvelope on the wire by the presence
-    of `bundle` (see TaskHostRequest.request)."""
+    namespace per request, not one per task). Setup, if the manifest
+    declares one, always runs first. Distinguished from RequestEnvelope on
+    the wire by the presence of `bundle` (see TaskHostRequest.request)."""
 
     bundle: Bundle
     tasks: list[str] = Field(default_factory=list)

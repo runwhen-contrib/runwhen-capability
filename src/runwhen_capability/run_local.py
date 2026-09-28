@@ -5,7 +5,7 @@
 Both are reference implementations: the same code path as `rwtask serve`
 (host.run_request / bundle.run_bundle_request), against the local
 filesystem, with credentials from a local file. A capability author needs no
-cluster, and a custom capability author needs no papi and no runner, to
+cluster, and a custom capability author needs no platform and no runner, to
 develop against this SDK.
 
 `allow_anonymous` (CLI: `--allow-anonymous`) is `rwtask run`'s own escape

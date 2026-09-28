@@ -214,9 +214,10 @@ def bash_output_writes(text: str) -> list[tuple[int, str]]:
 
 # -- readOnly: a mutating kubectl verb in a readOnly task ---------------------
 
-# Exactly the verbs section 2 names, plus the small set of obvious mutating
-# complements ("and similar"). Read-only verbs (get/describe/logs/top/explain/
-# version/api-resources/...) are deliberately not in this list.
+# kubectl delete/apply/patch/edit/scale/rollout restart/exec and the small
+# set of obvious mutating complements. Read-only verbs
+# (get/describe/logs/top/explain/version/api-resources/...) are deliberately
+# not in this list.
 MUTATING_KUBECTL_VERBS = (
     "delete",
     "apply",

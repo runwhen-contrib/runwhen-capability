@@ -16,9 +16,9 @@ For each request:
 
 Unlike a packaged capability's setup/task (an in-process function call,
 host.py), each one here runs as its OWN CHILD PROCESS, in its own process
-group, with its own deadline -- that is what makes "kill the whole process
-group on a deadline" (section 2) possible without taking `rwtask serve`'s
-long-poll loop down with it. Python and bash are both run this way, for the
+group, with its own deadline -- that is what makes killing the whole process
+group on a deadline possible without taking `rwtask serve`'s long-poll loop
+down with it. Python and bash are both run this way, for the
 same reason: _bundle_entrypoint.py is the small, uniform wrapper that gives a
 Python `main(ctx, **inputs)` file the same subprocess boundary a bash file
 already needs.

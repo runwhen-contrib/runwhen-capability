@@ -1,9 +1,10 @@
-"""compile_manifest(files) -- the packaged-capability manifest shape papi's
-CapabilityManifest parses, compiled from a custom capability bundle's
-capability.yaml: `capability`, `appliesTo`, `needs.credentials`, and
+"""compile_manifest(files) -- the packaged-capability manifest shape the
+platform's CapabilityManifest parses, compiled from a custom capability
+bundle's capability.yaml: `capability`, `appliesTo`, `needs.credentials`, and
 `tasks[{name, description, readOnly, file, inputs, outputs}]` with every
 output's compact schema (or escape-hatch file) resolved to JSON Schema.
-`execution` is omitted -- papi fills the image (the rw-task runtime).
+`execution` is omitted -- the platform fills the image (the rw-task
+runtime).
 """
 
 from __future__ import annotations
@@ -66,8 +67,8 @@ def _needs_credentials(manifest: Manifest) -> list[dict]:
 
 
 def _compile_task(files: dict[str, str], manifest: Manifest, task: TaskSpec) -> dict:
-    # Capability-level inputs are "shared by every task" (section 1); a
-    # task-level entry of the same name overrides it. The compiled shape
+    # Capability-level inputs are shared by every task; a task-level entry
+    # of the same name overrides it. The compiled shape
     # carries no separate top-level `inputs` -- each task's `inputs` here is
     # the complete, self-contained set it runs with.
     merged_inputs = {**manifest.inputs, **task.inputs}
