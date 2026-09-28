@@ -19,6 +19,10 @@ with the wheel and sdist attached to the GitHub Release.
   - `content_hash(files)` / `task_hash(files, task)`.
   - Bundles are untrusted input: `validate()` runs in linear time, never raises, refuses YAML
     aliases, unsafe paths and names, and schema files with non-local `$ref`s.
+  - Regex keywords (`pattern`, `patternProperties`) are not supported in custom task schemas:
+    `validate()` reports them as `E_SCHEMA_FEATURE` (on outputs, including `./x.json` schema
+    files, and on inputs), and the host refuses to evaluate a schema that contains one. Validate
+    formats in the task code instead.
 - **Bundle mode**: a request whose envelope carries a `bundle` (its files inline, content-hash
   verified) is materialised, compiled, and run. `rwtask serve` runs one **only when started with
   `--allow-bundles` (or `RW_ALLOW_BUNDLES=1`)**; otherwise it refuses the request with a failed

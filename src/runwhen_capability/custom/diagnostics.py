@@ -16,6 +16,8 @@ Static codes (validate() only, no execution):
 - E_READONLY_WRITE -- kubectl delete/apply/patch/edit/scale/rollout restart/exec
   and similar in a readOnly task.
 - E_DUPLICATE_NAME -- a name is used twice.
+- E_SCHEMA_FEATURE -- a schema uses a JSON Schema feature custom tasks may not
+  use (regex keywords: `pattern`, `patternProperties`).
 
 Runtime codes (the bundle host, bundle.py) reuse the same string constants:
 E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT.
@@ -39,6 +41,7 @@ E_UNDECLARED_INPUT = "E_UNDECLARED_INPUT"
 E_OUTPUT_UNDECLARED = "E_OUTPUT_UNDECLARED"
 E_READONLY_WRITE = "E_READONLY_WRITE"
 E_DUPLICATE_NAME = "E_DUPLICATE_NAME"
+E_SCHEMA_FEATURE = "E_SCHEMA_FEATURE"
 
 # -- runtime codes: the bundle host (bundle.py) --------------------------------
 E_INPUT_TYPE = "E_INPUT_TYPE"

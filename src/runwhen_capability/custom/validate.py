@@ -25,6 +25,7 @@ from .diagnostics import (
     E_OUTPUT_UNDECLARED,
     E_PATH_NOT_ALLOWED,
     E_READONLY_WRITE,
+    E_SCHEMA_FEATURE,
     E_SCHEMA_NOTATION,
     E_TASK_FILE_MISSING,
     E_UNDECLARED_INPUT,
@@ -46,6 +47,7 @@ from .manifest import (
     python_kwarg_name,
     task_file_language,
 )
+from .schema_features import REGEX_HINT, REGEX_KEYWORDS, regex_keyword_paths
 from .schema_notation import SchemaNotationError, compile_schema_notation
 from .yaml_lines import line_of, load_with_lines
 
@@ -150,6 +152,7 @@ def _validate(files: dict[str, str]) -> list[Diagnostic]:
         return diagnostics
 
     diagnostics += _check_names(raw, manifest)
+    diagnostics += _check_input_schema_features(raw)
     diagnostics += _check_duplicate_task_names(raw, manifest)
     diagnostics += _check_setup_file(files, raw, manifest)
     diagnostics += _check_tasks(files, raw, manifest)
@@ -537,10 +540,10 @@ def _check_output_schema(
                     message=f"{ref}: {problem}",
                 )
             ]
-        return []
+        return _regex_keyword_diagnostics(json.loads(files[ref]), ref, loc_path, None)
 
     try:
-        compile_schema_notation(schema_text)
+        compiled = compile_schema_notation(schema_text)
     except SchemaNotationError as exc:
         return [
             Diagnostic(
@@ -551,7 +554,57 @@ def _check_output_schema(
                 message=str(exc),
             )
         ]
-    return []
+    # The compact notation has no way to write a regex today; checked anyway
+    # so the rule holds for every compiled schema, whatever the notation grows.
+    return _regex_keyword_diagnostics(compiled, "capability.yaml", loc_path, line)
+
+
+def _regex_keyword_diagnostics(
+    schema: dict, file: str, loc_path: str, line: int | None
+) -> list[Diagnostic]:
+    return [
+        Diagnostic(
+            code=E_SCHEMA_FEATURE,
+            file=file,
+            line=line,
+            path=loc_path,
+            message=f"{file}: {pointer.rsplit('/', 1)[-1]!r} at {pointer} is not supported",
+            hint=REGEX_HINT,
+        )
+        for pointer in regex_keyword_paths(schema)
+    ]
+
+
+def _check_input_schema_features(raw) -> list[Diagnostic]:
+    """An input is declared by `type` alone -- there is no input JSON Schema
+    -- so a `pattern`/`patternProperties` key on an input would be silently
+    ignored. Reported instead, so an author never believes a format is
+    being enforced when it is not."""
+    raw_tasks = raw.get("tasks") if isinstance(raw.get("tasks"), list) else []
+    scopes = [("inputs", raw.get("inputs"))] + [
+        (f"tasks[{index}].inputs", task.get("inputs") if isinstance(task, dict) else None)
+        for index, task in enumerate(raw_tasks)
+    ]
+    diagnostics = []
+    for loc, inputs in scopes:
+        if not isinstance(inputs, dict):
+            continue
+        for name, spec in inputs.items():
+            if not isinstance(spec, dict):
+                continue
+            for keyword in REGEX_KEYWORDS:
+                if keyword in spec:
+                    diagnostics.append(
+                        Diagnostic(
+                            code=E_SCHEMA_FEATURE,
+                            file="capability.yaml",
+                            line=line_of(spec),
+                            path=f"{loc}.{name}.{keyword}",
+                            message=f"input {name!r} uses {keyword!r}, which is not supported",
+                            hint=REGEX_HINT,
+                        )
+                    )
+    return diagnostics
 
 
 def _json_schema_file_problem(text: str) -> str | None:

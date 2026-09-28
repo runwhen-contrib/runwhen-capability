@@ -70,7 +70,13 @@ import referencing
 from ._redaction import Redactor
 from ._rw_sh import RW_SH
 from .custom.compiler import CompileError, compile_manifest
-from .custom.diagnostics import E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT
+from .custom.diagnostics import (
+    E_INPUT_TYPE,
+    E_OUTPUT_SCHEMA,
+    E_OUTPUT_TOO_LARGE,
+    E_SCHEMA_FEATURE,
+    E_TIMEOUT,
+)
 from .custom.hashing import content_hash
 from .custom.manifest import (
     Manifest,
@@ -79,6 +85,7 @@ from .custom.manifest import (
     python_kwarg_name,
     task_file_language,
 )
+from .custom.schema_features import regex_keyword_paths
 from .custom.yaml_lines import safe_load
 from .models import BundleRequestEnvelope, ResultEnvelope, SetupResult, TaskResult
 
@@ -405,11 +412,11 @@ def _run_setup_or_task(
         # A list output cut to fit its size cap is noted in `errors` but does
         # NOT fail the task -- only a non-list output/whole result still over
         # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code or a schema
-        # violation. Truncation notices carry neither prefix, so this is exactly
-        # "every error EXCEPT a plain truncation notice".
-        failed = exit_code != 0 or any(
-            msg.startswith(E_OUTPUT_SCHEMA) or msg.startswith(E_OUTPUT_TOO_LARGE) for msg in errors
-        )
+        # violation or a refused schema. Notes (truncation, ignored output
+        # lines) carry no E_ prefix, so this is exactly "every error EXCEPT a
+        # plain note".
+        failing = (E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_SCHEMA_FEATURE)
+        failed = exit_code != 0 or any(msg.startswith(failing) for msg in errors)
         if failed:
             return _RunOutcome(
                 status="failed",
@@ -514,7 +521,19 @@ def _validate_output_schema(name: str, value: Any, schema: dict) -> list[str]:
     References resolve only within `schema` itself: an empty Registry
     means jsonschema never fetches a URL or reads a file to follow a
     `$ref` -- by default it would. A schema that cannot be evaluated at all
-    fails this one output, never the whole request."""
+    fails this one output, never the whole request.
+
+    A schema with a regex keyword is never evaluated at all: validate()
+    already refuses one (E_SCHEMA_FEATURE), and this is the guard for a
+    compiled schema that reached the host some other way -- a regex that
+    backtracks catastrophically would run here, in the host process,
+    outside any deadline."""
+    regex_paths = regex_keyword_paths(schema)
+    if regex_paths:
+        return [
+            f"{E_SCHEMA_FEATURE} outputs.{name}: the schema uses regex keywords "
+            f"({', '.join(regex_paths[:5])}), which the host does not evaluate"
+        ]
     messages = []
     try:
         validator_cls = jsonschema.validators.validator_for(schema)

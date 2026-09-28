@@ -444,3 +444,13 @@ def test_a_result_over_the_per_result_limit_is_not_sent(tmp_path):
     assert task.status == "failed"
     assert task.outputs == {}
     assert any("per-result limit" in e for e in task.errors)
+
+
+def test_the_host_never_evaluates_a_schema_with_a_regex_keyword():
+    # a catastrophically backtracking pattern and a value that triggers it:
+    # evaluated, this would not return for hours
+    schema = {"type": "object", "properties": {"v": {"type": "string", "pattern": "^(a+)+$"}}}
+    started = time.monotonic()
+    messages = _validate_output_schema("o", {"v": "a" * 64 + "!"}, schema)
+    assert time.monotonic() - started < 1
+    assert messages and messages[0].startswith("E_SCHEMA_FEATURE outputs.o")

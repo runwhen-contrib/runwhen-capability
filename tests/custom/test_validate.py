@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -15,6 +16,7 @@ from runwhen_capability.custom.diagnostics import (
     E_OUTPUT_UNDECLARED,
     E_PATH_NOT_ALLOWED,
     E_READONLY_WRITE,
+    E_SCHEMA_FEATURE,
     E_SCHEMA_NOTATION,
     E_TASK_FILE_MISSING,
     E_UNDECLARED_INPUT,
@@ -639,3 +641,67 @@ def test_an_escape_hatch_schema_with_a_local_ref_is_fine():
     content = '{"$defs": {"n": {"type": "integer"}}, "$ref": "#/$defs/n"}'
     files = _one_task("echo\n", schema="./schemas/s.json", **{"schemas/s.json": content})
     assert validate(files) == []
+
+
+# -- no regex keywords in custom task schemas (E_SCHEMA_FEATURE) ------------------
+
+_REGEX_HINT = (
+    "regex patterns aren't supported in custom task schemas; validate the format in the task code"
+)
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "string", "pattern": "^a+$"},
+        {"type": "object", "patternProperties": {"^x-": {"type": "string"}}},
+        {"type": "array", "items": {"type": "string", "pattern": "^(a+)+$"}},
+        {"type": "object", "properties": {"id": {"type": "string", "pattern": "^[0-9]+$"}}},
+        {"anyOf": [{"type": "integer"}, {"type": "string", "pattern": "x"}]},
+        {"$defs": {"s": {"pattern": "x"}}, "$ref": "#/$defs/s"},
+        {"type": "object", "propertyNames": {"pattern": "^[a-z]+$"}},
+    ],
+    ids=["top", "patternProperties", "items", "property", "anyOf", "defs", "propertyNames"],
+)
+def test_a_regex_keyword_anywhere_in_a_schema_file_is_e_schema_feature(schema):
+    files = _one_task("echo\n", schema="./schemas/s.json", **{"schemas/s.json": json.dumps(schema)})
+    diagnostics = [d for d in validate(files) if d.code == E_SCHEMA_FEATURE]
+    assert diagnostics
+    assert all(d.hint == _REGEX_HINT and d.file == "schemas/s.json" for d in diagnostics)
+
+
+def test_a_property_named_pattern_is_not_the_keyword():
+    compact = "{ pattern: string, count: integer }[]"
+    as_file = {
+        "type": "object",
+        "properties": {"pattern": {"type": "string"}},
+        "enum": [{"pattern": "data, not a keyword"}],
+    }
+    assert validate(_one_task("echo\n", schema=compact)) == []
+    files = _one_task(
+        "echo\n", schema="./schemas/s.json", **{"schemas/s.json": json.dumps(as_file)}
+    )
+    assert validate(files) == []
+
+
+def test_a_regex_keyword_on_an_input_is_e_schema_feature():
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+inputs:
+  host: { type: string, default: a, pattern: "^[a-z]+$" }
+tasks:
+  - name: t
+    file: tasks/t.sh
+    inputs:
+      port: { type: string, default: "1", patternProperties: {} }
+""",
+        "tasks/t.sh": "echo $HOST $PORT\n",
+    }
+    diagnostics = [d for d in validate(files) if d.code == E_SCHEMA_FEATURE]
+    assert {d.path for d in diagnostics} == {
+        "inputs.host.pattern",
+        "tasks[0].inputs.port.patternProperties",
+    }
+    assert all(d.hint == _REGEX_HINT for d in diagnostics)
