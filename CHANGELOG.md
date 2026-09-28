@@ -3,6 +3,35 @@
 This project follows [Semantic Versioning](https://semver.org/). Releases are git tags `v<version>`
 with the wheel and sdist attached to the GitHub Release.
 
+## Unreleased
+
+### Added
+
+- GitOps commands, speaking to the RunWhen platform API's `custom-capabilities:plan`/`:apply`/
+  `:export` routes:
+  - `rwtask plan <dir>` finds every `capability.yaml` bundle under `dir`, recursively, validates
+    each locally first (`runwhen_capability.custom.validate`; a local error prints as
+    `file:line code message` and exits 1 without calling the API), then posts the bundles to
+    `:plan` and prints each capability's action and file diffs. Exit codes are Terraform-style: 0
+    when nothing would change, 2 when something would, 1 on error -- for use in CI.
+  - `rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]` plans first, prints the plan,
+    then applies it. A capability that exists but is not git-managed is reported as `conflict` and
+    refused unless `--adopt` is given. Without `--yes` on a TTY, it asks for confirmation; off a
+    TTY, it proceeds (the pipeline that invoked it is the actual gate).
+  - `rwtask export <dir> [--name NAME ...] [--force]` writes each capability's published files
+    under `<dir>/<name>/`, refusing to overwrite a local file whose content has changed unless
+    `--force` is given.
+  - `--api-url`, `--token` and `--workspace` flags (env fallbacks `RW_API_URL`, `RW_API_TOKEN`,
+    `RW_WORKSPACE`); the token travels as `Authorization: Bearer` and is never printed. The
+    platform API's `{errors: [{code, file, line, path, message, hint}]}` shape is mapped to the
+    same `file:line code message` format as a local validation error.
+- `rwtask test <dir> [--task NAME]` runs, for each capability and task that has a
+  `tests/<task>.json` (`{inputs, target?, expect?: {status}}`), that task locally through the same
+  code path `run --local` uses, and reports pass/fail by comparing the resulting status to
+  `expect.status` (default `"ok"`) -- a task's outputs are already checked against their schema as
+  part of that run, so a status match means the outputs validated too. A task with no test file is
+  reported as `no test`, which is not a failure. Exits 1 if any task fails.
+
 ## 0.2.0
 
 ### Added

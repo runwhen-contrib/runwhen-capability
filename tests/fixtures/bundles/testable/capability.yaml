@@ -1,0 +1,20 @@
+apiVersion: runwhen.com/custom-capability/v1
+name: testable
+description: Fixture bundle for `rwtask test`
+tasks:
+  - name: greet-py
+    file: tasks/greet.py
+    inputs:
+      name: { type: string, default: world, runtime: true }
+    outputs:
+      greeting: { schema: "string" }
+  - name: greet-bash
+    file: tasks/greet.sh
+    inputs:
+      name: { type: string, default: world, runtime: true }
+    outputs:
+      greeting: { schema: "string" }
+  - name: boom
+    file: tasks/boom.py
+  - name: untested
+    file: tasks/untested.py
