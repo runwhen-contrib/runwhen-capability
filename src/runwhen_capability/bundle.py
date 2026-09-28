@@ -58,6 +58,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -701,23 +702,35 @@ def _execute(
         log.warning(
             "%s: exceeded the %ss deadline; killing its process group", file_path, deadline_seconds
         )
-        _kill_process_group(proc)
-        proc.wait()
+    # Kill the group on EVERY exit, not only on a timeout: a task's
+    # background children (`cmd &`, a daemon it started) stay in its
+    # process group after the main process returns, and would otherwise
+    # outlive the task on this pod -- still holding its pipes, and able to
+    # read whatever the next request writes under the same user.
+    _kill_process_group(proc)
+    proc.wait()
 
-    events_thread.join(timeout=_DRAIN_JOIN_TIMEOUT)
-    stdout_thread.join(timeout=_DRAIN_JOIN_TIMEOUT)
-    stderr_thread.join(timeout=_DRAIN_JOIN_TIMEOUT)
-    try:
+    join_deadline = time.monotonic() + _DRAIN_JOIN_TIMEOUT
+    for thread in (events_thread, stdout_thread, stderr_thread):
+        thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+    if events_thread.is_alive():
+        # Something outside the process group (it called setsid) still holds
+        # the output channel open. Leave read_fd open: the drain thread is
+        # still reading it, and closing it would let the next os.pipe() reuse
+        # the same fd number under that thread -- which would then consume
+        # the NEXT task's output events.
+        log.warning(
+            "%s: a process that left its process group still holds the output channel", file_path
+        )
+    else:
         os.close(read_fd)
-    except OSError:
-        pass
     if not stdout_thread.is_alive():
         proc.stdout.close()
     if not stderr_thread.is_alive():
         proc.stderr.close()
 
     log_tail = (stdout_tail.get() + stderr_tail.get())[-LOG_TAIL_BYTES:]
-    return proc.returncode, events, log_tail, timed_out
+    return proc.returncode, list(events), log_tail, timed_out
 
 
 # -- bundle materialisation -----------------------------------------------------

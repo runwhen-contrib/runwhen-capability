@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import time
 
 import pytest
 
@@ -167,3 +168,39 @@ def test_a_path_outside_the_bundle_is_never_written(tmp_path, bad_path):
     result = _run(files, tmp_path / "scope")
     assert result.setup.status == "failed"
     assert not (tmp_path / "escape.sh").exists()
+
+
+def _wait_until_gone(pid: int, timeout: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_background_child_does_not_outlive_its_task(tmp_path):
+    pid_file = tmp_path / "bg.pid"
+    source = f'sleep 60 &\necho $! > "{pid_file}"\nexit 0\n'
+    started = time.monotonic()
+    result = _run(_files("t.sh", source), tmp_path / "scope")
+    assert result.tasks[0].status == "ok"
+    # the run no longer waits out the background child's hold on the pipes
+    assert time.monotonic() - started < 4
+    assert _wait_until_gone(int(pid_file.read_text()))
+
+
+def test_a_python_tasks_subprocess_does_not_outlive_it(tmp_path):
+    pid_file = tmp_path / "bg.pid"
+    source = (
+        "import subprocess\n"
+        "def main(ctx):\n"
+        "    proc = subprocess.Popen(['sleep', '60'])\n"
+        f"    open({str(pid_file)!r}, 'w').write(str(proc.pid))\n"
+        "    return {}\n"
+    )
+    result = _run(_files("t.py", source), tmp_path / "scope")
+    assert result.tasks[0].status == "ok"
+    assert _wait_until_gone(int(pid_file.read_text()))
