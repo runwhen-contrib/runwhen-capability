@@ -7,7 +7,7 @@ host that runs them, in a pod (`rwtask serve`) or locally (`rwtask run`).
 
 # The one place the package version is written down: pyproject.toml reads it
 # (setuptools dynamic version) and `rwtask --version` prints it.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .context import Context
 from .decorators import setup, task
