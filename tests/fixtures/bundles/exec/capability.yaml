@@ -46,3 +46,11 @@ tasks:
     file: tasks/secret_log.sh
     inputs:
       token: { type: secret, optional: false }
+  - name: big-list
+    file: tasks/big_list.py
+    outputs:
+      items: { schema: "integer[]" }
+  - name: big-scalar
+    file: tasks/big_scalar.py
+    outputs:
+      blob: { schema: "string" }

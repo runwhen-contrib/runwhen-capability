@@ -4,8 +4,6 @@ both Python and bash tasks, and setup."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from bundle_fixtures import load_bundle
 
 from runwhen_capability.bundle import run_bundle_request
@@ -115,6 +113,22 @@ def test_output_schema_violation_fails_the_task_with_the_json_path(tmp_path):
     # The offending output still travels with the result -- a caller
     # debugging why validation failed needs to see what was actually produced.
     assert task.outputs == {"count": "not-an-integer"}
+
+
+def test_an_oversized_list_output_is_truncated_but_the_task_still_ok(tmp_path):
+    result = _run(EXEC, ["big-list"], tmp_path)
+    [task] = result.tasks
+    assert task.status == "ok"
+    assert len(task.outputs["items"]) < 100000
+    assert any("truncated" in e for e in task.errors)
+
+
+def test_an_oversized_non_list_output_fails_the_task(tmp_path):
+    result = _run(EXEC, ["big-scalar"], tmp_path)
+    [task] = result.tasks
+    assert task.status == "failed"
+    assert any("E_OUTPUT_TOO_LARGE" in e for e in task.errors)
+    assert "blob" not in task.outputs
 
 
 def test_timeout_kills_the_whole_process_group(tmp_path):

@@ -309,7 +309,15 @@ def _run_setup_or_task(
 
     outputs = _redact_value(outputs, secrets)
 
-    if errors:
+    # A list output cut to fit its size cap is noted in `errors` but does
+    # NOT fail the task -- only a non-list output/whole result still over
+    # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code or a schema
+    # violation. Truncation notices carry neither prefix, so this is exactly
+    # "every error EXCEPT a plain truncation notice".
+    failed = exit_code != 0 or any(
+        msg.startswith(E_OUTPUT_SCHEMA) or msg.startswith(E_OUTPUT_TOO_LARGE) for msg in errors
+    )
+    if failed:
         return _RunOutcome(
             status="failed",
             outputs=outputs,
@@ -317,7 +325,7 @@ def _run_setup_or_task(
             errors=errors,
             log_tail=log_tail,
         )
-    return _RunOutcome(status="ok", outputs=outputs, log_tail=log_tail)
+    return _RunOutcome(status="ok", outputs=outputs, errors=errors, log_tail=log_tail)
 
 
 # -- input resolution -----------------------------------------------------------
@@ -426,6 +434,25 @@ def _json_size(value: Any) -> int:
     return len(json.dumps(value).encode("utf-8"))
 
 
+def _truncate_list_to_budget(value: list, budget: int) -> list:
+    """The largest prefix of `value` whose JSON encoding fits `budget`
+    bytes, computed in one O(n) pass -- each element is encoded exactly
+    once, not the whole (shrinking) list once per dropped element. Exact,
+    not approximate: `json.dumps` with its default separators renders a
+    list as "[" + ", ".join(dumps(item) for item in list) + "]", so summing
+    each item's own encoded length plus its ", " separator reproduces the
+    real total byte-for-byte."""
+    kept: list = []
+    total = 2  # the array's own "[" + "]"
+    for item in value:
+        extra = len(json.dumps(item).encode("utf-8")) + (2 if kept else 0)  # ", " between items
+        if total + extra > budget:
+            break
+        total += extra
+        kept.append(item)
+    return kept
+
+
 def _apply_size_caps(outputs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     capped: dict[str, Any] = {}
@@ -435,9 +462,7 @@ def _apply_size_caps(outputs: dict[str, Any]) -> tuple[dict[str, Any], list[str]
             capped[name] = value
             continue
         if isinstance(value, list):
-            truncated = list(value)
-            while truncated and _json_size(truncated) > MAX_OUTPUT_BYTES:
-                truncated.pop()
+            truncated = _truncate_list_to_budget(value, MAX_OUTPUT_BYTES)
             capped[name] = truncated
             errors.append(
                 f"outputs.{name} exceeded {MAX_OUTPUT_BYTES} bytes and was truncated to "
