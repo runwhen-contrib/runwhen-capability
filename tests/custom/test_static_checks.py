@@ -115,3 +115,26 @@ def test_read_options_that_take_a_value_are_not_names():
 
 def test_a_comparison_is_not_an_assignment():
     assert "X" not in bash_locally_assigned_names('[ "$X" == 1 ]\ntest "$X" = 2\n')
+
+
+def test_a_dollar_inside_single_quotes_is_not_an_env_read():
+    source = (
+        "jq -n --argjson total \"$COUNT\" '{total: $total}'\n"
+        "jq -n '{\n  a: $a,\n  b: $b\n}'\n"
+        'echo "it\'s $REAL"\n'
+        "echo \\'$ESCAPED\n"
+    )
+    assert sorted(name for _, name in bash_env_reads(source)) == ["COUNT", "ESCAPED", "REAL"]
+
+
+def test_single_quote_blanking_keeps_line_numbers():
+    source = "jq '{\n a: $a\n}'\necho $LATER\n"
+    assert bash_env_reads(source) == [(4, "LATER")]
+
+
+def test_single_quotes_inside_a_command_substitution_in_double_quotes_are_literal():
+    source = (
+        'rw_set summary "$(jq -n --argjson total "$COUNT" \'{total: $total}\')"\n'
+        "echo \"$(printf '%s' \"$(echo '$inner')\") $OUTER\"\n"
+    )
+    assert sorted(name for _, name in bash_env_reads(source)) == ["COUNT", "OUTER"]

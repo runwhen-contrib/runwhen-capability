@@ -157,6 +157,42 @@ def _strip_comments_and_heredocs(text: str) -> str:
     return "\n".join(out_lines)
 
 
+def _blank_single_quoted(text: str) -> str:
+    """Blanks out the body of every '...' string (same length, line breaks
+    kept), so a `$` inside one -- a jq or awk variable, say `jq '{t: $t}'` --
+    is never read as a bash expansion; bash never expands inside single
+    quotes. Tracked across lines, since a quoted jq program often spans
+    several; a `'` inside "..." or escaped as `\\'` opens nothing.
+
+    Each `(` -- a `$(...)` substitution or a subshell -- starts a fresh
+    quoting context, closed by its `)`: in `"$(jq "$n" '{n: $n}')"` the
+    inner quotes belong to the substitution, not to the outer string."""
+    out = list(text)
+    in_double = [False]  # one entry per open `(`; the last is the current context
+    in_single = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            elif ch != "\n":
+                out[i] = " "
+        elif ch == "\\":
+            i += 2  # an escaped character never toggles quote state
+            continue
+        elif ch == "'" and not in_double[-1]:
+            in_single = True
+        elif ch == '"':
+            in_double[-1] = not in_double[-1]
+        elif ch == "(" and (not in_double[-1] or text[i - 1 : i] == "$"):
+            in_double.append(False)
+        elif ch == ")" and not in_double[-1] and len(in_double) > 1:
+            in_double.pop()
+        i += 1
+    return "".join(out)
+
+
 # -- bash: env-var/rw_input reads and rw_append/rw_set writes ----------------
 
 # $VAR / ${VAR} / ${VAR:-default} / ${VAR[0]} -- only the name right after
@@ -293,12 +329,13 @@ def bash_env_reads(text: str) -> list[tuple[int, str]]:
     """(line, VAR) for every `$VAR`/`${VAR}` reference that is NOT one of
     this script's own local variables -- the raw name as written, uppercase
     or not (the caller compares against each declared input's computed
-    env-var name). Comments and heredoc bodies are never scanned."""
+    env-var name). Comments, heredoc bodies and single-quoted strings are
+    never scanned."""
     text = _strip_comments_and_heredocs(text)
     starts = _line_starts(text)
     local_names = bash_locally_assigned_names(text)
     hits = []
-    for m in _VAR_REF_RE.finditer(text):
+    for m in _VAR_REF_RE.finditer(_blank_single_quoted(text)):
         name = m.group(1) or m.group(2)
         if name in _SPECIAL_BASH_VARS or name in local_names:
             continue

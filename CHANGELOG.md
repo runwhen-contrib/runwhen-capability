@@ -12,6 +12,9 @@ with the wheel and sdist attached to the GitHub Release.
   `while IFS='|' read -ra X`), `mapfile`/`readarray`, `declare`/`typeset` and flag forms of
   `local`/`export`/`readonly`, `printf -v`, `getopts`, `select`, `x+=`, and assignments after `;`,
   `&&`, `||`, `then`, `do` or `else`. Before this, `E_UNDECLARED_INPUT` flagged them falsely.
+- `validate`: a `$name` inside a single-quoted string (a jq or awk variable, as in
+  `jq -n --argjson t "$n" '{t: $t}'`) is not an env read. Quote context is tracked across lines
+  and restarts inside each `$(...)`. Before this, `E_UNDECLARED_INPUT` flagged `$t`.
 
 ### Added
 
