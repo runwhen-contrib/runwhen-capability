@@ -5,6 +5,14 @@ with the wheel and sdist attached to the GitHub Release.
 
 ## Unreleased
 
+### Fixed
+
+- `validate`: bash variables bound without a plain `name=` at the start of a line are local, not
+  undeclared inputs. This covers `read`/`read -a` (including after an env prefix such as
+  `while IFS='|' read -ra X`), `mapfile`/`readarray`, `declare`/`typeset` and flag forms of
+  `local`/`export`/`readonly`, `printf -v`, `getopts`, `select`, `x+=`, and assignments after `;`,
+  `&&`, `||`, `then`, `do` or `else`. Before this, `E_UNDECLARED_INPUT` flagged them falsely.
+
 ### Added
 
 - GitOps commands, speaking to the RunWhen platform API's `custom-capabilities:plan`/`:apply`/

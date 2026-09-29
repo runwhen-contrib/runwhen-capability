@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import bisect
 import re
+import shlex
 
 # -- python: main()'s signature and what it returns --------------------------
 
@@ -184,10 +185,33 @@ _SPECIAL_BASH_VARS = frozenset({"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"
 # it can never both match the same spaces: an optional keyword between two
 # `[ \t]*` let a long run of blanks (e.g. a blanked-out comment line) be
 # split between them every possible way -- quadratic backtracking.
+#
+# An assignment starts a simple command: at the start of a line, or after a
+# command separator (`;`, `&&`, `||`, `|`, `(`, `{`, `!`) or a compound
+# keyword (`then`, `do`, `else`, `while`, `until`, `if`, `elif`) -- `a=1; b=2`, `cmd || n=0` and
+# `for ((i=0; ...))` all bind their names. `x+=` appends and counts too.
+_COMMAND_START = r"(?:^|[;&|({!]|\b(?:then|do|else|while|until|if|elif)\b)[ \t]*"
 _ASSIGNMENT_RE = re.compile(
-    r"(?m)^[ \t]*(?:(?:local|export|readonly)[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)="
+    r"(?m)"
+    + _COMMAND_START
+    + r"(?:(?:local|export|readonly|declare|typeset)[ \t]+(?:-[A-Za-z]+[ \t]+)*)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\+?="
 )
-_FOR_LOOP_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+_FOR_LOOP_RE = re.compile(r"\b(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b")
+# Builtins that bind the names they are given without an `=`: the rest of
+# the simple command (up to a separator or the end of the line) is parsed
+# by _names_bound_by().
+_BINDING_BUILTIN_RE = re.compile(
+    r"(?m)"
+    + _COMMAND_START
+    + r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*[ \t]+)*"  # an env prefix: `IFS='|' read ...`
+    r"(local|export|readonly|declare|typeset|read|mapfile|readarray|printf|getopts)\b([^;&|\n]*)"
+)
+_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Option letters that consume a value (glued, `-d:`, or the next word) --
+# per builtin, from bash(1). `read -a NAME` and `printf -v NAME` bind NAME.
+_VALUE_OPTIONS = {"read": "dinNptu", "mapfile": "dnOsuCc", "readarray": "dnOsuCc"}
+_NAME_OPTIONS = {"read": "a", "printf": "v"}
 
 
 def _line_starts(text: str) -> list[int]:
@@ -207,7 +231,62 @@ def bash_locally_assigned_names(text: str) -> set[str]:
     text = _strip_comments_and_heredocs(text)
     names = {m.group(1) for m in _ASSIGNMENT_RE.finditer(text)}
     names |= {m.group(1) for m in _FOR_LOOP_RE.finditer(text)}
+    for m in _BINDING_BUILTIN_RE.finditer(text):
+        names |= _names_bound_by(m.group(1), m.group(2))
     return names
+
+
+def _words(rest: str) -> list[str]:
+    """The words of a simple command's arguments, quotes removed; up to the
+    first redirection, since `read x < file` binds x and not `file`."""
+    try:
+        words = shlex.split(rest)
+    except ValueError:  # an unbalanced quote: fall back to plain splitting
+        words = rest.split()
+    for i, word in enumerate(words):
+        if word.startswith(("<", ">", "0<", "1>", "2>")):
+            return words[:i]
+    return words
+
+
+def _names_bound_by(builtin: str, rest: str) -> set[str]:
+    """The variable names `builtin rest...` binds.
+
+    Declaration builtins and `read` bind every plain word (`local a b=1`,
+    `read -r x y`); `mapfile`/`readarray` bind their last word; `getopts`
+    binds its second; `printf` binds only its `-v` name. Option letters that
+    take a value skip that value, so `read -p prompt x` binds x alone."""
+    value_options = _VALUE_OPTIONS.get(builtin, "")
+    name_options = _NAME_OPTIONS.get(builtin, "")
+    bound: set[str] = set()
+    operands: list[str] = []
+    words = _words(rest)
+    i = 0
+    while i < len(words):
+        word = words[i]
+        i += 1
+        if word.startswith("-") and len(word) > 1 and not operands:
+            for pos, letter in enumerate(word[1:], start=1):
+                if letter in value_options or letter in name_options:
+                    value = word[pos + 1 :]
+                    if not value and i < len(words):
+                        value, i = words[i], i + 1
+                    if letter in name_options and _NAME_RE.fullmatch(value):
+                        bound.add(value)
+                    break
+            continue
+        operands.append(word)
+    if builtin in ("mapfile", "readarray"):
+        operands = operands[-1:]
+    elif builtin == "getopts":
+        operands = operands[1:2]
+    elif builtin == "printf":
+        operands = []
+    for operand in operands:
+        name = operand.split("=", 1)[0].removesuffix("+")
+        if _NAME_RE.fullmatch(name):
+            bound.add(name)
+    return bound
 
 
 def bash_env_reads(text: str) -> list[tuple[int, str]]:
