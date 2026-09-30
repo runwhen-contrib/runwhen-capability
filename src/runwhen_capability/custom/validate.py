@@ -439,7 +439,8 @@ def _check_effects(raw, manifest: Manifest) -> list[Diagnostic]:
                 line=line_of(raw_task),
                 path=f"tasks[{index}].effects",
                 message=f"task {task.name!r} is not readOnly, so it must declare its effects",
-                hint="add effects: one plain sentence per change, e.g. "
+                hint="if the task changes nothing, set readOnly: true; otherwise add "
+                "effects: one plain sentence per change, e.g. "
                 "'Compacts volumes whose garbage ratio exceeds the threshold'",
             )
         )

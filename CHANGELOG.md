@@ -51,8 +51,9 @@ with the wheel and sdist attached to the GitHub Release.
 
 - **Breaking:** a task that omits `readOnly` (it defaults to false, i.e. "changes things") must now
   either set `readOnly: true` or declare `effects`; otherwise validation fails with
-  `E_EFFECTS_REQUIRED`. Bundles whose read-only tasks never set `readOnly: true` must add it before
-  upgrading.
+  `E_EFFECTS_REQUIRED`. The check applies when authoring/validating and publishing; the runtime
+  does not apply it when executing an already-published bundle. Bundles whose read-only tasks never
+  set `readOnly: true` must add it before their next publish.
 
 ## 0.2.0
 

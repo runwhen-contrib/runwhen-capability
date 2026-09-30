@@ -71,6 +71,7 @@ from ._redaction import Redactor
 from ._rw_sh import RW_SH
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import (
+    E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
     E_OUTPUT_SCHEMA,
     E_OUTPUT_TOO_LARGE,
@@ -161,7 +162,9 @@ def run_bundle_request(
         return result
 
     try:
-        compiled = compile_manifest(files)
+        # E_EFFECTS_REQUIRED is an authoring/publish gate; an already-published
+        # (immutable) bundle that predates it must still run.
+        compiled = compile_manifest(files, ignore=frozenset({E_EFFECTS_REQUIRED}))
     except CompileError as exc:
         result.setup = SetupResult(status="failed", error=f"invalid bundle: {exc}")
         return result

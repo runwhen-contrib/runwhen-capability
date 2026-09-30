@@ -9,6 +9,7 @@ import time
 from bundle_fixtures import load_bundle
 
 from runwhen_capability.bundle import run_bundle_request
+from runwhen_capability.custom import validate
 from runwhen_capability.custom.hashing import content_hash
 from runwhen_capability.models import Bundle, BundleFile, BundleRequestEnvelope, BundleTarget
 
@@ -59,6 +60,28 @@ def test_an_invalid_bundle_fails_closed_with_no_execution(tmp_path):
     assert result.setup.status == "failed"
     assert "invalid bundle" in result.setup.error
     assert result.tasks == []
+
+
+def test_a_published_bundle_without_read_only_or_effects_still_runs(tmp_path):
+    # E_EFFECTS_REQUIRED gates authoring; the runtime must not refuse an
+    # immutable bundle published before it existed.
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\n"
+            "name: legacy\n"
+            "appliesTo:\n"
+            "  - { platform: kubernetes, type: statefulset }\n"
+            "tasks:\n"
+            "  - name: hello\n"
+            "    file: tasks/hello.py\n"
+        ),
+        "tasks/hello.py": "def main(ctx):\n    return {}\n",
+    }
+    assert "E_EFFECTS_REQUIRED" in [d.code for d in validate(files)]
+    result = _run(files, ["hello"], tmp_path)
+    assert result.setup is None or result.setup.status != "failed"
+    [task] = result.tasks
+    assert task.status == "ok"
 
 
 def test_ok_python_task(tmp_path):

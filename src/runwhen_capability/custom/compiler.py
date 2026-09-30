@@ -31,9 +31,12 @@ class CompileError(RuntimeError):
         super().__init__(summary)
 
 
-def compile_manifest(files: dict[str, str]) -> dict:
+def compile_manifest(files: dict[str, str], *, ignore: frozenset[str] = frozenset()) -> dict:
+    """Compile a bundle, refusing on any error-severity diagnostic whose code
+    is not in `ignore`. The runtime bundle host passes authoring-only gates
+    (E_EFFECTS_REQUIRED) here so an already-published bundle still runs."""
     diagnostics = validate(files)
-    if any(d.severity == "error" for d in diagnostics):
+    if any(d.severity == "error" and d.code not in ignore for d in diagnostics):
         raise CompileError(diagnostics)
 
     # validate() already proved capability.yaml parses and matches Manifest,
