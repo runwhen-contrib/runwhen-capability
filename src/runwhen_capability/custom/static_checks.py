@@ -454,7 +454,9 @@ _SHELL_NAME_RE = re.compile(r"(?:ba|da|z|k)?sh")
 _XARGS_RE = re.compile(r"(?<![\w.\-])xargs\b([^\n]*)")
 _XARGS_REPLACE_RE = re.compile(r"(?<![\w-])(?:-I|-i|--replace)\b|\{\}")
 _AWK_RE = re.compile(r"(?<![\w.\-])[gmn]?awk\b")
-_AWK_CMD_RE = re.compile(r"\bsystem[ \t]*\(|\bgetline\b")
+# `system(` and the pipe form `<expr> | getline` run a command; a plain
+# `getline` and `getline var < file` only read input and are safe.
+_AWK_CMD_RE = re.compile(r"\bsystem[ \t]*\(|\|&?[ \t]*getline\b")
 _STATEMENT_SEP_RE = re.compile(r"[;|&\n(]")
 
 
@@ -464,7 +466,8 @@ def bash_data_as_code(text: str) -> list[tuple[int, str]]:
     `eval` with a `$` expansion; `sh -c`/`bash -c` whose command string has
     a `$` expansion; `xargs ... sh -c` with a replace string (`-I`, `{}`) or
     an expansion; and an awk program (single-quoted, so its text is
-    blanked for the `$` checks) containing `system(` or `getline` at all.
+    blanked for the `$` checks) containing `system(` or a `| getline` pipe (a plain `getline` or
+    `getline < file` reads input and is safe).
     A single-quoted `$` (`bash -c 'echo "$1"' _ "$x"`) is the safe pattern
     and never flagged. Comments and heredoc bodies are never scanned."""
     stripped = _strip_comments_and_heredocs(text)
@@ -494,7 +497,7 @@ def bash_data_as_code(text: str) -> list[tuple[int, str]]:
         if not _AWK_RE.search(joined, statement_start, start):
             continue
         for hit in _AWK_CMD_RE.finditer(stripped, start, end):
-            construct = "awk getline" if hit.group(0) == "getline" else "awk system()"
+            construct = "awk system()" if hit.group(0).startswith("system") else "awk | getline"
             found.setdefault(_line_of(starts, hit.start()), construct)
     return sorted(found.items())
 

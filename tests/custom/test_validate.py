@@ -938,3 +938,42 @@ def test_the_new_warnings_never_count_as_errors():
     diagnostics = validate(files)
     assert {W_DATA_AS_CODE, W_UNUSED_INPUT} <= {d.code for d in diagnostics}
     assert all(d.severity == "warning" for d in diagnostics)
+
+
+def _two_task_bundle(a_src: str, b_src: str, inputs: str) -> dict[str, str]:
+    return {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\nname: w\ninputs:\n"
+            f"{inputs}\ntasks:\n"
+            "  - name: a\n    file: tasks/a.sh\n    readOnly: true\n"
+            "  - name: b\n    file: tasks/b.sh\n    readOnly: true\n"
+        ),
+        "tasks/a.sh": a_src,
+        "tasks/b.sh": b_src,
+    }
+
+
+def test_a_capability_secret_read_by_only_some_tasks_is_not_reported():
+    files = _two_task_bundle('echo "$TOK"\n', "echo hi\n", "  tok: { type: secret }")
+    assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_a_capability_secret_no_task_reads_warns_once():
+    files = _two_task_bundle("echo a\n", "echo b\n", "  tok: { type: secret }")
+    (diag,) = _of(files, W_UNUSED_INPUT)
+    assert (diag.path, diag.line) == ("inputs.tok", 4)
+
+
+def test_task_level_unused_inputs_still_warn_per_task():
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\nname: w\ntasks:\n"
+            "  - name: a\n    file: tasks/a.sh\n    readOnly: true\n    inputs:\n"
+            "      tok: { type: secret }\n"
+            "  - name: b\n    file: tasks/b.sh\n    readOnly: true\n    inputs:\n"
+            "      tok: { type: secret }\n"
+        ),
+        "tasks/a.sh": "echo a\n",
+        "tasks/b.sh": 'echo "$TOK"\n',
+    }
+    assert [d.path for d in _of(files, W_UNUSED_INPUT)] == ["tasks[0].inputs.tok"]

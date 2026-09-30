@@ -494,12 +494,18 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
     if manifest.setup is not None:
         shared_paths.add(manifest.setup.file)
     shared_text = "\n".join(files[path] for path in sorted(shared_paths) if path in files)
+    # Capability-level secrets/credentials no task reads; a task that cannot be
+    # analysed empties it (unknown counts as used).
+    cap_unused_by_all = {
+        name for name, spec in manifest.inputs.items() if spec.type in ("secret", "credential")
+    }
     for index, task in enumerate(manifest.tasks):
         raw_task = raw_tasks[index] if index < len(raw_tasks) else {}
         task_line = line_of(raw_task)
         path = task.file
 
         if path not in files:
+            cap_unused_by_all.clear()
             diagnostics.append(
                 Diagnostic(
                     code=E_TASK_FILE_MISSING,
@@ -513,6 +519,7 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
 
         language = task_file_language(path)
         if language is None:
+            cap_unused_by_all.clear()
             diagnostics.append(
                 Diagnostic(
                     code=E_PATH_NOT_ALLOWED,
@@ -534,9 +541,11 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
             read_only=task.readOnly,
         )
 
-        diagnostics += _check_unused_inputs(
-            files, raw, raw_task, manifest, task, index, language, shared_text
+        task_unused, cap_unused = _check_unused_inputs(
+            files, raw_task, manifest, task, index, language, shared_text
         )
+        diagnostics += task_unused
+        cap_unused_by_all &= cap_unused
 
         raw_outputs = (raw_task or {}).get("outputs") or {}
         for name, output in task.outputs.items():
@@ -547,30 +556,36 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
                 loc_path=f"tasks[{index}].outputs.{name}.schema",
                 line=line_of(raw_outputs.get(name)),
             )
+    raw_cap_inputs = (raw or {}).get("inputs") or {}
+    for name in manifest.inputs:
+        if name in cap_unused_by_all and manifest.tasks:
+            diagnostics.append(
+                _unused_input_diagnostic(name, f"inputs.{name}", line_of(raw_cap_inputs.get(name)))
+            )
     return diagnostics
 
 
 def _check_unused_inputs(
     files: dict[str, str],
-    raw,
     raw_task,
     manifest: Manifest,
     task,
     index: int,
     language: str,
     shared_text: str,
-) -> list[Diagnostic]:
-    """W_UNUSED_INPUT: a secret/credential input the task receives (its own,
-    or a capability-level one) and never reads. Skipped, never guessed, when
+) -> tuple[list[Diagnostic], set[str]]:
+    """W_UNUSED_INPUT for the task's own secret/credential inputs, plus the
+    names of capability-level ones this task never reads (the caller warns
+    once, when no task reads them). Skipped, never guessed, when
     the task's Python has no parseable `main`. An input the setup file or
     lib/ mentions is treated as used -- they run on the task's behalf.
     A `k8s.kubeconfig` credential counts as used when the task calls
     kubectl or names KUBECONFIG, since KUBECONFIG is set automatically."""
     source = files[task.file]
     calls_kubectl = static_checks.runs_kubectl(source)
-    raw_cap_inputs = (raw or {}).get("inputs") or {}
     raw_task_inputs = (raw_task or {}).get("inputs") or {}
     diagnostics = []
+    cap_unused: set[str] = set()
     for name, spec in {**manifest.inputs, **task.inputs}.items():
         if spec.type not in ("secret", "credential"):
             continue
@@ -593,26 +608,29 @@ def _check_unused_inputs(
             )
         ):
             continue
-        if name in task.inputs:
-            loc_path = f"tasks[{index}].inputs.{name}"
-            line = line_of(raw_task_inputs.get(name))
-        else:
-            loc_path = f"inputs.{name}"
-            line = line_of(raw_cap_inputs.get(name))
+        if name not in task.inputs:
+            cap_unused.add(name)
+            continue
         diagnostics.append(
-            Diagnostic(
-                code=W_UNUSED_INPUT,
-                severity="warning",
-                file="capability.yaml",
-                line=line,
-                path=loc_path,
-                message=(
-                    f"{name!r} is declared but never read; it still shows on the trust card "
-                    "and narrows where the capability is offered"
-                ),
+            _unused_input_diagnostic(
+                name, f"tasks[{index}].inputs.{name}", line_of(raw_task_inputs.get(name))
             )
         )
-    return diagnostics
+    return diagnostics, cap_unused
+
+
+def _unused_input_diagnostic(name: str, loc_path: str, line: int | None) -> Diagnostic:
+    return Diagnostic(
+        code=W_UNUSED_INPUT,
+        severity="warning",
+        file="capability.yaml",
+        line=line,
+        path=loc_path,
+        message=(
+            f"{name!r} is declared but never read; it still shows on the trust card "
+            "and narrows where the capability is offered"
+        ),
+    )
 
 
 def _check_read_only_shared_code(files: dict[str, str], manifest: Manifest) -> list[Diagnostic]:

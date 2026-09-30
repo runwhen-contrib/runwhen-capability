@@ -156,7 +156,7 @@ DETAILS=$(awk '
 
 
 def test_the_sdlc_t4_awk_getline_is_flagged_on_its_own_line():
-    assert bash_data_as_code(T4_AWK) == [(3, "awk getline")]
+    assert bash_data_as_code(T4_AWK) == [(3, "awk | getline")]
 
 
 def test_awk_system_is_flagged_even_after_an_f_option():
@@ -277,3 +277,12 @@ def test_runs_kubectl_ignores_comments():
     assert runs_kubectl("kubectl get pods\n")
     assert runs_kubectl('ctx.run(["kubectl", "get"])\n')
     assert not runs_kubectl("# kubectl get pods\necho hi\n")
+
+
+def test_awk_plain_getline_and_getline_from_file_are_safe():
+    assert bash_data_as_code("awk 'BEGIN { getline line; print line }' f\n") == []
+    assert bash_data_as_code("awk 'BEGIN { while ((getline l < \"f\") > 0) n++ }'\n") == []
+
+
+def test_awk_pipe_getline_is_flagged_without_spaces_too():
+    assert bash_data_as_code("awk 'BEGIN { \"date\"|getline d }'\n") == [(1, "awk | getline")]
