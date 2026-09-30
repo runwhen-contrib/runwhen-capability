@@ -18,6 +18,9 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `TaskSpec.effects`: plain-language sentences saying what a task changes. Required when
+  `readOnly` is false (`E_EFFECTS_REQUIRED`), optional on a read-only task, and carried into the
+  compiled manifest beside `readOnly`.
 - GitOps commands, speaking to the RunWhen platform API's `custom-capabilities:plan`/`:apply`/
   `:export` routes:
   - `rwtask plan <dir>` finds every `capability.yaml` bundle under `dir`, recursively, validates

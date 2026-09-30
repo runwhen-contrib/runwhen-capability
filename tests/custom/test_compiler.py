@@ -68,6 +68,7 @@ inputs:
 tasks:
   - name: t
     file: tasks/t.sh
+    effects: [Test fixture]
     inputs:
       since: { type: duration, default: 5m, runtime: true }
 """,
@@ -88,8 +89,10 @@ inputs:
 tasks:
   - name: a
     file: tasks/a.sh
+    effects: [Test fixture]
   - name: b
     file: tasks/b.sh
+    effects: [Test fixture]
     inputs:
       kubeconfig: { type: credential, kind: k8s.kubeconfig }
 """,

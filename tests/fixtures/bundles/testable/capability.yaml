@@ -4,17 +4,21 @@ description: Fixture bundle for `rwtask test`
 tasks:
   - name: greet-py
     file: tasks/greet.py
+    effects: [Test fixture]
     inputs:
       name: { type: string, default: world, runtime: true }
     outputs:
       greeting: { schema: "string" }
   - name: greet-bash
     file: tasks/greet.sh
+    effects: [Test fixture]
     inputs:
       name: { type: string, default: world, runtime: true }
     outputs:
       greeting: { schema: "string" }
   - name: boom
     file: tasks/boom.py
+    effects: [Test fixture]
   - name: untested
     file: tasks/untested.py
+    effects: [Test fixture]

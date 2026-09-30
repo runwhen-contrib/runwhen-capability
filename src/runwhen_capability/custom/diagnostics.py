@@ -16,6 +16,7 @@ Static codes (validate() only, no execution):
 - E_READONLY_WRITE -- kubectl delete/apply/patch/edit/scale/rollout restart/exec
   and similar in a readOnly task.
 - E_DUPLICATE_NAME -- a name is used twice.
+- E_EFFECTS_REQUIRED -- a task that isn't readOnly declares no effects.
 - E_SCHEMA_FEATURE -- a schema uses a JSON Schema feature custom tasks may not
   use (regex keywords: `pattern`, `patternProperties`).
 
@@ -42,6 +43,7 @@ E_OUTPUT_UNDECLARED = "E_OUTPUT_UNDECLARED"
 E_READONLY_WRITE = "E_READONLY_WRITE"
 E_DUPLICATE_NAME = "E_DUPLICATE_NAME"
 E_SCHEMA_FEATURE = "E_SCHEMA_FEATURE"
+E_EFFECTS_REQUIRED = "E_EFFECTS_REQUIRED"
 
 # -- runtime codes: the bundle host (bundle.py) --------------------------------
 E_INPUT_TYPE = "E_INPUT_TYPE"

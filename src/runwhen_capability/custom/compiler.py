@@ -75,6 +75,7 @@ def _compile_task(files: dict[str, str], manifest: Manifest, task: TaskSpec) -> 
         "name": task.name,
         "description": task.description,
         "readOnly": task.readOnly,
+        "effects": [effect for effect in task.effects if effect.strip()],
         "file": task.file,
         "inputs": {name: spec.model_dump(mode="json") for name, spec in merged_inputs.items()},
         "outputs": {

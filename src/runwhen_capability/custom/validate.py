@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from . import static_checks
 from .diagnostics import (
     E_DUPLICATE_NAME,
+    E_EFFECTS_REQUIRED,
     E_LIMIT,
     E_MANIFEST_SCHEMA,
     E_OUTPUT_UNDECLARED,
@@ -154,6 +155,7 @@ def _validate(files: dict[str, str]) -> list[Diagnostic]:
     diagnostics += _check_names(raw, manifest)
     diagnostics += _check_input_schema_features(raw)
     diagnostics += _check_duplicate_task_names(raw, manifest)
+    diagnostics += _check_effects(raw, manifest)
     diagnostics += _check_setup_file(files, raw, manifest)
     diagnostics += _check_tasks(files, raw, manifest)
     diagnostics += _check_read_only_shared_code(files, manifest)
@@ -419,6 +421,28 @@ def _check_duplicate_task_names(raw, manifest: Manifest) -> list[Diagnostic]:
             )
         else:
             seen[task.name] = index
+    return diagnostics
+
+
+def _check_effects(raw, manifest: Manifest) -> list[Diagnostic]:
+    """E_EFFECTS_REQUIRED for a task that changes things but doesn't say what."""
+    diagnostics = []
+    raw_tasks = raw.get("tasks") or []
+    for index, task in enumerate(manifest.tasks):
+        if task.readOnly or any(effect.strip() for effect in task.effects):
+            continue
+        raw_task = raw_tasks[index] if index < len(raw_tasks) else None
+        diagnostics.append(
+            Diagnostic(
+                code=E_EFFECTS_REQUIRED,
+                file="capability.yaml",
+                line=line_of(raw_task),
+                path=f"tasks[{index}].effects",
+                message=f"task {task.name!r} is not readOnly, so it must declare its effects",
+                hint="add effects: one plain sentence per change, e.g. "
+                "'Compacts volumes whose garbage ratio exceeds the threshold'",
+            )
+        )
     return diagnostics
 
 

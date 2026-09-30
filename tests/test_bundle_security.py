@@ -28,6 +28,7 @@ inputs:
 tasks:
   - name: t
     file: tasks/{file}
+    effects: [Test fixture]
     outputs:
       o: {{ schema: "{schema}" }}
 """
@@ -382,6 +383,7 @@ inputs:
 tasks:
   - name: t
     file: tasks/t.sh
+    effects: [Test fixture]
     outputs:
       o: { schema: "string" }
 """,
@@ -412,10 +414,12 @@ name: probe
 tasks:
   - name: big
     file: tasks/t.sh
+    effects: [Test fixture]
     inputs:
       blob: { type: string, runtime: true }
   - name: ok
     file: tasks/ok.sh
+    effects: [Test fixture]
 """,
         "tasks/t.sh": "echo $BLOB\n",
         "tasks/ok.sh": "echo fine\n",
@@ -435,7 +439,9 @@ def test_a_result_over_the_per_result_limit_is_not_sent(tmp_path):
     files = {
         "capability.yaml": (
             "apiVersion: runwhen.com/custom-capability/v1\nname: probe\ntasks:\n"
-            "  - name: t\n    file: tasks/t.py\n    outputs:\n" + outputs + "\n"
+            "  - name: t\n    file: tasks/t.py\n    effects: [Test fixture]\n    outputs:\n"
+            + outputs
+            + "\n"
         ),
         "tasks/t.py": source,
     }

@@ -403,6 +403,7 @@ name: x
 tasks:
   - name: t
     file: tasks/t.sh
+    effects: [Test fixture]
     outputs:
       message: { schema: "string" }
 """,
@@ -563,6 +564,7 @@ name: x
 tasks:
   - name: t
     file: tasks/{file}
+    effects: [Test fixture]
     outputs:
       o: {{ schema: "{schema}" }}
 """

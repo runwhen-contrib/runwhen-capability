@@ -18,6 +18,7 @@ from __future__ import annotations
 from .compiler import CompileError, compile_manifest
 from .diagnostics import (
     E_DUPLICATE_NAME,
+    E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
     E_LIMIT,
     E_MANIFEST_SCHEMA,
@@ -57,6 +58,7 @@ __all__ = [
     "E_OUTPUT_UNDECLARED",
     "E_READONLY_WRITE",
     "E_DUPLICATE_NAME",
+    "E_EFFECTS_REQUIRED",
     "E_SCHEMA_FEATURE",
     "E_INPUT_TYPE",
     "E_OUTPUT_SCHEMA",

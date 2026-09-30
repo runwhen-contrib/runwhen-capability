@@ -78,6 +78,9 @@ class TaskSpec(BaseModel):
     file: str
     description: str = ""
     readOnly: bool = False
+    #: Plain-language sentences saying what the task changes. Required when readOnly is false
+    #: (E_EFFECTS_REQUIRED); optional description on a read-only task.
+    effects: list[str] = Field(default_factory=list)
     inputs: dict[str, InputSpec] = Field(default_factory=dict)
     outputs: dict[str, OutputSpec] = Field(default_factory=dict)
 
