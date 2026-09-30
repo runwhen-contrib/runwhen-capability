@@ -35,7 +35,7 @@ from .diagnostics import (
     Diagnostic,
 )
 from .hashing import content_hash, task_hash
-from .manifest import Manifest
+from .manifest import Manifest, manifest_json_schema
 from .schema_notation import SchemaNotationError, compile_schema_notation
 from .validate import validate
 
@@ -44,6 +44,7 @@ __all__ = [
     "CompileError",
     "SchemaNotationError",
     "Manifest",
+    "manifest_json_schema",
     "validate",
     "compile_manifest",
     "compile_schema_notation",

@@ -180,3 +180,23 @@ def task_file_language(path: str) -> TaskFileLanguage | None:
     if path.endswith(".sh"):
         return "bash"
     return None
+
+
+#: The description papi's /capabilities/schema.json carries, verbatim.
+MANIFEST_SCHEMA_DESCRIPTION = (
+    "JSON Schema for capability.yaml, apiVersion: runwhen.com/custom-capability/v1. Generated "
+    "from runwhen_capability.custom.manifest.Manifest, the same Pydantic model the SDK's "
+    "validate() uses for E_MANIFEST_SCHEMA -- this file is never hand-written, only "
+    "regenerated from the SDK."
+)
+
+
+def manifest_json_schema() -> dict[str, Any]:
+    """The capability.yaml JSON Schema document, as papi serves it at /capabilities/schema.json."""
+    model = Manifest.model_json_schema()
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": model.pop("title", "Manifest"),
+        "description": MANIFEST_SCHEMA_DESCRIPTION,
+        **model,
+    }

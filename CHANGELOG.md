@@ -45,6 +45,14 @@ with the wheel and sdist attached to the GitHub Release.
   `expect.status` (default `"ok"`) -- a task's outputs are already checked against their schema as
   part of that run, so a status match means the outputs validated too. A task with no test file is
   reported as `no test`, which is not a failure. Exits 1 if any task fails.
+- `manifest_json_schema()`: the capability.yaml JSON Schema document papi serves as `/capabilities/schema.json`.
+
+### Changed
+
+- **Breaking:** a task that omits `readOnly` (it defaults to false, i.e. "changes things") must now
+  either set `readOnly: true` or declare `effects`; otherwise validation fails with
+  `E_EFFECTS_REQUIRED`. Bundles whose read-only tasks never set `readOnly: true` must add it before
+  upgrading.
 
 ## 0.2.0
 
