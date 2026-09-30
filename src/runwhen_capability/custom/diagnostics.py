@@ -20,6 +20,12 @@ Static codes (validate() only, no execution):
 - E_SCHEMA_FEATURE -- a schema uses a JSON Schema feature custom tasks may not
   use (regex keywords: `pattern`, `patternProperties`).
 
+Warning codes (validate() only; severity "warning", never block a write or a run):
+
+- W_DATA_AS_CODE -- a task builds a command from text (bash `eval`/`sh -c` with an
+  expansion, awk `system(`/`getline`, Python `shell=True`/`os.system`).
+- W_UNUSED_INPUT -- a declared secret/credential input the task never reads.
+
 Runtime codes (the bundle host, bundle.py) reuse the same string constants:
 E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT.
 """
@@ -44,6 +50,10 @@ E_READONLY_WRITE = "E_READONLY_WRITE"
 E_DUPLICATE_NAME = "E_DUPLICATE_NAME"
 E_SCHEMA_FEATURE = "E_SCHEMA_FEATURE"
 E_EFFECTS_REQUIRED = "E_EFFECTS_REQUIRED"
+
+# -- warning codes: validate() ---------------------------------------------------
+W_DATA_AS_CODE = "W_DATA_AS_CODE"
+W_UNUSED_INPUT = "W_UNUSED_INPUT"
 
 # -- runtime codes: the bundle host (bundle.py) --------------------------------
 E_INPUT_TYPE = "E_INPUT_TYPE"

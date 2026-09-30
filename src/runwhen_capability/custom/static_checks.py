@@ -130,7 +130,7 @@ def _split_comment(line: str) -> tuple[str, int]:
     return line, 0
 
 
-def _strip_comments_and_heredocs(text: str) -> str:
+def _strip_comments_and_heredocs(text: str, keep_heredocs: bool = False) -> str:
     """Blanks out (replaces with spaces, same length, same line breaks) every
     `#` comment and every heredoc body (`<<EOF ... EOF`, `<<-EOF ... EOF`) in
     `text`, so a downstream regex scan never sees either as code. Line-based
@@ -138,12 +138,15 @@ def _strip_comments_and_heredocs(text: str) -> str:
     docstring for why that trade is the right one here. A heredoc's own
     delimiter line is matched literally (no shell word-expansion), which
     covers every task script this SDK has seen; a delimiter built from a
-    variable is out of scope."""
+    variable is out of scope.
+
+    `keep_heredocs=True` blanks comments only: an unquoted heredoc body
+    expands `$VAR`, so "is this name read" must still see it."""
     out_lines: list[str] = []
     heredoc_terminator: str | None = None
     for line in text.split("\n"):
         if heredoc_terminator is not None:
-            out_lines.append(" " * len(line))
+            out_lines.append(line if keep_heredocs else " " * len(line))
             if line.strip() == heredoc_terminator:
                 heredoc_terminator = None
             continue
@@ -157,32 +160,30 @@ def _strip_comments_and_heredocs(text: str) -> str:
     return "\n".join(out_lines)
 
 
-def _blank_single_quoted(text: str) -> str:
-    """Blanks out the body of every '...' string (same length, line breaks
-    kept), so a `$` inside one -- a jq or awk variable, say `jq '{t: $t}'` --
-    is never read as a bash expansion; bash never expands inside single
-    quotes. Tracked across lines, since a quoted jq program often spans
+def _single_quoted_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) of the body of every '...' string in `text` (the
+    characters between the quotes; an unterminated quote runs to the end).
+    Tracked across lines, since a quoted jq or awk program often spans
     several; a `'` inside "..." or escaped as `\\'` opens nothing.
 
     Each `(` -- a `$(...)` substitution or a subshell -- starts a fresh
     quoting context, closed by its `)`: in `"$(jq "$n" '{n: $n}')"` the
     inner quotes belong to the substitution, not to the outer string."""
-    out = list(text)
+    spans: list[tuple[int, int]] = []
     in_double = [False]  # one entry per open `(`; the last is the current context
-    in_single = False
+    start: int | None = None
     i = 0
     while i < len(text):
         ch = text[i]
-        if in_single:
+        if start is not None:
             if ch == "'":
-                in_single = False
-            elif ch != "\n":
-                out[i] = " "
+                spans.append((start, i))
+                start = None
         elif ch == "\\":
             i += 2  # an escaped character never toggles quote state
             continue
         elif ch == "'" and not in_double[-1]:
-            in_single = True
+            start = i + 1
         elif ch == '"':
             in_double[-1] = not in_double[-1]
         elif ch == "(" and (not in_double[-1] or text[i - 1 : i] == "$"):
@@ -190,6 +191,21 @@ def _blank_single_quoted(text: str) -> str:
         elif ch == ")" and not in_double[-1] and len(in_double) > 1:
             in_double.pop()
         i += 1
+    if start is not None:
+        spans.append((start, len(text)))
+    return spans
+
+
+def _blank_single_quoted(text: str) -> str:
+    """Blanks out the body of every '...' string (same length, line breaks
+    kept), so a `$` inside one -- a jq or awk variable, say `jq '{t: $t}'` --
+    is never read as a bash expansion; bash never expands inside single
+    quotes. See _single_quoted_spans for the quoting rules."""
+    out = list(text)
+    for start, end in _single_quoted_spans(text):
+        for i in range(start, end):
+            if out[i] != "\n":
+                out[i] = " "
     return "".join(out)
 
 
@@ -420,3 +436,192 @@ def mutating_kubectl_calls(text: str) -> list[tuple[int, str]]:
         if verb_match:
             hits.append((_line_of(starts, m.start()), f"kubectl {verb_match.group(1)}"))
     return hits
+
+
+# -- data as code: text built from a variable, then run as a command -----------
+
+_EVAL_RE = re.compile(r"(?m)" + _COMMAND_START + r"eval\b([^\n]*)")
+# sh/bash/dash/zsh/ksh -c, with any options before the -c (`bash -euo pipefail
+# -c`, `sh -lc`). Not preceded by a word character or `.`, so `run.sh -c x` is
+# a script called run.sh, not a shell. Group 1 is the command string alone
+# (the first word after -c); later words are positional arguments, which
+# are data passed as data.
+_SHELL_C_RE = re.compile(
+    r"(?<![\w.\-])(?:ba|da|z|k)?sh(?:[ \t]+(?:-[A-Za-z]*o[ \t]+\w+|-[A-Za-z-]+))*?"
+    r"[ \t]+-[A-Za-z]*c\b[ \t]*(\"(?:[^\"\\]|\\.)*\"|'[^']*'|\S*)"
+)
+_SHELL_NAME_RE = re.compile(r"(?:ba|da|z|k)?sh")
+_XARGS_RE = re.compile(r"(?<![\w.\-])xargs\b([^\n]*)")
+_XARGS_REPLACE_RE = re.compile(r"(?<![\w-])(?:-I|-i|--replace)\b|\{\}")
+_AWK_RE = re.compile(r"(?<![\w.\-])[gmn]?awk\b")
+_AWK_CMD_RE = re.compile(r"\bsystem[ \t]*\(|\bgetline\b")
+_STATEMENT_SEP_RE = re.compile(r"[;|&\n(]")
+
+
+def bash_data_as_code(text: str) -> list[tuple[int, str]]:
+    """(line, construct) -- at most one per line -- for every bash construct
+    that runs text as a command where that text can be built from data:
+    `eval` with a `$` expansion; `sh -c`/`bash -c` whose command string has
+    a `$` expansion; `xargs ... sh -c` with a replace string (`-I`, `{}`) or
+    an expansion; and an awk program (single-quoted, so its text is
+    blanked for the `$` checks) containing `system(` or `getline` at all.
+    A single-quoted `$` (`bash -c 'echo "$1"' _ "$x"`) is the safe pattern
+    and never flagged. Comments and heredoc bodies are never scanned."""
+    stripped = _strip_comments_and_heredocs(text)
+    starts = _line_starts(stripped)
+    blanked = _blank_single_quoted(stripped)
+    found: dict[int, str] = {}
+
+    for m in _EVAL_RE.finditer(blanked):
+        if "$" in m.group(1):
+            found.setdefault(_line_of(starts, m.start(1)), "eval")
+    for m in _XARGS_RE.finditer(blanked):
+        shell = _SHELL_C_RE.search(m.group(1))
+        if shell and ("$" in shell.group(1) or _XARGS_REPLACE_RE.search(m.group(1))):
+            found.setdefault(_line_of(starts, m.start(1)), "xargs sh -c")
+    for m in _SHELL_C_RE.finditer(blanked):
+        if "$" in m.group(1):
+            shell_name = _SHELL_NAME_RE.search(m.group(0)).group(0)
+            found.setdefault(_line_of(starts, m.start()), f"{shell_name} -c")
+
+    # awk: a single-quoted span whose statement (back to the previous command
+    # separator, looking at the blanked text so `-F'|'` is no separator)
+    # names awk is an awk program.
+    joined = re.sub(r"\\\n", "  ", blanked)  # a `\`-continued line is one statement
+    for start, end in _single_quoted_spans(stripped):
+        seps = list(_STATEMENT_SEP_RE.finditer(joined, 0, start))
+        statement_start = seps[-1].end() if seps else 0
+        if not _AWK_RE.search(joined, statement_start, start):
+            continue
+        for hit in _AWK_CMD_RE.finditer(stripped, start, end):
+            construct = "awk getline" if hit.group(0) == "getline" else "awk system()"
+            found.setdefault(_line_of(starts, hit.start()), construct)
+    return sorted(found.items())
+
+
+_SUBPROCESS_CALLS = frozenset({"run", "call", "check_call", "check_output", "Popen"})
+_SUBPROCESS_ALWAYS_SHELL = frozenset({"getoutput", "getstatusoutput"})
+
+
+def python_data_as_code(source: str) -> list[tuple[int, str]]:
+    """(line, construct) for every `subprocess.run/call/check_call/
+    check_output/Popen(..., shell=True)`, `subprocess.getoutput`/
+    `getstatusoutput` (always a shell) and `os.system(...)` in a Python
+    task, following `import subprocess as sp` / `from subprocess import run`
+    aliases. [] when the source does not parse."""
+    tree = _parse_python(source)
+    if tree is None:
+        return []
+    modules: dict[str, str] = {}  # local name -> "subprocess" | "os"
+    functions: dict[str, str] = {}  # local name -> "subprocess.run" | "os.system" ...
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in ("subprocess", "os"):
+                    modules[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module in ("subprocess", "os"):
+            for alias in node.names:
+                functions[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        qualified = None
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            module = modules.get(func.value.id)
+            if module:
+                qualified = f"{module}.{func.attr}"
+        elif isinstance(func, ast.Name):
+            qualified = functions.get(func.id)
+        if qualified is None:
+            continue
+        module, _, name = qualified.partition(".")
+        if module == "os" and name == "system":
+            hits.append((node.lineno, "os.system()"))
+        elif module == "subprocess" and name in _SUBPROCESS_ALWAYS_SHELL:
+            hits.append((node.lineno, f"subprocess.{name}()"))
+        elif module == "subprocess" and name in _SUBPROCESS_CALLS:
+            shell_true = any(
+                kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+                for kw in node.keywords
+            )
+            if shell_true:
+                hits.append((node.lineno, f"subprocess.{name}(shell=True)"))
+    return sorted(hits)
+
+
+# -- unused inputs: a secret/credential the task never reads ---------------------
+
+
+def bash_input_used(text: str, name: str) -> bool:
+    """True if the bash task mentions the declared input `name` at all: its
+    env var (`$NAME`, `${NAME}`, `printenv NAME`, any whole-word `NAME` --
+    even one assigned locally, `NAME="${NAME:-x}"`, is a read) or
+    `rw_input name`. Comments are ignored; heredoc bodies and single
+    quotes are not, because an unquoted heredoc expands `$NAME`. Biased to
+    "used": a spurious mention only hides a warning."""
+    text = _strip_comments_and_heredocs(text, keep_heredocs=True)
+    env = _input_env_name(name)
+    if re.search(rf"(?<![A-Za-z0-9_]){re.escape(env)}(?![A-Za-z0-9_])", text):
+        return True
+    return any(m.group(1) == name for m in _RW_INPUT_RE.finditer(text))
+
+
+def _input_env_name(name: str) -> str:
+    from .manifest import input_env_name
+
+    return input_env_name(name)
+
+
+def python_input_used(source: str, name: str) -> bool | None:
+    """Whether `main` uses the declared input `name`: the matching parameter
+    (camelCase -> snake_case) is read somewhere in the body, or
+    `ctx.credential("name")` names it. `**kwargs`, `locals()`, a dynamic
+    `ctx.credential(x)` and any mention of RW_INPUTS_JSON count as using
+    everything. None when there is no parseable top-level `main`."""
+    from .manifest import python_kwarg_name
+
+    tree = _parse_python(source)
+    if tree is None:
+        return None
+    main_def = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == "main"
+        ),
+        None,
+    )
+    if main_def is None:
+        return None
+    if main_def.args.kwarg is not None:
+        return True
+    param = python_kwarg_name(name)
+    for stmt in main_def.body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id == param:
+                    return True
+                if node.id == "locals":
+                    return True
+            elif isinstance(node, ast.Constant) and node.value == "RW_INPUTS_JSON":
+                return True
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute) and func.attr == "credential" and node.args:
+                    arg = node.args[0]
+                    if not isinstance(arg, ast.Constant):
+                        return True
+                    if arg.value == name:
+                        return True
+    return False
+
+
+_KUBECTL_RE = re.compile(r"\bkubectl\b")
+
+
+def runs_kubectl(text: str) -> bool:
+    """True if `kubectl` appears anywhere in the task's code (bash or
+    Python), outside `#` comments -- KUBECONFIG is set for it automatically."""
+    return _KUBECTL_RE.search(_strip_comments_and_heredocs(text, keep_heredocs=True)) is not None

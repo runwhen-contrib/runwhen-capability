@@ -5,10 +5,15 @@ from __future__ import annotations
 
 from runwhen_capability.custom.static_checks import (
     _strip_comments_and_heredocs,
+    bash_data_as_code,
     bash_env_reads,
+    bash_input_used,
     bash_locally_assigned_names,
     bash_output_writes,
     mutating_kubectl_calls,
+    python_data_as_code,
+    python_input_used,
+    runs_kubectl,
 )
 
 
@@ -138,3 +143,137 @@ def test_single_quotes_inside_a_command_substitution_in_double_quotes_are_litera
         "echo \"$(printf '%s' \"$(echo '$inner')\") $OUTER\"\n"
     )
     assert sorted(name for _, name in bash_env_reads(source)) == ["COUNT", "OUTER"]
+
+
+# -- data as code: bash -------------------------------------------------------
+
+T4_AWK = """\
+DETAILS=$(awk '
+  { cmd = "printf \\047%s\\047 \\047" $0 "\\047 | jq -r \\047.kind\\047"
+    cmd | getline kv
+    close(cmd) }' "$CAUSES_FILE")
+"""
+
+
+def test_the_sdlc_t4_awk_getline_is_flagged_on_its_own_line():
+    assert bash_data_as_code(T4_AWK) == [(3, "awk getline")]
+
+
+def test_awk_system_is_flagged_even_after_an_f_option():
+    text = "awk -F'|' '{ system(\"echo \" $1) }' file\n"
+    assert bash_data_as_code(text) == [(1, "awk system()")]
+
+
+def test_plain_awk_and_jq_arg_are_not_flagged():
+    text = "awk '{ print $1 }' f\njq -r --arg k \"$K\" '.[$k]' f\n"
+    assert bash_data_as_code(text) == []
+
+
+def test_eval_with_an_expansion_is_flagged_but_not_a_fixed_eval():
+    assert bash_data_as_code('eval "$cmd"\n') == [(1, "eval")]
+    assert bash_data_as_code("eval 'echo $x'\n") == []
+    assert bash_data_as_code("eval echo hi\n") == []
+    assert bash_data_as_code("echo eval $x\n") == []
+
+
+def test_shell_dash_c_with_an_expansion_is_flagged():
+    assert bash_data_as_code('bash -c "echo $LINE"\n') == [(1, "bash -c")]
+    assert bash_data_as_code('sh -c "$CMD"\n') == [(1, "sh -c")]
+    assert bash_data_as_code('bash -euo pipefail -c "run $X"\n') == [(1, "bash -c")]
+
+
+def test_shell_dash_c_with_a_fixed_literal_is_not_flagged():
+    assert bash_data_as_code("bash -c 'echo hello'\n") == []
+    assert bash_data_as_code('bash -c \'echo "$1"\' _ "$x"\n') == []
+    assert bash_data_as_code('./run.sh -c "$x"\n') == []
+
+
+def test_xargs_with_a_replace_string_into_sh_c_is_flagged():
+    assert bash_data_as_code("ls | xargs -I{} sh -c 'echo {}'\n") == [(1, "xargs sh -c")]
+    assert bash_data_as_code("ls | xargs -n1 sh -c 'echo \"$1\"' _\n") == []
+
+
+def test_data_as_code_ignores_comments_and_heredocs_and_reports_each_line_once():
+    text = '# eval $x\ncat <<EOF\neval $x\nEOF\neval "$a"; eval "$b"\n'
+    assert bash_data_as_code(text) == [(5, "eval")]
+
+
+# -- data as code: python ------------------------------------------------------
+
+
+def test_python_shell_true_and_os_system_are_flagged():
+    src = (
+        "import os, subprocess\n"
+        "def main(ctx):\n"
+        "    subprocess.run(f'echo {x}', shell=True)\n"
+        "    os.system('ls')\n"
+        "    subprocess.check_output('ls', shell=True, text=True)\n"
+    )
+    assert python_data_as_code(src) == [
+        (3, "subprocess.run(shell=True)"),
+        (4, "os.system()"),
+        (5, "subprocess.check_output(shell=True)"),
+    ]
+
+
+def test_python_argv_lists_and_shell_false_are_not_flagged():
+    src = (
+        "import subprocess\n"
+        "subprocess.run(['echo', x])\n"
+        "subprocess.run('ls', shell=False)\n"
+        "subprocess.run(['sh', '-c', 'ls'])\n"
+    )
+    assert python_data_as_code(src) == []
+
+
+def test_python_aliased_imports_are_followed():
+    src = "import subprocess as sp\nfrom os import system\nsp.call('x', shell=True)\nsystem('y')\n"
+    assert [line for line, _ in python_data_as_code(src)] == [3, 4]
+
+
+def test_python_data_as_code_on_unparseable_source_is_empty():
+    assert python_data_as_code("def (:\n") == []
+
+
+# -- unused input ---------------------------------------------------------------
+
+
+def test_bash_input_used_by_env_read_or_rw_input():
+    assert bash_input_used('curl -H "Authorization: $API_TOKEN"\n', "apiToken")
+    assert bash_input_used("x=${API_TOKEN:-}\n", "apiToken")
+    assert bash_input_used("t=$(rw_input apiToken)\n", "apiToken")
+    assert bash_input_used("printenv API_TOKEN\n", "apiToken")
+
+
+def test_bash_input_not_used_when_absent_commented_or_only_a_prefix():
+    assert not bash_input_used("echo hi\n", "apiToken")
+    assert not bash_input_used("# uses $API_TOKEN\necho hi\n", "apiToken")
+    assert not bash_input_used("echo $API_TOKEN_OTHER\n", "apiToken")
+
+
+def test_bash_input_reassigned_locally_still_counts_as_read():
+    assert bash_input_used('API_TOKEN="${API_TOKEN:-x}"\n', "apiToken")
+
+
+def test_python_input_used_when_the_param_is_used_in_the_body():
+    src = "def main(ctx, api_token, other):\n    return {'t': api_token}\n"
+    assert python_input_used(src, "apiToken") is True
+    assert python_input_used(src, "other") is False
+
+
+def test_python_input_used_via_ctx_credential_or_kwargs_or_dynamic():
+    assert python_input_used("def main(ctx):\n    ctx.credential('apiToken')\n", "apiToken")
+    assert python_input_used("def main(ctx, **kw):\n    pass\n", "apiToken")
+    assert python_input_used("def main(ctx, n):\n    ctx.credential(n)\n", "apiToken")
+    assert python_input_used("def main(ctx):\n    pass\n", "apiToken") is False
+
+
+def test_python_input_used_is_none_without_a_main():
+    assert python_input_used("x = 1\n", "apiToken") is None
+    assert python_input_used("def (:\n", "apiToken") is None
+
+
+def test_runs_kubectl_ignores_comments():
+    assert runs_kubectl("kubectl get pods\n")
+    assert runs_kubectl('ctx.run(["kubectl", "get"])\n')
+    assert not runs_kubectl("# kubectl get pods\necho hi\n")

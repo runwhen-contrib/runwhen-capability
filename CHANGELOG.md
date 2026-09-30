@@ -18,6 +18,13 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `validate`: two new warnings (severity `warning`; they never block a write, plan, apply or run):
+  - `W_DATA_AS_CODE`: text built from a variable is run as a command. Bash: `eval` with a `$`
+    expansion, `sh -c`/`bash -c` whose command string has an expansion, `xargs ... sh -c` with a
+    replace string, and an awk program containing `system(` or `getline`. Python: `shell=True` on
+    `subprocess` calls and `os.system(`. One diagnostic per line, with a hint to pass data as data.
+  - `W_UNUSED_INPUT`: a `secret` or `credential` input (task- or capability-level) the task never
+    reads. A `k8s.kubeconfig` credential counts as used when the task calls `kubectl`.
 - `TaskSpec.effects`: plain-language sentences saying what a task changes. Required when
   `readOnly` is false (`E_EFFECTS_REQUIRED`), optional on a read-only task, and carried into the
   compiled manifest beside `readOnly`.

@@ -30,6 +30,8 @@ from .diagnostics import (
     E_SCHEMA_NOTATION,
     E_TASK_FILE_MISSING,
     E_UNDECLARED_INPUT,
+    W_DATA_AS_CODE,
+    W_UNUSED_INPUT,
     Diagnostic,
 )
 from .manifest import (
@@ -487,6 +489,11 @@ def _check_setup_file(files: dict[str, str], raw, manifest: Manifest) -> list[Di
 def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnostic]:
     diagnostics = []
     raw_tasks = raw.get("tasks") or []
+    # Code every task may run besides its own file: the setup file and lib/.
+    shared_paths = {path for path in files if path.startswith("lib/")}
+    if manifest.setup is not None:
+        shared_paths.add(manifest.setup.file)
+    shared_text = "\n".join(files[path] for path in sorted(shared_paths) if path in files)
     for index, task in enumerate(manifest.tasks):
         raw_task = raw_tasks[index] if index < len(raw_tasks) else {}
         task_line = line_of(raw_task)
@@ -527,6 +534,10 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
             read_only=task.readOnly,
         )
 
+        diagnostics += _check_unused_inputs(
+            files, raw, raw_task, manifest, task, index, language, shared_text
+        )
+
         raw_outputs = (raw_task or {}).get("outputs") or {}
         for name, output in task.outputs.items():
             diagnostics += _check_output_schema(
@@ -536,6 +547,71 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
                 loc_path=f"tasks[{index}].outputs.{name}.schema",
                 line=line_of(raw_outputs.get(name)),
             )
+    return diagnostics
+
+
+def _check_unused_inputs(
+    files: dict[str, str],
+    raw,
+    raw_task,
+    manifest: Manifest,
+    task,
+    index: int,
+    language: str,
+    shared_text: str,
+) -> list[Diagnostic]:
+    """W_UNUSED_INPUT: a secret/credential input the task receives (its own,
+    or a capability-level one) and never reads. Skipped, never guessed, when
+    the task's Python has no parseable `main`. An input the setup file or
+    lib/ mentions is treated as used -- they run on the task's behalf.
+    A `k8s.kubeconfig` credential counts as used when the task calls
+    kubectl or names KUBECONFIG, since KUBECONFIG is set automatically."""
+    source = files[task.file]
+    calls_kubectl = static_checks.runs_kubectl(source)
+    raw_cap_inputs = (raw or {}).get("inputs") or {}
+    raw_task_inputs = (raw_task or {}).get("inputs") or {}
+    diagnostics = []
+    for name, spec in {**manifest.inputs, **task.inputs}.items():
+        if spec.type not in ("secret", "credential"):
+            continue
+        if spec.type == "credential" and spec.kind == "k8s.kubeconfig" and calls_kubectl:
+            continue
+        if language == "python":
+            used = static_checks.python_input_used(source, name)
+            if used is None:
+                continue
+        else:
+            used = static_checks.bash_input_used(source, name)
+        if spec.type == "credential" and spec.kind == "k8s.kubeconfig":
+            used = used or static_checks.bash_input_used(source, "kubeconfig")
+        if used or (
+            shared_text
+            and (
+                static_checks.bash_input_used(shared_text, name)
+                or f'"{name}"' in shared_text
+                or f"'{name}'" in shared_text
+            )
+        ):
+            continue
+        if name in task.inputs:
+            loc_path = f"tasks[{index}].inputs.{name}"
+            line = line_of(raw_task_inputs.get(name))
+        else:
+            loc_path = f"inputs.{name}"
+            line = line_of(raw_cap_inputs.get(name))
+        diagnostics.append(
+            Diagnostic(
+                code=W_UNUSED_INPUT,
+                severity="warning",
+                file="capability.yaml",
+                line=line,
+                path=loc_path,
+                message=(
+                    f"{name!r} is declared but never read; it still shows on the trust card "
+                    "and narrows where the capability is offered"
+                ),
+            )
+        )
     return diagnostics
 
 
@@ -722,6 +798,26 @@ def _check_source(
                     message=f"{call!r} mutates cluster state, but this task is readOnly",
                 )
             )
+
+    data_as_code = (
+        static_checks.python_data_as_code(source)
+        if language == "python"
+        else static_checks.bash_data_as_code(source)
+    )
+    for line, construct in data_as_code:
+        diagnostics.append(
+            Diagnostic(
+                code=W_DATA_AS_CODE,
+                severity="warning",
+                file=file_path,
+                line=line,
+                message=(
+                    f"{construct} runs text as a command; if that text comes from data "
+                    "(a log line, an API body), a quote breaks it and the data can run commands"
+                ),
+                hint="pass data as data: environment variables, stdin, jq --arg, or Python",
+            )
+        )
 
     if language == "python":
         signature = static_checks.python_main_params(source)
