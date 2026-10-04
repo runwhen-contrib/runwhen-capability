@@ -31,9 +31,16 @@ set -u
 
 rw_input() {
     # The env var name is derived exactly as the host derives it from the
-    # manifest's input name: an underscore before every capital letter but
-    # the first, then upper-cased ("maxWait" -> MAX_WAIT).
-    local name="${1:-}" env_name="" ch i
+    # manifest's input name (manifest.input_env_name): an underscore where a
+    # lower-case letter or digit meets a capital ("maxWait" -> MAX_WAIT) and
+    # before the last capital of a run followed by a lower-case letter
+    # ("HTTPTimeout" -> HTTP_TIMEOUT), then upper-cased; a run of capitals is
+    # one word ("THRESHOLD" -> THRESHOLD). If that variable is unset, the
+    # legacy name -- an underscore before every capital but the first, the
+    # only one an older host sets ("THRESHOLD" -> T_H_R_E_S_H_O_L_D) -- is
+    # read instead.
+    local name="${1:-}" env_name="" legacy_name="" ch prev next i
+    local upper=ABCDEFGHIJKLMNOPQRSTUVWXYZ lower=abcdefghijklmnopqrstuvwxyz
     case "$name" in
         [A-Za-z]*) ;;
         *) printf 'rw_input: invalid input name %s\n' "$name" >&2; return 1 ;;
@@ -43,13 +50,26 @@ rw_input() {
     esac
     for (( i = 0; i < ${#name}; i++ )); do
         ch=${name:i:1}
-        case "$ch" in
-            [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) if (( i > 0 )); then env_name+="_"; fi ;;
-        esac
+        if (( i > 0 )) && [[ $upper == *"$ch"* ]]; then
+            legacy_name+="_"
+            prev=${name:i-1:1}
+            next=${name:i+1:1}
+            if [[ $lower$'0123456789' == *"$prev"* ]]; then
+                env_name+="_"
+            elif [[ $upper == *"$prev"* && -n $next && $lower == *"$next"* ]]; then
+                env_name+="_"
+            fi
+        fi
         env_name+=$ch
+        legacy_name+=$ch
     done
-    env_name=$(printf '%s' "$env_name" | tr '[:lower:]' '[:upper:]')
-    printf '%s' "${!env_name-}"
+    env_name=$(printf '%s' "$env_name" | tr "$lower" "$upper")
+    legacy_name=$(printf '%s' "$legacy_name" | tr "$lower" "$upper")
+    if [[ -n ${!env_name+set} ]]; then
+        printf '%s' "${!env_name}"
+    else
+        printf '%s' "${!legacy_name-}"
+    fi
 }
 
 rw_append() {

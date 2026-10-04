@@ -554,20 +554,92 @@ def python_data_as_code(source: str) -> list[tuple[int, str]]:
     return sorted(hits)
 
 
+# -- unknown SDK helpers: an rw_* command rw.sh doesn't define ------------------
+
+#: The public helpers rw.sh defines; any other `rw_*` command is a typo or an
+#: invented helper that bash reports as "command not found" and carries on.
+RW_SH_HELPERS = ("rw_input", "rw_append", "rw_set", "rw_skip")
+
+# An rw_* word in command position: _COMMAND_START, plus a backtick
+# substitution. Not followed by `=`/`+=` (an assignment to a variable that
+# happens to start with rw_) or by a word character.
+_RW_COMMAND_RE = re.compile(
+    r"(?m)(?:" + _COMMAND_START + r"|`[ \t]*)\b(rw_[a-z_]+)(?![A-Za-z0-9_]|\+?=)"
+)
+_RW_FUNCTION_DEF_RE = re.compile(
+    r"(?m)^[ \t]*(?:function[ \t]+(rw_[a-z_]+)\b|(rw_[a-z_]+)[ \t]*\(\s*\))"
+)
+
+
+def _blank_double_quoted(text: str) -> str:
+    """Blanks the literal text of every "..." string (same length, line breaks
+    kept), keeping each `$(...)` inside one: its body is code. Expects
+    single-quoted bodies to be blanked already (_blank_single_quoted)."""
+    out = list(text)
+    in_double = [False]  # one entry per open `$(`/`(`, as in _single_quoted_spans
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\":
+            if in_double[-1]:
+                out[i] = " "
+                if i + 1 < len(text) and text[i + 1] != "\n":
+                    out[i + 1] = " "
+            i += 2
+            continue
+        if ch == '"':
+            in_double[-1] = not in_double[-1]
+        elif ch == "(" and (not in_double[-1] or text[i - 1 : i] == "$"):
+            in_double.append(False)
+        elif ch == ")" and not in_double[-1] and len(in_double) > 1:
+            in_double.pop()
+        elif in_double[-1] and ch != "\n":
+            out[i] = " "
+        i += 1
+    return "".join(out)
+
+
+def bash_defined_rw_functions(text: str) -> set[str]:
+    """Every `rw_*` function the script defines (`rw_foo() {`, `function rw_foo`)."""
+    text = _strip_comments_and_heredocs(text)
+    return {m.group(1) or m.group(2) for m in _RW_FUNCTION_DEF_RE.finditer(text)}
+
+
+def bash_unknown_sdk_helpers(
+    text: str, defined: frozenset[str] = frozenset()
+) -> list[tuple[int, str]]:
+    """(line, name) for every `rw_*` word used as a command that is neither one
+    of rw.sh's helpers (RW_SH_HELPERS), a function the script itself defines,
+    nor one in `defined` (functions from lib/ or setup). Comments, heredoc
+    bodies and quoted strings are never scanned."""
+    known = set(RW_SH_HELPERS) | bash_defined_rw_functions(text) | set(defined)
+    stripped = _strip_comments_and_heredocs(text)
+    starts = _line_starts(stripped)
+    blanked = _blank_double_quoted(_blank_single_quoted(stripped))
+    return [
+        (_line_of(starts, m.start(1)), m.group(1))
+        for m in _RW_COMMAND_RE.finditer(blanked)
+        if m.group(1) not in known
+    ]
+
+
 # -- unused inputs: a secret/credential the task never reads ---------------------
 
 
 def bash_input_used(text: str, name: str) -> bool:
     """True if the bash task mentions the declared input `name` at all: its
-    env var (`$NAME`, `${NAME}`, `printenv NAME`, any whole-word `NAME` --
-    even one assigned locally, `NAME="${NAME:-x}"`, is a read) or
-    `rw_input name`. Comments are ignored; heredoc bodies and single
-    quotes are not, because an unquoted heredoc expands `$NAME`. Biased to
-    "used": a spurious mention only hides a warning."""
+    env var under the new or the legacy name (`$NAME`, `${NAME}`, `printenv
+    NAME`, any whole-word `NAME` -- even one assigned locally,
+    `NAME="${NAME:-x}"`, is a read) or `rw_input name`. Comments are
+    ignored; heredoc bodies and single quotes are not, because an unquoted
+    heredoc expands `$NAME`. Biased to "used": a spurious mention only hides
+    a warning."""
     text = _strip_comments_and_heredocs(text, keep_heredocs=True)
-    env = _input_env_name(name)
-    if re.search(rf"(?<![A-Za-z0-9_]){re.escape(env)}(?![A-Za-z0-9_])", text):
-        return True
+    # The legacy (pre-H48) spelling counts too: the host still sets it, and
+    # the reserved-name warning tells authors to read it (`ENV` -> $E_N_V).
+    for env in {_input_env_name(name), _legacy_input_env_name(name)}:
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(env)}(?![A-Za-z0-9_])", text):
+            return True
     return any(m.group(1) == name for m in _RW_INPUT_RE.finditer(text))
 
 
@@ -575,6 +647,12 @@ def _input_env_name(name: str) -> str:
     from .manifest import input_env_name
 
     return input_env_name(name)
+
+
+def _legacy_input_env_name(name: str) -> str:
+    from .manifest import legacy_input_env_name
+
+    return legacy_input_env_name(name)
 
 
 def python_input_used(source: str, name: str) -> bool | None:

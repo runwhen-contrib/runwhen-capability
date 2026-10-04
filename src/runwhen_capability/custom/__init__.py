@@ -32,6 +32,7 @@ from .diagnostics import (
     E_TASK_FILE_MISSING,
     E_TIMEOUT,
     E_UNDECLARED_INPUT,
+    E_UNKNOWN_SDK_HELPER,
     Diagnostic,
 )
 from .hashing import content_hash, task_hash
@@ -60,6 +61,7 @@ __all__ = [
     "E_READONLY_WRITE",
     "E_DUPLICATE_NAME",
     "E_EFFECTS_REQUIRED",
+    "E_UNKNOWN_SDK_HELPER",
     "E_SCHEMA_FEATURE",
     "E_INPUT_TYPE",
     "E_OUTPUT_SCHEMA",

@@ -460,3 +460,13 @@ def test_the_host_never_evaluates_a_schema_with_a_regex_keyword():
     messages = _validate_output_schema("o", {"v": "a" * 64 + "!"}, schema)
     assert time.monotonic() - started < 1
     assert messages and messages[0].startswith("E_SCHEMA_FEATURE outputs.o")
+
+
+def test_a_published_bundle_calling_an_unknown_sdk_helper_still_runs(tmp_path):
+    # E_UNKNOWN_SDK_HELPER is an authoring gate (H51): the host re-validates
+    # every run and must not start refusing an already-published bundle.
+    source = _BASH + "rw_set_severity 3\nrw_set o '\"ran\"'\n"
+    result = _run(_files("t.sh", source), tmp_path)
+    assert result.setup is None or result.setup.status != "failed"
+    [task] = result.tasks
+    assert task.outputs == {"o": "ran"}

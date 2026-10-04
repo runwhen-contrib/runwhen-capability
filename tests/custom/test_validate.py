@@ -20,6 +20,7 @@ from runwhen_capability.custom.diagnostics import (
     E_SCHEMA_NOTATION,
     E_TASK_FILE_MISSING,
     E_UNDECLARED_INPUT,
+    E_UNKNOWN_SDK_HELPER,
     W_DATA_AS_CODE,
     W_UNUSED_INPUT,
 )
@@ -977,3 +978,90 @@ def test_task_level_unused_inputs_still_warn_per_task():
         "tasks/b.sh": 'echo "$TOK"\n',
     }
     assert [d.path for d in _of(files, W_UNUSED_INPUT)] == ["tasks[0].inputs.tok"]
+
+
+# -- E_UNKNOWN_SDK_HELPER: an rw_* call rw.sh doesn't define (H51) ---------------
+
+_HELPER_MANIFEST = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+    readOnly: true
+    outputs:
+      severity: { schema: "integer" }
+"""
+
+
+def _helper_bundle(source: str, **extra) -> dict[str, str]:
+    return {"capability.yaml": _HELPER_MANIFEST, "tasks/t.sh": source, **extra}
+
+
+def test_e_unknown_sdk_helper_flags_the_sdlc_rw_set_severity_call():
+    src = 'source "$RW_SDK/rw.sh"\necho start\nrw_set_severity 3\n'
+    (diag,) = _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER)
+    assert (diag.severity, diag.file, diag.line) == ("error", "tasks/t.sh", 3)
+    assert "rw_set_severity" in diag.message
+    for real in ("rw_input", "rw_append", "rw_set", "rw_skip"):
+        assert real in diag.message
+    assert diag.hint == "severity and other fields go in an output (rw_set/rw_append)"
+
+
+def test_e_unknown_sdk_helper_in_every_command_position():
+    src = (
+        "x=$(rw_get_thing a)\nif rw_check; then :; fi\ntrue && rw_emit 1\n"
+        "echo hi | rw_pipe\ny=`rw_tick`\n"
+    )
+    names = sorted(d.message.split("'")[1] for d in _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER))
+    assert names == ["rw_check", "rw_emit", "rw_get_thing", "rw_pipe", "rw_tick"]
+
+
+def test_e_unknown_sdk_helper_ignores_real_helpers_comments_heredocs_and_quotes():
+    src = (
+        "rw_set severity 1\nrw_append severity 2\nv=$(rw_input x)\nrw_skip done\n"
+        "# rw_set_severity 3 would be wrong\n"
+        "cat <<EOF\nrw_set_severity 3\nEOF\n"
+        "echo 'rw_set_severity 3'\n"
+        'echo "do not call rw_set_severity; ever"\n'
+        'rw_sdk_dir=/x\necho "$rw_sdk_dir"\n'
+    )
+    assert _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER) == []
+
+
+def test_e_unknown_sdk_helper_ignores_functions_the_script_defines():
+    src = (
+        'rw_emit_sev() {\n  rw_set severity "$1"\n}\n'
+        'function rw_note { echo "$1"; }\n'
+        "rw_emit_sev 2\nrw_note hi\n"
+    )
+    assert _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER) == []
+
+
+def test_e_unknown_sdk_helper_ignores_functions_a_lib_file_defines():
+    files = _helper_bundle(
+        'source "$RW_SDK/../lib/util.sh"\nrw_emit_sev 2\n',
+        **{"lib/util.sh": 'rw_emit_sev() { rw_set severity "$1"; }\n'},
+    )
+    assert _of(files, E_UNKNOWN_SDK_HELPER) == []
+
+
+def test_e_unknown_sdk_helper_is_not_checked_in_python():
+    src = "def main(ctx):\n    rw_set_severity = 1\n    return {}\n"
+    files = {
+        "capability.yaml": _HELPER_MANIFEST.replace("t.sh", "t.py"),
+        "tasks/t.py": src,
+    }
+    assert _of(files, E_UNKNOWN_SDK_HELPER) == []
+
+
+# -- W_UNUSED_INPUT: reading an input under its legacy env name (H51) -----------
+
+
+def test_w_unused_input_accepts_a_read_under_the_legacy_env_name():
+    # `ENV` maps to the reserved $ENV, so the reserved-name warning tells the
+    # author to read the legacy spelling $E_N_V -- that read counts.
+    files = _warn_bundle("tasks/t.sh", 'curl -H "$E_N_V"\n', "  ENV: { type: secret }")
+    assert _of(files, W_UNUSED_INPUT) == []
+    files = _warn_bundle("tasks/t.sh", 'curl -H "$T_O_K_E_N"\n', "  TOKEN: { type: secret }")
+    assert _of(files, W_UNUSED_INPUT) == []

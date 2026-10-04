@@ -77,6 +77,7 @@ from .custom.diagnostics import (
     E_OUTPUT_TOO_LARGE,
     E_SCHEMA_FEATURE,
     E_TIMEOUT,
+    E_UNKNOWN_SDK_HELPER,
 )
 from .custom.hashing import content_hash
 from .custom.manifest import (
@@ -164,9 +165,12 @@ def run_bundle_request(
         return result
 
     try:
-        # E_EFFECTS_REQUIRED is an authoring/publish gate; an already-published
-        # (immutable) bundle that predates it must still run.
-        compiled = compile_manifest(files, ignore=frozenset({E_EFFECTS_REQUIRED}))
+        # E_EFFECTS_REQUIRED and E_UNKNOWN_SDK_HELPER are authoring/publish
+        # gates; an already-published (immutable) bundle that predates them must
+        # still run.
+        compiled = compile_manifest(
+            files, ignore=frozenset({E_EFFECTS_REQUIRED, E_UNKNOWN_SDK_HELPER})
+        )
     except CompileError as exc:
         result.setup = SetupResult(status="failed", error=f"invalid bundle: {exc}")
         return result

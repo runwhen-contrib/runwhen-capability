@@ -17,6 +17,9 @@ Static codes (validate() only, no execution):
   and similar in a readOnly task.
 - E_DUPLICATE_NAME -- a name is used twice.
 - E_EFFECTS_REQUIRED -- a task that isn't readOnly declares no effects.
+- E_UNKNOWN_SDK_HELPER -- a bash task calls an `rw_*` command rw.sh doesn't define
+  (only rw_input, rw_append, rw_set and rw_skip exist) and the script doesn't
+  define itself. An authoring gate: the bundle host ignores it at run time.
 - E_SCHEMA_FEATURE -- a schema uses a JSON Schema feature custom tasks may not
   use (regex keywords: `pattern`, `patternProperties`).
 
@@ -50,6 +53,7 @@ E_READONLY_WRITE = "E_READONLY_WRITE"
 E_DUPLICATE_NAME = "E_DUPLICATE_NAME"
 E_SCHEMA_FEATURE = "E_SCHEMA_FEATURE"
 E_EFFECTS_REQUIRED = "E_EFFECTS_REQUIRED"
+E_UNKNOWN_SDK_HELPER = "E_UNKNOWN_SDK_HELPER"
 
 # -- warning codes: validate() ---------------------------------------------------
 W_DATA_AS_CODE = "W_DATA_AS_CODE"

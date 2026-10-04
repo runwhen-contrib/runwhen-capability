@@ -23,6 +23,13 @@ with the wheel and sdist attached to the GitHub Release.
 - `validate`: a `$name` inside a single-quoted string (a jq or awk variable, as in
   `jq -n --argjson t "$n" '{t: $t}'`) is not an env read. Quote context is tracked across lines
   and restarts inside each `$(...)`. Before this, `E_UNDECLARED_INPUT` flagged `$t`.
+- `rw_input` in `rw.sh` derives an input's env var name with the same rule as the host
+  (`THRESHOLD` → `THRESHOLD`, `HTTPTimeout` → `HTTP_TIMEOUT`, `maxWait` → `MAX_WAIT`); before
+  this it still split per letter, so `rw_input THRESHOLD` read nothing on a new host. If that
+  variable is unset it falls back to the legacy per-letter name, so it also works under an older
+  host.
+- `validate`: `W_UNUSED_INPUT` accepts a bash read of an input under its legacy env name (for
+  example `$E_N_V` for an input named `ENV`, which the reserved-name warning tells authors to use).
 
 ### Added
 
@@ -33,6 +40,12 @@ with the wheel and sdist attached to the GitHub Release.
     `subprocess` calls and `os.system(`. One diagnostic per line, with a hint to pass data as data.
   - `W_UNUSED_INPUT`: a `secret` or `credential` input (task- or capability-level) the task never
     reads. A capability-level input warns once, and only when no task (nor setup/lib) reads it. A `k8s.kubeconfig` credential counts as used when the task calls `kubectl`.
+- `validate`: `E_UNKNOWN_SDK_HELPER` (error) for a bash task that calls an `rw_*` command rw.sh
+  doesn't define (only `rw_input`, `rw_append`, `rw_set` and `rw_skip` exist), for example
+  `rw_set_severity`. Before this, bash printed "command not found" and the task carried on and
+  passed. Comments, heredocs, quoted strings and `rw_*` functions the script (or `lib/`, or a
+  bash setup file) defines are ignored. It is an authoring gate: the bundle host ignores it at run
+  time, so already-published bundles run exactly as before.
 - `TaskSpec.effects`: plain-language sentences saying what a task changes. Required when
   `readOnly` is false (`E_EFFECTS_REQUIRED`), optional on a read-only task, and carried into the
   compiled manifest beside `readOnly`.

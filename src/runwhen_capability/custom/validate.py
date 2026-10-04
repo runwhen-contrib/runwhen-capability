@@ -30,6 +30,7 @@ from .diagnostics import (
     E_SCHEMA_NOTATION,
     E_TASK_FILE_MISSING,
     E_UNDECLARED_INPUT,
+    E_UNKNOWN_SDK_HELPER,
     W_DATA_AS_CODE,
     W_UNUSED_INPUT,
     Diagnostic,
@@ -499,8 +500,27 @@ def _check_setup_file(files: dict[str, str], raw, manifest: Manifest) -> list[Di
     # Setup declares no outputs of its own in this manifest version, so
     # output-undeclared checking does not apply (outputs=None skips it).
     return _check_source(
-        files[path], path, language, manifest.inputs, outputs=None, read_only=False
+        files[path],
+        path,
+        language,
+        manifest.inputs,
+        outputs=None,
+        read_only=False,
+        shared_functions=_shared_rw_functions(files, manifest),
     )
+
+
+def _shared_rw_functions(files: dict[str, str], manifest: Manifest) -> frozenset[str]:
+    """rw_* functions defined by the bash code every task may source: lib/*.sh
+    and a bash setup file."""
+    paths = {p for p in files if p.startswith("lib/") and p.endswith(".sh")}
+    if manifest.setup is not None and manifest.setup.file.endswith(".sh"):
+        paths.add(manifest.setup.file)
+    names: set[str] = set()
+    for path in paths:
+        if path in files:
+            names |= static_checks.bash_defined_rw_functions(files[path])
+    return frozenset(names)
 
 
 def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnostic]:
@@ -511,6 +531,7 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
     if manifest.setup is not None:
         shared_paths.add(manifest.setup.file)
     shared_text = "\n".join(files[path] for path in sorted(shared_paths) if path in files)
+    shared_functions = _shared_rw_functions(files, manifest)
     # Capability-level secrets/credentials no task reads; a task that cannot be
     # analysed empties it (unknown counts as used).
     cap_unused_by_all = {
@@ -556,6 +577,7 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
             merged_inputs,
             outputs=task.outputs,
             read_only=task.readOnly,
+            shared_functions=shared_functions,
         )
 
         task_unused, cap_unused = _check_unused_inputs(
@@ -820,7 +842,10 @@ def _check_source(
     declared_inputs: dict[str, InputSpec],
     outputs: dict[str, OutputSpec] | None,
     read_only: bool,
+    shared_functions: frozenset[str] = frozenset(),
 ) -> list[Diagnostic]:
+    """`shared_functions`: rw_* functions lib/ (and setup) define, which a
+    bash task may call without tripping E_UNKNOWN_SDK_HELPER."""
     diagnostics = []
 
     if read_only:
@@ -918,6 +943,19 @@ def _check_source(
                     message=f"rw_input {name!r} has no declared input",
                 )
             )
+    for line, helper in static_checks.bash_unknown_sdk_helpers(source, shared_functions):
+        diagnostics.append(
+            Diagnostic(
+                code=E_UNKNOWN_SDK_HELPER,
+                file=file_path,
+                line=line,
+                message=(
+                    f"{helper!r} is not an SDK helper; rw.sh defines only "
+                    + ", ".join(static_checks.RW_SH_HELPERS)
+                ),
+                hint="severity and other fields go in an output (rw_set/rw_append)",
+            )
+        )
     if outputs is not None:
         for line, out_name in static_checks.bash_output_writes(source):
             if out_name not in outputs:
