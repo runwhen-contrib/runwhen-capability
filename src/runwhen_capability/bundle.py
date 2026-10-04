@@ -83,6 +83,8 @@ from .custom.manifest import (
     Manifest,
     input_env_name,
     is_allowed_path,
+    is_reserved_env_name,
+    legacy_input_env_name,
     python_kwarg_name,
     task_file_language,
 )
@@ -837,7 +839,14 @@ def _execute(
         argv = ["bash", str(files_dir / file_path)]
         env = {**base_env, "RW_SDK": str(rw_sdk_dir)}
         for name, value in resolved_inputs.items():
-            env[input_env_name(name)] = value if isinstance(value, str) else json.dumps(value)
+            text = value if isinstance(value, str) else json.dumps(value)
+            # The legacy (pre-H48) spelling too, for bundles published against it;
+            # never a reserved variable, and the current name wins any clash.
+            legacy = legacy_input_env_name(name)
+            if not is_reserved_env_name(legacy):
+                env.setdefault(legacy, text)
+            if not is_reserved_env_name(input_env_name(name)):
+                env[input_env_name(name)] = text
     else:
         python_kwargs = {python_kwarg_name(name): value for name, value in resolved_inputs.items()}
         # -P: the working directory (the writable scope) is not put on

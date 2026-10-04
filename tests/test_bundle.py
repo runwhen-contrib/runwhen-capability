@@ -262,3 +262,36 @@ def test_a_setup_runs_once_before_the_requested_tasks(tmp_path):
     )
     assert result.setup.status == "ok"
     assert result.tasks[0].status == "ok"
+
+
+_UPPER_INPUT_BUNDLE = {
+    "capability.yaml": (
+        "apiVersion: runwhen.com/custom-capability/v1\n"
+        "name: legacy-upper\n"
+        "appliesTo:\n"
+        "  - { platform: kubernetes, type: statefulset }\n"
+        "tasks:\n"
+        "  - name: show\n"
+        "    file: tasks/show.sh\n"
+        "    readOnly: true\n"
+        "    inputs:\n"
+        "      THRESHOLD: { type: number, default: 1, runtime: true }\n"
+        "      ENV: { type: string, default: prod, runtime: true }\n"
+        "    outputs:\n"
+        '      seen: { schema: "string" }\n'
+    ),
+    # Written against the pre-H48 mapping: THRESHOLD -> T_H_R_E_S_H_O_L_D, ENV -> E_N_V.
+    "tasks/show.sh": (
+        'source "$RW_SDK/rw.sh"\nrw_set seen "\\"t=$T_H_R_E_S_H_O_L_D e=$E_N_V\\""\n'
+    ),
+}
+
+
+def test_a_published_bundle_reading_a_legacy_mangled_env_name_still_runs(tmp_path):
+    # H48 changed input_env_name; bundles published before it read the per-letter
+    # names (the old validator demanded them) and must keep running unchanged.
+    result = _run(_UPPER_INPUT_BUNDLE, ["show"], tmp_path, inputs={"THRESHOLD": 7, "ENV": "stg"})
+    assert result.setup is None or result.setup.status != "failed", result.setup
+    [task] = result.tasks
+    assert task.status == "ok", task
+    assert task.outputs["seen"] == "t=7 e=stg"

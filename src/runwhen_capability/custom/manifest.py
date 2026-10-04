@@ -36,6 +36,20 @@ MAX_BUNDLE_BYTES = 256 * 1024
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
+# The pre-H48 mapping: every capital starts a new word, so an upper-case name was split
+# per letter ("THRESHOLD" -> "T_H_R_E_S_H_O_L_D"). Kept only so bundles published against
+# it keep running; see legacy_input_env_name.
+_LEGACY_CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def legacy_input_env_name(name: str) -> str:
+    """The env var name input_env_name produced before H48. A published bundle is
+    immutable and may read this spelling, so the host still delivers the value under
+    it and validate() still accepts reading it. Equal to input_env_name for every
+    camelCase / snake_case name."""
+    return _LEGACY_CAMEL_RE.sub("_", name).upper()
+
+
 def input_env_name(name: str) -> str:
     """The bash env var a declared input's value arrives on:
     camelCase -> SCREAMING_SNAKE_CASE (e.g. "maxWait" -> "MAX_WAIT",

@@ -6,10 +6,15 @@ with the wheel and sdist attached to the GitHub Release.
 ## Unreleased
 
 ### Fixed
-- An input name that is already upper case (`THRESHOLD`, `DRY_RUN`) keeps its spelling as its env var instead of splitting per letter (`T_H_R_E_S_H_O_L_D`); acronyms split once (`HTTPTimeout` → `HTTP_TIMEOUT`). camelCase and snake_case names map as before.
 
-### Fixed
-
+- An input name that is already upper case (`THRESHOLD`, `DRY_RUN`) keeps its spelling as its env
+  var instead of splitting per letter (`T_H_R_E_S_H_O_L_D`); acronyms split once (`HTTPTimeout` →
+  `HTTP_TIMEOUT`). camelCase and snake_case names map as before. Bundles published against the old
+  spelling keep running: the host still sets the old per-letter name beside the new one, and
+  `validate` still accepts reading it. **Behaviour change for authors:** two inputs that differ
+  only in case (`foo` and `FOO`) now collide (`E_DUPLICATE_NAME`), and an upper-case name that now
+  hits a reserved variable (`ENV`, `USER`, `PATH`, ...) warns and arrives under the old name only;
+  rename it.
 - `validate`: bash variables bound without a plain `name=` at the start of a line are local, not
   undeclared inputs. This covers `read`/`read -a` (including after an env prefix such as
   `while IFS='|' read -ra X`), `mapfile`/`readarray`, `declare`/`typeset` and flag forms of
