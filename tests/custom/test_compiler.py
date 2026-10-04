@@ -22,7 +22,10 @@ def test_compiles_the_pgbouncer_health_fixture():
         }
     ]
     assert compiled["needs"] == {
-        "credentials": [{"name": "kubeconfig", "kind": "k8s.kubeconfig", "optional": False}]
+        "credentials": [
+            {"name": "kubeconfig", "kind": "k8s.kubeconfig", "optional": False},
+            {"name": "statsDsn", "kind": "secret", "optional": True},
+        ]
     }
 
     [task] = compiled["tasks"]
@@ -102,6 +105,31 @@ tasks:
     compiled = compile_manifest(files)
     assert compiled["needs"]["credentials"] == [
         {"name": "kubeconfig", "kind": "k8s.kubeconfig", "optional": False}
+    ]
+
+
+def test_secret_inputs_are_declared_as_secret_credential_needs():
+    """sdlc S-DB (H52): only `type: credential` inputs became needs, so papi never resolved a
+    `type: secret` input and every run failed `no secret resolved`."""
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+inputs:
+  pgPassword: { type: secret }
+tasks:
+  - name: a
+    file: tasks/a.sh
+    readOnly: true
+    inputs:
+      apiToken: { type: secret, optional: true }
+""",
+        "tasks/a.sh": 'cat "$PG_PASSWORD" "$API_TOKEN"\n',
+    }
+    compiled = compile_manifest(files)
+    assert compiled["needs"]["credentials"] == [
+        {"name": "pgPassword", "kind": "secret", "optional": False},
+        {"name": "apiToken", "kind": "secret", "optional": True},
     ]
 
 

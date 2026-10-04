@@ -7,6 +7,8 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Fixed
 
+- **`type: secret` inputs reach the run.** The compiler now declares every `type: secret` input in `needs.credentials` as kind `secret`, so the platform resolves it (from an admin's binding) and the run gets the file. Before, only `type: credential` inputs were declared and a secret input always failed `E_INPUT_TYPE … no secret resolved`.
+- `W_UNUSED_INPUT` now says to remove the unread input; the old wording read like a reason to keep it.
 - An input name that is already upper case (`THRESHOLD`, `DRY_RUN`) keeps its spelling as its env
   var instead of splitting per letter (`T_H_R_E_S_H_O_L_D`); acronyms split once (`HTTPTimeout` →
   `HTTP_TIMEOUT`). camelCase and snake_case names map as before. Bundles published against the old

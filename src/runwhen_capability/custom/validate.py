@@ -666,8 +666,9 @@ def _unused_input_diagnostic(name: str, loc_path: str, line: int | None) -> Diag
         line=line,
         path=loc_path,
         message=(
-            f"{name!r} is declared but never read; it still shows on the trust card "
-            "and narrows where the capability is offered"
+            f"{name!r} is declared but never read; remove it. An unread secret or "
+            "credential is still shown to the approving admin and can stop the "
+            "capability running where it isn't available"
         ),
     )
 

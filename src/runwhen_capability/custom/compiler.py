@@ -54,7 +54,9 @@ def compile_manifest(files: dict[str, str], *, ignore: frozenset[str] = frozense
 
 
 def _needs_credentials(manifest: Manifest) -> list[dict]:
-    """Every `type: credential` input, capability-level and task-level alike,
+    """Every `type: credential` and `type: secret` input (a secret as kind
+    `secret`, which papi resolves from an admin's binding), capability-level
+    and task-level alike,
     deduped by name (first declaration wins -- validate() does not currently
     flag a name redeclared with a different kind/optional, so this is a
     plain first-wins merge, matching how merged_inputs already lets a
@@ -63,8 +65,12 @@ def _needs_credentials(manifest: Manifest) -> list[dict]:
     sources = [manifest.inputs] + [task.inputs for task in manifest.tasks]
     for inputs in sources:
         for name, spec in inputs.items():
-            if spec.type == "credential" and name not in seen:
+            if name in seen:
+                continue
+            if spec.type == "credential":
                 seen[name] = {"name": name, "kind": spec.kind, "optional": spec.optional}
+            elif spec.type == "secret":
+                seen[name] = {"name": name, "kind": "secret", "optional": spec.optional}
     return list(seen.values())
 
 

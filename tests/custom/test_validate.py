@@ -845,8 +845,9 @@ def test_w_unused_input_bash_secret_never_read():
     assert diag.file == "capability.yaml"
     assert diag.line == 4
     assert diag.message == (
-        "'apiToken' is declared but never read; it still shows on the trust card and narrows "
-        "where the capability is offered"
+        "'apiToken' is declared but never read; remove it. An unread secret or credential "
+        "is still shown to the approving admin and can stop the capability running where "
+        "it isn't available"
     )
 
 
