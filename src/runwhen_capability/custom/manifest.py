@@ -29,15 +29,20 @@ MAX_FILE_BYTES = 64 * 1024
 MAX_FILES = 40
 MAX_BUNDLE_BYTES = 256 * 1024
 
-_CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
+# A word boundary is a lower-case letter or digit followed by a capital
+# ("maxWait"), or the last capital of an acronym followed by a lower-case
+# letter ("HTTPTimeout" -> HTTP|Timeout). A run of capitals is one word, so an
+# all-caps name ("THRESHOLD", "DRY_RUN") maps to itself.
+_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def input_env_name(name: str) -> str:
     """The bash env var a declared input's value arrives on:
     camelCase -> SCREAMING_SNAKE_CASE (e.g. "maxWait" -> "MAX_WAIT",
-    "since" -> "SINCE"). Shared between validate.py (E_UNDECLARED_INPUT) and
-    bundle.py (building the child process's environment), so the two never
-    drift apart."""
+    "since" -> "SINCE", "HTTPTimeout" -> "HTTP_TIMEOUT"); a name that is
+    already upper case keeps its spelling ("DRY_RUN" -> "DRY_RUN"). Shared
+    between validate.py (E_UNDECLARED_INPUT) and bundle.py (building the child
+    process's environment), so the two never drift apart."""
     return _CAMEL_RE.sub("_", name).upper()
 
 

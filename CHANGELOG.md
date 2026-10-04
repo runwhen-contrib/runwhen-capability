@@ -6,6 +6,9 @@ with the wheel and sdist attached to the GitHub Release.
 ## Unreleased
 
 ### Fixed
+- An input name that is already upper case (`THRESHOLD`, `DRY_RUN`) keeps its spelling as its env var instead of splitting per letter (`T_H_R_E_S_H_O_L_D`); acronyms split once (`HTTPTimeout` → `HTTP_TIMEOUT`). camelCase and snake_case names map as before.
+
+### Fixed
 
 - `validate`: bash variables bound without a plain `name=` at the start of a line are local, not
   undeclared inputs. This covers `read`/`read -a` (including after an env prefix such as
