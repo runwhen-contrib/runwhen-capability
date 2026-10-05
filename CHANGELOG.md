@@ -79,6 +79,13 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Changed
 
+- **Behaviour change:** a bundle run with an output line that is not a well-formed
+  `rw_set`/`rw_append`/`rw_skip` event now **fails** with `E_OUTPUT_MALFORMED` ("N output line(s)
+  were not a well-formed rw_set/rw_append/rw_skip event and were dropped; an output was lost").
+  Before, the line was dropped with a note and the run still came back `ok`, so a task that hit
+  `bc: command not found` and then wrote `rw_set x ""` passed as evidence. Well-formed lines
+  still populate outputs. A run that calls `rw_skip` is still `skipped`, exactly as with a
+  non-zero exit or a schema violation.
 - **Breaking:** a task that omits `readOnly` (it defaults to false, i.e. "changes things") must now
   either set `readOnly: true` or declare `effects`; otherwise validation fails with
   `E_EFFECTS_REQUIRED`. The check applies when authoring/validating and publishing; the runtime

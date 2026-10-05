@@ -230,13 +230,31 @@ _BASH = 'source "$RW_SDK/rw.sh"\n'
         '{"op": "set", "name": "o", "value": ' + "[" * 100 + "]" * 100 + "}",
     ],
 )
-def test_a_malformed_event_line_is_ignored_not_fatal(tmp_path, line):
+def test_a_malformed_event_line_fails_the_run_but_keeps_good_outputs(tmp_path, line):
+    """A dropped line is a lost output: the run fails (E_OUTPUT_MALFORMED),
+    so it can never count as evidence, but every well-formed line still
+    populates outputs."""
     source = _BASH + f'echo {json.dumps(line)} >&"$RW_OUTPUT_FD"\nrw_set o \'"kept"\'\n'
     result = _run(_files("t.sh", source), tmp_path)
     [task] = result.tasks
-    assert task.status == "ok"
+    assert task.status == "failed"
     assert task.outputs == {"o": "kept"}
-    assert any("were ignored" in e for e in task.errors)
+    [error] = task.errors
+    assert error.startswith("E_OUTPUT_MALFORMED: 1 output line(s)")
+    assert "an output was lost" in error
+    assert task.error == error
+
+
+def test_a_malformed_line_in_a_skipped_run_behaves_like_a_schema_violation(tmp_path):
+    """rw_skip wins over anything that would otherwise fail the run (exit
+    code, schema violation): a malformed line is treated exactly the same."""
+    schema_violation = _BASH + "rw_set o 1\nrw_skip 'nothing here'\n"
+    malformed = _BASH + 'echo "[1, 2]" >&"$RW_OUTPUT_FD"\nrw_skip \'nothing here\'\n'
+    by_schema = _run(_files("t.sh", schema_violation), tmp_path / "a").tasks[0]
+    by_malformed = _run(_files("t.sh", malformed), tmp_path / "b").tasks[0]
+    assert by_schema.status == by_malformed.status == "skipped"
+    assert by_schema.reason == by_malformed.reason == "nothing here"
+    assert by_schema.errors == by_malformed.errors == []
 
 
 @pytest.mark.parametrize(
@@ -252,9 +270,11 @@ def test_a_value_cannot_inject_a_second_event(tmp_path, value):
     source = source.replace("\\n", "\n")  # a real newline inside the value
     result = _run(_files("t.sh", source), tmp_path)
     [task] = result.tasks
-    assert task.status == "ok"
+    # the line is rejected whole: no spoofed skip, and the lost output fails the run
+    assert task.status == "failed"
     assert task.reason is None
     assert task.outputs == {}
+    assert [e.split(":")[0] for e in task.errors] == ["E_OUTPUT_MALFORMED"]
 
 
 def test_an_endless_output_stream_is_capped_and_fails_the_task(tmp_path):

@@ -30,7 +30,10 @@ Warning codes (validate() only; severity "warning", never block a write or a run
 - W_UNUSED_INPUT -- a declared secret/credential input the task never reads.
 
 Runtime codes (the bundle host, bundle.py) reuse the same string constants:
-E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT.
+E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_OUTPUT_MALFORMED, E_TIMEOUT.
+E_OUTPUT_MALFORMED fails a run when a line on the private output channel is not
+a well-formed rw_set/rw_append/rw_skip event (the line is dropped, so an output
+was lost); well-formed lines still populate outputs.
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ W_UNUSED_INPUT = "W_UNUSED_INPUT"
 E_INPUT_TYPE = "E_INPUT_TYPE"
 E_OUTPUT_SCHEMA = "E_OUTPUT_SCHEMA"
 E_OUTPUT_TOO_LARGE = "E_OUTPUT_TOO_LARGE"
+E_OUTPUT_MALFORMED = "E_OUTPUT_MALFORMED"
 E_TIMEOUT = "E_TIMEOUT"
 
 

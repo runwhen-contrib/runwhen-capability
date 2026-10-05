@@ -73,6 +73,7 @@ from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import (
     E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
+    E_OUTPUT_MALFORMED,
     E_OUTPUT_SCHEMA,
     E_OUTPUT_TOO_LARGE,
     E_SCHEMA_FEATURE,
@@ -403,10 +404,13 @@ def _run_setup_or_task(
                 "of output events; everything after that was discarded"
             )
         if stream.malformed:
-            # Noted, not failed: every well-formed line still counts.
+            # Fails the run, like a schema violation: a dropped line is an
+            # output the task meant to produce and didn't, so the result must
+            # not pass as evidence. Every well-formed line still counts.
             errors.append(
-                f"{stream.malformed} output line(s) were not a well-formed "
-                "rw_set/rw_append/rw_skip event and were ignored"
+                f"{E_OUTPUT_MALFORMED}: {stream.malformed} output line(s) were not a "
+                "well-formed rw_set/rw_append/rw_skip event and were dropped; "
+                "an output was lost"
             )
 
         if declared_outputs is not None:
@@ -420,11 +424,11 @@ def _run_setup_or_task(
 
         # A list output cut to fit its size cap is noted in `errors` but does
         # NOT fail the task -- only a non-list output/whole result still over
-        # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code or a schema
-        # violation or a refused schema. Notes (truncation, ignored output
-        # lines) carry no E_ prefix, so this is exactly "every error EXCEPT a
-        # plain note".
-        failing = (E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_SCHEMA_FEATURE)
+        # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code, a schema
+        # violation, a refused schema or a dropped output line
+        # (E_OUTPUT_MALFORMED). Notes (truncation) carry no E_ prefix, so this
+        # is exactly "every error EXCEPT a plain note".
+        failing = (E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_OUTPUT_MALFORMED, E_SCHEMA_FEATURE)
         failed = exit_code != 0 or any(msg.startswith(failing) for msg in errors)
         if failed:
             return _RunOutcome(

@@ -22,6 +22,7 @@ from .diagnostics import (
     E_INPUT_TYPE,
     E_LIMIT,
     E_MANIFEST_SCHEMA,
+    E_OUTPUT_MALFORMED,
     E_OUTPUT_SCHEMA,
     E_OUTPUT_TOO_LARGE,
     E_OUTPUT_UNDECLARED,
@@ -66,5 +67,6 @@ __all__ = [
     "E_INPUT_TYPE",
     "E_OUTPUT_SCHEMA",
     "E_OUTPUT_TOO_LARGE",
+    "E_OUTPUT_MALFORMED",
     "E_TIMEOUT",
 ]
