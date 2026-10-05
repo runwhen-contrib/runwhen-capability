@@ -40,6 +40,7 @@ name: {name}
 tasks:
   - name: hello
     file: tasks/hello.py
+    effects: [Test fixture]
     outputs:
       greeting: {{ schema: "string" }}
 """

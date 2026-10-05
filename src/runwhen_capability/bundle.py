@@ -68,20 +68,26 @@ import jsonschema
 import referencing
 
 from ._redaction import Redactor
-from ._rw_sh import RW_SH
+from ._rw_sh import BASH_ENV_SH, RW_SH
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import (
+    E_COMMAND_NOT_FOUND,
+    E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
+    E_OUTPUT_MALFORMED,
     E_OUTPUT_SCHEMA,
     E_OUTPUT_TOO_LARGE,
     E_SCHEMA_FEATURE,
     E_TIMEOUT,
+    E_UNKNOWN_SDK_HELPER,
 )
 from .custom.hashing import content_hash
 from .custom.manifest import (
     Manifest,
     input_env_name,
     is_allowed_path,
+    is_reserved_env_name,
+    legacy_input_env_name,
     python_kwarg_name,
     task_file_language,
 )
@@ -161,7 +167,12 @@ def run_bundle_request(
         return result
 
     try:
-        compiled = compile_manifest(files)
+        # E_EFFECTS_REQUIRED and E_UNKNOWN_SDK_HELPER are authoring/publish
+        # gates; an already-published (immutable) bundle that predates them must
+        # still run.
+        compiled = compile_manifest(
+            files, ignore=frozenset({E_EFFECTS_REQUIRED, E_UNKNOWN_SDK_HELPER})
+        )
     except CompileError as exc:
         result.setup = SetupResult(status="failed", error=f"invalid bundle: {exc}")
         return result
@@ -176,6 +187,7 @@ def run_bundle_request(
         _materialize(files_dir, files)
         _fresh_dir(rw_sdk_dir, marker="rw.sh")
         _write_private_file(rw_sdk_dir, "rw.sh", RW_SH)
+        _write_private_file(rw_sdk_dir, "bash_env.sh", BASH_ENV_SH)
     except (OSError, ValueError) as exc:
         result.setup = SetupResult(status="failed", error=f"could not write the bundle: {exc}")
         return result
@@ -356,7 +368,17 @@ def _run_setup_or_task(
             return _RunOutcome(status="timeout", error=message, errors=[message], log_tail=log_tail)
 
         events = stream.events
-        skip_event = next((e for e in events if e["op"] == "skip"), None)
+        # Checked before skip: a missing tool is a bug in the task, never
+        # "nothing to check", so a later rw_skip must not turn it into a pass.
+        missing = sorted({e["name"] for e in events if e["op"] == "missing_command"})
+        missing_error = None
+        if missing:
+            names = ", ".join(repr(name) for name in missing)
+            missing_error = (
+                f"{E_COMMAND_NOT_FOUND}: {names} is not on this image; bash carried on "
+                "without it (exit 127). Use a tool the image has"
+            )
+        skip_event = None if missing else next((e for e in events if e["op"] == "skip"), None)
         if skip_event is not None:
             reason = skip_event.get("reason") or ""
             if is_setup:
@@ -385,7 +407,7 @@ def _run_setup_or_task(
             # it is simply dropped rather than failing an otherwise-good result.
             outputs = {name: value for name, value in outputs.items() if name in declared_outputs}
 
-        errors: list[str] = []
+        errors: list[str] = [missing_error] if missing_error else []
         if exit_code != 0:
             errors.append(f"process exited {exit_code}")
         if stream.overflowed:
@@ -394,10 +416,13 @@ def _run_setup_or_task(
                 "of output events; everything after that was discarded"
             )
         if stream.malformed:
-            # Noted, not failed: every well-formed line still counts.
+            # Fails the run, like a schema violation: a dropped line is an
+            # output the task meant to produce and didn't, so the result must
+            # not pass as evidence. Every well-formed line still counts.
             errors.append(
-                f"{stream.malformed} output line(s) were not a well-formed "
-                "rw_set/rw_append/rw_skip event and were ignored"
+                f"{E_OUTPUT_MALFORMED}: {stream.malformed} output line(s) were not a "
+                "well-formed rw_set/rw_append/rw_skip event and were dropped; "
+                "an output was lost"
             )
 
         if declared_outputs is not None:
@@ -411,11 +436,17 @@ def _run_setup_or_task(
 
         # A list output cut to fit its size cap is noted in `errors` but does
         # NOT fail the task -- only a non-list output/whole result still over
-        # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code or a schema
-        # violation or a refused schema. Notes (truncation, ignored output
-        # lines) carry no E_ prefix, so this is exactly "every error EXCEPT a
-        # plain note".
-        failing = (E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_SCHEMA_FEATURE)
+        # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code, a schema
+        # violation, a refused schema or a dropped output line
+        # (E_OUTPUT_MALFORMED). Notes (truncation) carry no E_ prefix, so this
+        # is exactly "every error EXCEPT a plain note".
+        failing = (
+            E_OUTPUT_SCHEMA,
+            E_OUTPUT_TOO_LARGE,
+            E_OUTPUT_MALFORMED,
+            E_COMMAND_NOT_FOUND,
+            E_SCHEMA_FEATURE,
+        )
         failed = exit_code != 0 or any(msg.startswith(failing) for msg in errors)
         if failed:
             return _RunOutcome(
@@ -774,6 +805,8 @@ def _is_event(event: Any) -> bool:
         return event.keys() == {"op", "name", "value"} and isinstance(event["name"], str)
     if op == "skip":
         return event.keys() <= {"op", "reason"} and isinstance(event.get("reason", ""), str)
+    if op == "missing_command":
+        return event.keys() == {"op", "name"} and isinstance(event["name"], str)
     return False
 
 
@@ -832,9 +865,21 @@ def _execute(
 
     if language == "bash":
         argv = ["bash", str(files_dir / file_path)]
-        env = {**base_env, "RW_SDK": str(rw_sdk_dir)}
+        env = {
+            **base_env,
+            "RW_SDK": str(rw_sdk_dir),
+            # command_not_found_handle (E_COMMAND_NOT_FOUND), read before the task runs.
+            "BASH_ENV": str(rw_sdk_dir / "bash_env.sh"),
+        }
         for name, value in resolved_inputs.items():
-            env[input_env_name(name)] = value if isinstance(value, str) else json.dumps(value)
+            text = value if isinstance(value, str) else json.dumps(value)
+            # The legacy (pre-H48) spelling too, for bundles published against it;
+            # never a reserved variable, and the current name wins any clash.
+            legacy = legacy_input_env_name(name)
+            if not is_reserved_env_name(legacy):
+                env.setdefault(legacy, text)
+            if not is_reserved_env_name(input_env_name(name)):
+                env[input_env_name(name)] = text
     else:
         python_kwargs = {python_kwarg_name(name): value for name, value in resolved_inputs.items()}
         # -P: the working directory (the writable scope) is not put on

@@ -16,11 +16,27 @@ Static codes (validate() only, no execution):
 - E_READONLY_WRITE -- kubectl delete/apply/patch/edit/scale/rollout restart/exec
   and similar in a readOnly task.
 - E_DUPLICATE_NAME -- a name is used twice.
+- E_EFFECTS_REQUIRED -- a task that isn't readOnly declares no effects.
+- E_UNKNOWN_SDK_HELPER -- a bash task calls an `rw_*` command rw.sh doesn't define
+  (only rw_input, rw_append, rw_set and rw_skip exist) and the script doesn't
+  define itself. An authoring gate: the bundle host ignores it at run time.
 - E_SCHEMA_FEATURE -- a schema uses a JSON Schema feature custom tasks may not
   use (regex keywords: `pattern`, `patternProperties`).
 
+Warning codes (validate() only; severity "warning", never block a write or a run):
+
+- W_DATA_AS_CODE -- a task builds a command from text (bash `eval`/`sh -c` with an
+  expansion, awk `system(`/`getline`, Python `shell=True`/`os.system`).
+- W_UNUSED_INPUT -- a declared secret/credential input the task never reads.
+
 Runtime codes (the bundle host, bundle.py) reuse the same string constants:
-E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_TIMEOUT.
+E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_OUTPUT_MALFORMED,
+E_COMMAND_NOT_FOUND, E_TIMEOUT.
+E_OUTPUT_MALFORMED fails a run when a line on the private output channel is not
+a well-formed rw_set/rw_append/rw_skip event (the line is dropped, so an output
+was lost); well-formed lines still populate outputs.
+E_COMMAND_NOT_FOUND fails a bash task that ran a command the image doesn't have
+(bash's command_not_found_handle reports it), even if the task then skips.
 """
 
 from __future__ import annotations
@@ -42,11 +58,19 @@ E_OUTPUT_UNDECLARED = "E_OUTPUT_UNDECLARED"
 E_READONLY_WRITE = "E_READONLY_WRITE"
 E_DUPLICATE_NAME = "E_DUPLICATE_NAME"
 E_SCHEMA_FEATURE = "E_SCHEMA_FEATURE"
+E_EFFECTS_REQUIRED = "E_EFFECTS_REQUIRED"
+E_UNKNOWN_SDK_HELPER = "E_UNKNOWN_SDK_HELPER"
+
+# -- warning codes: validate() ---------------------------------------------------
+W_DATA_AS_CODE = "W_DATA_AS_CODE"
+W_UNUSED_INPUT = "W_UNUSED_INPUT"
 
 # -- runtime codes: the bundle host (bundle.py) --------------------------------
 E_INPUT_TYPE = "E_INPUT_TYPE"
 E_OUTPUT_SCHEMA = "E_OUTPUT_SCHEMA"
 E_OUTPUT_TOO_LARGE = "E_OUTPUT_TOO_LARGE"
+E_OUTPUT_MALFORMED = "E_OUTPUT_MALFORMED"
+E_COMMAND_NOT_FOUND = "E_COMMAND_NOT_FOUND"
 E_TIMEOUT = "E_TIMEOUT"
 
 

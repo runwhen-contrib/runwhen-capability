@@ -31,9 +31,16 @@ set -u
 
 rw_input() {
     # The env var name is derived exactly as the host derives it from the
-    # manifest's input name: an underscore before every capital letter but
-    # the first, then upper-cased ("maxWait" -> MAX_WAIT).
-    local name="${1:-}" env_name="" ch i
+    # manifest's input name (manifest.input_env_name): an underscore where a
+    # lower-case letter or digit meets a capital ("maxWait" -> MAX_WAIT) and
+    # before the last capital of a run followed by a lower-case letter
+    # ("HTTPTimeout" -> HTTP_TIMEOUT), then upper-cased; a run of capitals is
+    # one word ("THRESHOLD" -> THRESHOLD). If that variable is unset, the
+    # legacy name -- an underscore before every capital but the first, the
+    # only one an older host sets ("THRESHOLD" -> T_H_R_E_S_H_O_L_D) -- is
+    # read instead.
+    local name="${1:-}" env_name="" legacy_name="" ch prev next i
+    local upper=ABCDEFGHIJKLMNOPQRSTUVWXYZ lower=abcdefghijklmnopqrstuvwxyz
     case "$name" in
         [A-Za-z]*) ;;
         *) printf 'rw_input: invalid input name %s\n' "$name" >&2; return 1 ;;
@@ -43,13 +50,26 @@ rw_input() {
     esac
     for (( i = 0; i < ${#name}; i++ )); do
         ch=${name:i:1}
-        case "$ch" in
-            [ABCDEFGHIJKLMNOPQRSTUVWXYZ]) if (( i > 0 )); then env_name+="_"; fi ;;
-        esac
+        if (( i > 0 )) && [[ $upper == *"$ch"* ]]; then
+            legacy_name+="_"
+            prev=${name:i-1:1}
+            next=${name:i+1:1}
+            if [[ $lower$'0123456789' == *"$prev"* ]]; then
+                env_name+="_"
+            elif [[ $upper == *"$prev"* && -n $next && $lower == *"$next"* ]]; then
+                env_name+="_"
+            fi
+        fi
         env_name+=$ch
+        legacy_name+=$ch
     done
-    env_name=$(printf '%s' "$env_name" | tr '[:lower:]' '[:upper:]')
-    printf '%s' "${!env_name-}"
+    env_name=$(printf '%s' "$env_name" | tr "$lower" "$upper")
+    legacy_name=$(printf '%s' "$legacy_name" | tr "$lower" "$upper")
+    if [[ -n ${!env_name+set} ]]; then
+        printf '%s' "${!env_name}"
+    else
+        printf '%s' "${!legacy_name-}"
+    fi
 }
 
 rw_append() {
@@ -83,5 +103,25 @@ _rw_json_string() {
     s=${s//$'\r'/\\r}
     s=${s//$'\t'/\\t}
     printf '"%s"' "$s"
+}
+"""
+
+
+#: Read by every bash task through BASH_ENV (bundle.py sets it), before the
+#: task's first line, so it applies whether or not the task sources rw.sh.
+#: When the task runs a command the image doesn't have, bash calls
+#: command_not_found_handle instead of only printing "command not found" and
+#: carrying on: it tells the host on the private output channel, and the host
+#: fails the run with E_COMMAND_NOT_FOUND. `command -v`/`type` only ask, so a
+#: task can still probe for an optional tool. The name is reduced to a safe
+#: alphabet so the line is always valid JSON.
+BASH_ENV_SH = r"""command_not_found_handle() {
+    local name="${1:0:128}"
+    printf 'rw: %s: command not found on this image\n' "$name" >&2
+    if [[ -n "${RW_OUTPUT_FD:-}" ]]; then
+        name="${name//[^A-Za-z0-9._+-]/?}"
+        printf '{"op":"missing_command","name":"%s"}\n' "$name" >&"$RW_OUTPUT_FD" 2>/dev/null
+    fi
+    return 127
 }
 """

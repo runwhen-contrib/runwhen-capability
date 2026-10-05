@@ -20,6 +20,9 @@ from runwhen_capability.custom.diagnostics import (
     E_SCHEMA_NOTATION,
     E_TASK_FILE_MISSING,
     E_UNDECLARED_INPUT,
+    E_UNKNOWN_SDK_HELPER,
+    W_DATA_AS_CODE,
+    W_UNUSED_INPUT,
 )
 
 BASE_MANIFEST = """\
@@ -403,6 +406,7 @@ name: x
 tasks:
   - name: t
     file: tasks/t.sh
+    effects: [Test fixture]
     outputs:
       message: { schema: "string" }
 """,
@@ -563,6 +567,7 @@ name: x
 tasks:
   - name: t
     file: tasks/{file}
+    effects: [Test fixture]
     outputs:
       o: {{ schema: "{schema}" }}
 """
@@ -756,3 +761,308 @@ def test_a_mutating_command_in_a_setup_outside_lib_fails_a_read_only_task():
 def test_shared_code_may_mutate_when_no_task_is_read_only():
     files = _shared_code_bundle(read_only="false", **{"lib/helpers.sh": "kubectl delete pod x\n"})
     assert E_READONLY_WRITE not in _codes(files)
+
+
+# -- warnings: W_DATA_AS_CODE and W_UNUSED_INPUT ------------------------------
+
+_WARN_MANIFEST = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: w
+inputs:
+{inputs}
+tasks:
+  - name: t
+    file: {file}
+    readOnly: true
+"""
+
+
+def _warn_bundle(file: str, source: str, inputs: str = "  {}") -> dict[str, str]:
+    inputs_block = (
+        inputs if inputs.strip() != "{}" else "  unused: { type: string, optional: true }"
+    )
+    return {
+        "capability.yaml": _WARN_MANIFEST.format(inputs=inputs_block, file=file),
+        file: source,
+    }
+
+
+def _of(files, code):
+    return [d for d in validate(files) if d.code == code]
+
+
+def test_w_data_as_code_is_a_warning_with_file_line_and_hint():
+    files = _warn_bundle("tasks/t.sh", 'echo start\neval "$CMD"\n')
+    (diag,) = _of(files, W_DATA_AS_CODE)
+    assert (diag.severity, diag.file, diag.line) == ("warning", "tasks/t.sh", 2)
+    assert diag.message == (
+        "eval runs text as a command; if that text comes from data (a log line, an API body), "
+        "a quote breaks it and the data can run commands"
+    )
+    assert diag.hint == "pass data as data: environment variables, stdin, jq --arg, or Python"
+
+
+def test_w_data_as_code_flags_the_sdlc_t4_awk_getline():
+    src = (
+        "DETAILS=$(awk '\n"
+        '  { cmd = "printf \\047%s\\047 \\047" $0 "\\047 | jq -r \\047.kind\\047"\n'
+        "    cmd | getline kv\n"
+        '    close(cmd) }\' "$CAUSES_FILE")\n'
+    )
+    (diag,) = _of(_warn_bundle("tasks/t.sh", src), W_DATA_AS_CODE)
+    assert diag.line == 3
+
+
+def test_w_data_as_code_not_raised_for_safe_bash():
+    src = "awk '{print $1}' f\njq -n --arg a \"$X\" '$a'\nbash -c 'echo fixed'\n"
+    assert _of(_warn_bundle("tasks/t.sh", src), W_DATA_AS_CODE) == []
+
+
+def test_w_data_as_code_flags_python_shell_true_and_os_system():
+    src = (
+        "import os, subprocess\ndef main(ctx):\n"
+        "    subprocess.run('x', shell=True)\n    os.system('y')\n"
+    )
+    diags = _of(_warn_bundle("tasks/t.py", src), W_DATA_AS_CODE)
+    assert [(d.severity, d.line) for d in diags] == [("warning", 3), ("warning", 4)]
+
+
+def test_w_data_as_code_not_raised_for_python_argv_lists():
+    src = "import subprocess\ndef main(ctx):\n    subprocess.run(['ls'])\n"
+    assert _of(_warn_bundle("tasks/t.py", src), W_DATA_AS_CODE) == []
+
+
+def test_data_as_code_is_not_checked_in_a_python_tasks_bash_text():
+    # a Python task mentioning eval in a string is not a bash eval
+    src = "def main(ctx):\n    return {'s': 'eval $x'}\n"
+    assert _of(_warn_bundle("tasks/t.py", src), W_DATA_AS_CODE) == []
+
+
+def test_w_unused_input_bash_secret_never_read():
+    files = _warn_bundle("tasks/t.sh", "echo hi\n", "  apiToken: { type: secret }")
+    (diag,) = _of(files, W_UNUSED_INPUT)
+    assert diag.severity == "warning"
+    assert diag.file == "capability.yaml"
+    assert diag.line == 4
+    assert diag.message == (
+        "'apiToken' is declared but never read; remove it. An unread secret or credential "
+        "is still shown to the approving admin and can stop the capability running where "
+        "it isn't available"
+    )
+
+
+def test_w_unused_input_bash_read_by_env_or_rw_input_is_clean():
+    for src in ('curl -H "$API_TOKEN"\n', "x=$(rw_input apiToken)\n"):
+        files = _warn_bundle("tasks/t.sh", src, "  apiToken: { type: secret }")
+        assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_w_unused_input_only_applies_to_secret_and_credential():
+    files = _warn_bundle("tasks/t.sh", "echo hi\n", "  n: { type: integer, default: 1 }")
+    assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_w_unused_input_python_param_never_used_in_body():
+    src = "def main(ctx, api_token):\n    return {}\n"
+    files = _warn_bundle("tasks/t.py", src, "  apiToken: { type: secret }")
+    assert len(_of(files, W_UNUSED_INPUT)) == 1
+    used = "def main(ctx, api_token):\n    return {'t': api_token}\n"
+    files = _warn_bundle("tasks/t.py", used, "  apiToken: { type: secret }")
+    assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_w_unused_input_sdlc_t9b_python_http_task_with_unused_kubeconfig():
+    src = (
+        "import urllib.request\n"
+        "def main(ctx, url):\n"
+        "    return {'body': urllib.request.urlopen(url).read().decode()}\n"
+    )
+    files = _warn_bundle(
+        "tasks/t.py",
+        src,
+        "  kubeconfig: { type: credential, kind: k8s.kubeconfig }\n  url: { type: string }",
+    )
+    (diag,) = _of(files, W_UNUSED_INPUT)
+    assert "'kubeconfig'" in diag.message
+
+
+@pytest.mark.parametrize(
+    ("file", "src"),
+    [
+        ("tasks/t.sh", "kubectl get pods\n"),
+        (
+            "tasks/t.py",
+            "import subprocess\ndef main(ctx):\n    subprocess.run(['kubectl', 'get', 'pods'])\n",
+        ),
+    ],
+)
+def test_a_kubeconfig_credential_counts_as_used_when_the_task_calls_kubectl(file, src):
+    files = _warn_bundle(file, src, "  kubeconfig: { type: credential, kind: k8s.kubeconfig }")
+    assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_the_kubectl_exception_is_only_for_kubeconfig_credentials():
+    files = _warn_bundle("tasks/t.sh", "kubectl get pods\n", "  dsn: { type: secret }")
+    assert len(_of(files, W_UNUSED_INPUT)) == 1
+
+
+def test_a_task_level_unused_input_points_at_the_task_inputs_line():
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\nname: w\ntasks:\n"
+            "  - name: t\n    file: tasks/t.sh\n    readOnly: true\n    inputs:\n"
+            "      tok: { type: secret }\n"
+        ),
+        "tasks/t.sh": "echo hi\n",
+    }
+    (diag,) = _of(files, W_UNUSED_INPUT)
+    assert diag.line == 8
+
+
+def test_a_capability_input_used_by_the_setup_file_is_not_reported():
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\nname: w\n"
+            "inputs:\n  tok: { type: secret }\n"
+            "setup: { file: lib/setup.py }\n"
+            "tasks:\n  - name: t\n    file: tasks/t.sh\n    readOnly: true\n"
+        ),
+        "tasks/t.sh": "echo hi\n",
+        "lib/setup.py": "def main(ctx):\n    ctx.credential('tok')\n",
+    }
+    assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_the_new_warnings_never_count_as_errors():
+    files = _warn_bundle(
+        "tasks/t.sh", 'eval "$DSN"\n', "  dsn: { type: string }\n  tok: { type: secret }"
+    )
+    diagnostics = validate(files)
+    assert {W_DATA_AS_CODE, W_UNUSED_INPUT} <= {d.code for d in diagnostics}
+    assert all(d.severity == "warning" for d in diagnostics)
+
+
+def _two_task_bundle(a_src: str, b_src: str, inputs: str) -> dict[str, str]:
+    return {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\nname: w\ninputs:\n"
+            f"{inputs}\ntasks:\n"
+            "  - name: a\n    file: tasks/a.sh\n    readOnly: true\n"
+            "  - name: b\n    file: tasks/b.sh\n    readOnly: true\n"
+        ),
+        "tasks/a.sh": a_src,
+        "tasks/b.sh": b_src,
+    }
+
+
+def test_a_capability_secret_read_by_only_some_tasks_is_not_reported():
+    files = _two_task_bundle('echo "$TOK"\n', "echo hi\n", "  tok: { type: secret }")
+    assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_a_capability_secret_no_task_reads_warns_once():
+    files = _two_task_bundle("echo a\n", "echo b\n", "  tok: { type: secret }")
+    (diag,) = _of(files, W_UNUSED_INPUT)
+    assert (diag.path, diag.line) == ("inputs.tok", 4)
+
+
+def test_task_level_unused_inputs_still_warn_per_task():
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\nname: w\ntasks:\n"
+            "  - name: a\n    file: tasks/a.sh\n    readOnly: true\n    inputs:\n"
+            "      tok: { type: secret }\n"
+            "  - name: b\n    file: tasks/b.sh\n    readOnly: true\n    inputs:\n"
+            "      tok: { type: secret }\n"
+        ),
+        "tasks/a.sh": "echo a\n",
+        "tasks/b.sh": 'echo "$TOK"\n',
+    }
+    assert [d.path for d in _of(files, W_UNUSED_INPUT)] == ["tasks[0].inputs.tok"]
+
+
+# -- E_UNKNOWN_SDK_HELPER: an rw_* call rw.sh doesn't define (H51) ---------------
+
+_HELPER_MANIFEST = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+    readOnly: true
+    outputs:
+      severity: { schema: "integer" }
+"""
+
+
+def _helper_bundle(source: str, **extra) -> dict[str, str]:
+    return {"capability.yaml": _HELPER_MANIFEST, "tasks/t.sh": source, **extra}
+
+
+def test_e_unknown_sdk_helper_flags_the_sdlc_rw_set_severity_call():
+    src = 'source "$RW_SDK/rw.sh"\necho start\nrw_set_severity 3\n'
+    (diag,) = _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER)
+    assert (diag.severity, diag.file, diag.line) == ("error", "tasks/t.sh", 3)
+    assert "rw_set_severity" in diag.message
+    for real in ("rw_input", "rw_append", "rw_set", "rw_skip"):
+        assert real in diag.message
+    assert diag.hint == "severity and other fields go in an output (rw_set/rw_append)"
+
+
+def test_e_unknown_sdk_helper_in_every_command_position():
+    src = (
+        "x=$(rw_get_thing a)\nif rw_check; then :; fi\ntrue && rw_emit 1\n"
+        "echo hi | rw_pipe\ny=`rw_tick`\n"
+    )
+    names = sorted(d.message.split("'")[1] for d in _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER))
+    assert names == ["rw_check", "rw_emit", "rw_get_thing", "rw_pipe", "rw_tick"]
+
+
+def test_e_unknown_sdk_helper_ignores_real_helpers_comments_heredocs_and_quotes():
+    src = (
+        "rw_set severity 1\nrw_append severity 2\nv=$(rw_input x)\nrw_skip done\n"
+        "# rw_set_severity 3 would be wrong\n"
+        "cat <<EOF\nrw_set_severity 3\nEOF\n"
+        "echo 'rw_set_severity 3'\n"
+        'echo "do not call rw_set_severity; ever"\n'
+        'rw_sdk_dir=/x\necho "$rw_sdk_dir"\n'
+    )
+    assert _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER) == []
+
+
+def test_e_unknown_sdk_helper_ignores_functions_the_script_defines():
+    src = (
+        'rw_emit_sev() {\n  rw_set severity "$1"\n}\n'
+        'function rw_note { echo "$1"; }\n'
+        "rw_emit_sev 2\nrw_note hi\n"
+    )
+    assert _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER) == []
+
+
+def test_e_unknown_sdk_helper_ignores_functions_a_lib_file_defines():
+    files = _helper_bundle(
+        'source "$RW_SDK/../lib/util.sh"\nrw_emit_sev 2\n',
+        **{"lib/util.sh": 'rw_emit_sev() { rw_set severity "$1"; }\n'},
+    )
+    assert _of(files, E_UNKNOWN_SDK_HELPER) == []
+
+
+def test_e_unknown_sdk_helper_is_not_checked_in_python():
+    src = "def main(ctx):\n    rw_set_severity = 1\n    return {}\n"
+    files = {
+        "capability.yaml": _HELPER_MANIFEST.replace("t.sh", "t.py"),
+        "tasks/t.py": src,
+    }
+    assert _of(files, E_UNKNOWN_SDK_HELPER) == []
+
+
+# -- W_UNUSED_INPUT: reading an input under its legacy env name (H51) -----------
+
+
+def test_w_unused_input_accepts_a_read_under_the_legacy_env_name():
+    # `ENV` maps to the reserved $ENV, so the reserved-name warning tells the
+    # author to read the legacy spelling $E_N_V -- that read counts.
+    files = _warn_bundle("tasks/t.sh", 'curl -H "$E_N_V"\n', "  ENV: { type: secret }")
+    assert _of(files, W_UNUSED_INPUT) == []
+    files = _warn_bundle("tasks/t.sh", 'curl -H "$T_O_K_E_N"\n', "  TOKEN: { type: secret }")
+    assert _of(files, W_UNUSED_INPUT) == []

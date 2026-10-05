@@ -31,9 +31,12 @@ class CompileError(RuntimeError):
         super().__init__(summary)
 
 
-def compile_manifest(files: dict[str, str]) -> dict:
+def compile_manifest(files: dict[str, str], *, ignore: frozenset[str] = frozenset()) -> dict:
+    """Compile a bundle, refusing on any error-severity diagnostic whose code
+    is not in `ignore`. The runtime bundle host passes authoring-only gates
+    (E_EFFECTS_REQUIRED) here so an already-published bundle still runs."""
     diagnostics = validate(files)
-    if any(d.severity == "error" for d in diagnostics):
+    if any(d.severity == "error" and d.code not in ignore for d in diagnostics):
         raise CompileError(diagnostics)
 
     # validate() already proved capability.yaml parses and matches Manifest,
@@ -51,7 +54,9 @@ def compile_manifest(files: dict[str, str]) -> dict:
 
 
 def _needs_credentials(manifest: Manifest) -> list[dict]:
-    """Every `type: credential` input, capability-level and task-level alike,
+    """Every `type: credential` and `type: secret` input (a secret as kind
+    `secret`, which papi resolves from an admin's binding), capability-level
+    and task-level alike,
     deduped by name (first declaration wins -- validate() does not currently
     flag a name redeclared with a different kind/optional, so this is a
     plain first-wins merge, matching how merged_inputs already lets a
@@ -60,8 +65,12 @@ def _needs_credentials(manifest: Manifest) -> list[dict]:
     sources = [manifest.inputs] + [task.inputs for task in manifest.tasks]
     for inputs in sources:
         for name, spec in inputs.items():
-            if spec.type == "credential" and name not in seen:
+            if name in seen:
+                continue
+            if spec.type == "credential":
                 seen[name] = {"name": name, "kind": spec.kind, "optional": spec.optional}
+            elif spec.type == "secret":
+                seen[name] = {"name": name, "kind": "secret", "optional": spec.optional}
     return list(seen.values())
 
 
@@ -75,6 +84,7 @@ def _compile_task(files: dict[str, str], manifest: Manifest, task: TaskSpec) -> 
         "name": task.name,
         "description": task.description,
         "readOnly": task.readOnly,
+        "effects": [effect for effect in task.effects if effect.strip()],
         "file": task.file,
         "inputs": {name: spec.model_dump(mode="json") for name, spec in merged_inputs.items()},
         "outputs": {
