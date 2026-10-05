@@ -32,7 +32,6 @@ from .diagnostics import (
     E_UNDECLARED_INPUT,
     E_UNKNOWN_SDK_HELPER,
     W_DATA_AS_CODE,
-    W_UNKNOWN_COMMAND,
     W_UNUSED_INPUT,
     Diagnostic,
 )
@@ -53,7 +52,6 @@ from .manifest import (
     python_kwarg_name,
     task_file_language,
 )
-from .runtime_commands import SUBSTITUTES
 from .schema_features import REGEX_HINT, REGEX_KEYWORDS, regex_keyword_paths
 from .schema_notation import SchemaNotationError, compile_schema_notation
 from .yaml_lines import line_of, load_with_lines
@@ -165,7 +163,6 @@ def _validate(files: dict[str, str]) -> list[Diagnostic]:
     diagnostics += _check_setup_file(files, raw, manifest)
     diagnostics += _check_tasks(files, raw, manifest)
     diagnostics += _check_read_only_shared_code(files, manifest)
-    diagnostics += _check_unknown_commands(files, manifest)
     return diagnostics
 
 
@@ -704,46 +701,6 @@ def _check_read_only_shared_code(files: dict[str, str], manifest: Manifest) -> l
                     message=(
                         f"{call!r} mutates cluster state, but {path} runs as part of "
                         f"readOnly task(s) {names}"
-                    ),
-                )
-            )
-    return diagnostics
-
-
-def _check_unknown_commands(files: dict[str, str], manifest: Manifest) -> list[Diagnostic]:
-    """W_UNKNOWN_COMMAND for every bash file a task runs -- each task's own
-    file, a bash setup file and lib/*.sh -- once per file however many tasks
-    share it. A function any .sh file in the bundle defines counts as known
-    everywhere: lib/ and setup define them for tasks, and which file sources
-    which is not tracked."""
-    paths = {task.file for task in manifest.tasks if task.file.endswith(".sh")}
-    paths |= {p for p in files if p.startswith("lib/") and p.endswith(".sh")}
-    if manifest.setup is not None and manifest.setup.file.endswith(".sh"):
-        paths.add(manifest.setup.file)
-    defined: set[str] = set()
-    for path in files:
-        if path.endswith(".sh"):
-            defined |= static_checks.bash_defined_functions(files[path])
-    diagnostics = []
-    for path in sorted(p for p in paths if p in files):
-        for line, name in static_checks.bash_unknown_commands(files[path], frozenset(defined)):
-            substitute = SUBSTITUTES.get(name)
-            advice = (
-                f"use {substitute} or a tool listed in the authoring README"
-                if substitute
-                else "use a tool that ships there (see the authoring README)"
-            )
-            diagnostics.append(
-                Diagnostic(
-                    code=W_UNKNOWN_COMMAND,
-                    severity="warning",
-                    file=path,
-                    line=line,
-                    message=f"{name!r} is not on the rw-task image; {advice}",
-                    hint=(
-                        "the image has bash, coreutils, grep, sed, awk, find, xargs, tar, gzip, "
-                        "curl, jq, yq, kubectl, psql, redis-cli, openssl and python3; "
-                        "a command it lacks fails with exit 127 and the script carries on"
                     ),
                 )
             )
