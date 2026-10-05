@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from .compiler import CompileError, compile_manifest
 from .diagnostics import (
+    E_COMMAND_NOT_FOUND,
     E_DUPLICATE_NAME,
     E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
@@ -67,6 +68,7 @@ __all__ = [
     "E_INPUT_TYPE",
     "E_OUTPUT_SCHEMA",
     "E_OUTPUT_TOO_LARGE",
+    "E_COMMAND_NOT_FOUND",
     "E_OUTPUT_MALFORMED",
     "E_TIMEOUT",
 ]

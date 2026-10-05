@@ -86,6 +86,13 @@ with the wheel and sdist attached to the GitHub Release.
   `bc: command not found` and then wrote `rw_set x ""` passed as evidence. Well-formed lines
   still populate outputs. A run that calls `rw_skip` is still `skipped`, exactly as with a
   non-zero exit or a schema violation.
+- **Behaviour change:** a bash task that runs a command the image doesn't have now **fails** with
+  `E_COMMAND_NOT_FOUND` ("'bc' is not on this image; bash carried on without it (exit 127)").
+  The host sets `BASH_ENV` to a file defining bash's `command_not_found_handle`, which reports
+  the name on the private output channel, so it works whether or not the task sources `rw.sh` and
+  needs no list of tools: the image itself answers. A later `rw_skip` does not hide it (a missing
+  tool is a bug in the task, not "nothing to check"); well-formed outputs are kept. `command -v`
+  and `type` only ask, so probing for an optional tool still works.
 - **Breaking:** a task that omits `readOnly` (it defaults to false, i.e. "changes things") must now
   either set `readOnly: true` or declare `effects`; otherwise validation fails with
   `E_EFFECTS_REQUIRED`. The check applies when authoring/validating and publishing; the runtime

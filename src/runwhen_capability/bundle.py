@@ -68,9 +68,10 @@ import jsonschema
 import referencing
 
 from ._redaction import Redactor
-from ._rw_sh import RW_SH
+from ._rw_sh import BASH_ENV_SH, RW_SH
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import (
+    E_COMMAND_NOT_FOUND,
     E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
     E_OUTPUT_MALFORMED,
@@ -186,6 +187,7 @@ def run_bundle_request(
         _materialize(files_dir, files)
         _fresh_dir(rw_sdk_dir, marker="rw.sh")
         _write_private_file(rw_sdk_dir, "rw.sh", RW_SH)
+        _write_private_file(rw_sdk_dir, "bash_env.sh", BASH_ENV_SH)
     except (OSError, ValueError) as exc:
         result.setup = SetupResult(status="failed", error=f"could not write the bundle: {exc}")
         return result
@@ -366,7 +368,17 @@ def _run_setup_or_task(
             return _RunOutcome(status="timeout", error=message, errors=[message], log_tail=log_tail)
 
         events = stream.events
-        skip_event = next((e for e in events if e["op"] == "skip"), None)
+        # Checked before skip: a missing tool is a bug in the task, never
+        # "nothing to check", so a later rw_skip must not turn it into a pass.
+        missing = sorted({e["name"] for e in events if e["op"] == "missing_command"})
+        missing_error = None
+        if missing:
+            names = ", ".join(repr(name) for name in missing)
+            missing_error = (
+                f"{E_COMMAND_NOT_FOUND}: {names} is not on this image; bash carried on "
+                "without it (exit 127). Use a tool the image has"
+            )
+        skip_event = None if missing else next((e for e in events if e["op"] == "skip"), None)
         if skip_event is not None:
             reason = skip_event.get("reason") or ""
             if is_setup:
@@ -395,7 +407,7 @@ def _run_setup_or_task(
             # it is simply dropped rather than failing an otherwise-good result.
             outputs = {name: value for name, value in outputs.items() if name in declared_outputs}
 
-        errors: list[str] = []
+        errors: list[str] = [missing_error] if missing_error else []
         if exit_code != 0:
             errors.append(f"process exited {exit_code}")
         if stream.overflowed:
@@ -428,7 +440,13 @@ def _run_setup_or_task(
         # violation, a refused schema or a dropped output line
         # (E_OUTPUT_MALFORMED). Notes (truncation) carry no E_ prefix, so this
         # is exactly "every error EXCEPT a plain note".
-        failing = (E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_OUTPUT_MALFORMED, E_SCHEMA_FEATURE)
+        failing = (
+            E_OUTPUT_SCHEMA,
+            E_OUTPUT_TOO_LARGE,
+            E_OUTPUT_MALFORMED,
+            E_COMMAND_NOT_FOUND,
+            E_SCHEMA_FEATURE,
+        )
         failed = exit_code != 0 or any(msg.startswith(failing) for msg in errors)
         if failed:
             return _RunOutcome(
@@ -787,6 +805,8 @@ def _is_event(event: Any) -> bool:
         return event.keys() == {"op", "name", "value"} and isinstance(event["name"], str)
     if op == "skip":
         return event.keys() <= {"op", "reason"} and isinstance(event.get("reason", ""), str)
+    if op == "missing_command":
+        return event.keys() == {"op", "name"} and isinstance(event["name"], str)
     return False
 
 
@@ -845,7 +865,12 @@ def _execute(
 
     if language == "bash":
         argv = ["bash", str(files_dir / file_path)]
-        env = {**base_env, "RW_SDK": str(rw_sdk_dir)}
+        env = {
+            **base_env,
+            "RW_SDK": str(rw_sdk_dir),
+            # command_not_found_handle (E_COMMAND_NOT_FOUND), read before the task runs.
+            "BASH_ENV": str(rw_sdk_dir / "bash_env.sh"),
+        }
         for name, value in resolved_inputs.items():
             text = value if isinstance(value, str) else json.dumps(value)
             # The legacy (pre-H48) spelling too, for bundles published against it;

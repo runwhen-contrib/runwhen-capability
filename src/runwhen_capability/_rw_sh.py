@@ -105,3 +105,23 @@ _rw_json_string() {
     printf '"%s"' "$s"
 }
 """
+
+
+#: Read by every bash task through BASH_ENV (bundle.py sets it), before the
+#: task's first line, so it applies whether or not the task sources rw.sh.
+#: When the task runs a command the image doesn't have, bash calls
+#: command_not_found_handle instead of only printing "command not found" and
+#: carrying on: it tells the host on the private output channel, and the host
+#: fails the run with E_COMMAND_NOT_FOUND. `command -v`/`type` only ask, so a
+#: task can still probe for an optional tool. The name is reduced to a safe
+#: alphabet so the line is always valid JSON.
+BASH_ENV_SH = r"""command_not_found_handle() {
+    local name="${1:0:128}"
+    printf 'rw: %s: command not found on this image\n' "$name" >&2
+    if [[ -n "${RW_OUTPUT_FD:-}" ]]; then
+        name="${name//[^A-Za-z0-9._+-]/?}"
+        printf '{"op":"missing_command","name":"%s"}\n' "$name" >&"$RW_OUTPUT_FD" 2>/dev/null
+    fi
+    return 127
+}
+"""
