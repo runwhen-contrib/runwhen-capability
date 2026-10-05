@@ -42,6 +42,14 @@ with the wheel and sdist attached to the GitHub Release.
     `subprocess` calls and `os.system(`. One diagnostic per line, with a hint to pass data as data.
   - `W_UNUSED_INPUT`: a `secret` or `credential` input (task- or capability-level) the task never
     reads. A capability-level input warns once, and only when no task (nor setup/lib) reads it. A `k8s.kubeconfig` credential counts as used when the task calls `kubectl`.
+- `validate`: `W_UNKNOWN_COMMAND` (warning; never blocks) when a bash task file, a bash setup
+  file or `lib/*.sh` runs a command that is not on the rw-task image: not a bash builtin or
+  keyword, a function or alias any `.sh` file in the bundle defines, an `rw_*` helper, a path or
+  an expansion, and not on `runwhen_capability.custom.runtime_commands.RW_TASK_COMMANDS`. One
+  diagnostic per distinct command per file, at its first use, for example "'bc' is not on the
+  rw-task image; use awk for arithmetic (awk "BEGIN { print 3 / 4 }") or a tool listed in the
+  authoring README". Before this, `bc: command not found` exited 127 and the script carried on.
+  `RW_TASK_COMMANDS` is checked against the built image by rw-tasks-codecollection's smoke test.
 - `validate`: `E_UNKNOWN_SDK_HELPER` (error) for a bash task that calls an `rw_*` command rw.sh
   doesn't define (only `rw_input`, `rw_append`, `rw_set` and `rw_skip` exist), for example
   `rw_set_severity`. Before this, bash printed "command not found" and the task carried on and

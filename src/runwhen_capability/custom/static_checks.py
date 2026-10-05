@@ -706,3 +706,93 @@ def runs_kubectl(text: str) -> bool:
     """True if `kubectl` appears anywhere in the task's code (bash or
     Python), outside `#` comments -- KUBECONFIG is set for it automatically."""
     return _KUBECTL_RE.search(_strip_comments_and_heredocs(text, keep_heredocs=True)) is not None
+
+
+# -- unknown commands: one the rw-task image doesn't ship (W_UNKNOWN_COMMAND) -----
+
+# Command position, as _COMMAND_START: a line start or a command separator
+# (`;`, `&`, `|`, `(`, `{`, `!`; a backtick substitution is rewritten to
+# `(...)` first), then any compound keywords (`if`, `then`, `do`, `else`, ...),
+# then any env-prefix assignments (`FOO=1 BAR="a b" cmd`). Stricter than
+# _COMMAND_START in one way: a keyword counts only at command position
+# itself, so `echo please do this` never makes `this` a command. The command
+# word must end where a word ends (blank, separator, redirection), which
+# rules out an assignment (`x=1`), a function definition (`f() {`), a path
+# (`lib/run.sh`) and a brace expansion (`{a,b}`).
+_KEYWORDS_BEFORE_COMMAND = r"(?:(?:then|do|else|while|until|if|elif|time|!)[ \t]+)*"
+_ENV_PREFIX = r"""(?:[A-Za-z_][A-Za-z0-9_]*\+?=(?:"[^"\n]*"|'[^'\n]*'|[^\s;&|()"'])*[ \t]+)*"""
+_COMMAND_WORD_RE = re.compile(
+    r"(?m)(?:^|[;&|({!])[ \t]*"
+    + _KEYWORDS_BEFORE_COMMAND
+    + _ENV_PREFIX
+    + r"([A-Za-z_][A-Za-z0-9_.+-]*)(?=[ \t;&|)<>]|$)"
+)
+_FUNCTION_DEF_RE = re.compile(
+    r"(?m)^[ \t]*(?:function[ \t]+([A-Za-z_][\w.:-]*)|([A-Za-z_][\w.:-]*)[ \t]*\(\s*\))"
+)
+_ALIAS_RE = re.compile(r"(?m)(?:^|[;&|])[ \t]*alias[ \t]+([A-Za-z_][\w.:-]*)=")
+
+# Length-preserving rewrites (same positions, same line breaks) that take
+# text out of command position before _COMMAND_WORD_RE runs.
+_BACKTICK_RE = re.compile(r"`([^`]*)`")
+_CONTINUATION_RE = re.compile(r"\\\n")
+_PARAM_EXPANSION_RE = re.compile(r"\$\{[^{}\n]*\}")  # ${x:-y}, ${!ref}: no command
+_ARITHMETIC_RE = re.compile(r"\(\((?:[^()\n]|\([^()\n]*\))*\)\)")  # (( )), $(( )), for (( ))
+_ARRAY_RE = re.compile(r"(?<=[A-Za-z0-9_\]]=)\([^()]*\)|(?<=[A-Za-z0-9_\]]\+=)\([^()]*\)")
+# A case pattern: after `case ... in` or a `;;`/`;&`/`;;&`, up to its `)`.
+_CASE_PATTERN_RE = re.compile(r"(?:\bin|;;&?|;&)\s*(\(?[^()\n;]*\))")
+_REGEX_MATCH_RE = re.compile(r"=~[ \t]+(?:\\.|[^ \t\n])*")  # [[ $x =~ ^(a|b)$ ]]
+
+
+def _blank(match: re.Match, group: int = 0) -> str:
+    whole = match.group(0)
+    start, end = match.start(group) - match.start(0), match.end(group) - match.start(0)
+    inner = "".join("\n" if ch == "\n" else " " for ch in whole[start:end])
+    return whole[:start] + inner + whole[end:]
+
+
+def _command_scan_text(text: str) -> str:
+    """`text` (comments, heredocs and quoted literals already blanked) with
+    everything that only looks like a command position blanked too."""
+    text = _CONTINUATION_RE.sub("  ", text)
+    for _ in range(3):  # ${a:-${b}} -- the inner one first
+        text = _PARAM_EXPANSION_RE.sub(_blank, text)
+    text = _ARITHMETIC_RE.sub(_blank, text)
+    text = _ARRAY_RE.sub(_blank, text)
+    # after arrays: `x=`cmd`` becomes `x=(cmd)`, which is not an array
+    text = _BACKTICK_RE.sub(lambda m: "(" + m.group(1) + ")", text)
+    text = _REGEX_MATCH_RE.sub(_blank, text)
+    return _CASE_PATTERN_RE.sub(lambda m: _blank(m, 1), text)
+
+
+def bash_defined_functions(text: str) -> set[str]:
+    """Every function (`f() {`, `function f`) and alias (`alias f=...`) the
+    script defines, whatever its name."""
+    text = _strip_comments_and_heredocs(text)
+    names = {m.group(1) or m.group(2) for m in _FUNCTION_DEF_RE.finditer(text)}
+    return names | {m.group(1) for m in _ALIAS_RE.finditer(text)}
+
+
+def bash_unknown_commands(
+    text: str, defined: frozenset[str] = frozenset()
+) -> list[tuple[int, str]]:
+    """(line of first use, name) for every distinct command word that is not a
+    bash builtin or keyword, an `rw_*` helper (E_UNKNOWN_SDK_HELPER's job), a
+    function or alias in `defined` or in the script itself, or a command on
+    the rw-task image (runtime_commands.RW_TASK_COMMANDS). Paths (`./x`,
+    `/usr/bin/x`) and expansions (`$TOOL`) are never a command word here.
+    Comments, heredoc bodies and quoted strings are never scanned; a command
+    run through another (`xargs cmd`, `timeout 5 cmd`) is not seen."""
+    from .runtime_commands import BASH_BUILTINS_AND_KEYWORDS, RW_TASK_COMMANDS
+
+    known = BASH_BUILTINS_AND_KEYWORDS | RW_TASK_COMMANDS | defined | bash_defined_functions(text)
+    stripped = _strip_comments_and_heredocs(text)
+    starts = _line_starts(stripped)
+    scanned = _command_scan_text(_blank_double_quoted(_blank_single_quoted(stripped)))
+    found: dict[str, int] = {}
+    for m in _COMMAND_WORD_RE.finditer(scanned):
+        name = m.group(1)
+        if name in known or name.startswith("rw_") or name in found:
+            continue
+        found[name] = _line_of(starts, m.start(1))
+    return [(line, name) for name, line in found.items()]

@@ -28,6 +28,10 @@ Warning codes (validate() only; severity "warning", never block a write or a run
 - W_DATA_AS_CODE -- a task builds a command from text (bash `eval`/`sh -c` with an
   expansion, awk `system(`/`getline`, Python `shell=True`/`os.system`).
 - W_UNUSED_INPUT -- a declared secret/credential input the task never reads.
+- W_UNKNOWN_COMMAND -- a bash task, setup or lib/ file runs a command that is not
+  a bash builtin, a function the bundle defines, an rw_* helper, a path, an
+  expansion, or on the rw-task image (runtime_commands.RW_TASK_COMMANDS). One
+  per distinct command per file, at its first use.
 
 Runtime codes (the bundle host, bundle.py) reuse the same string constants:
 E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_OUTPUT_MALFORMED, E_TIMEOUT.
@@ -61,6 +65,7 @@ E_UNKNOWN_SDK_HELPER = "E_UNKNOWN_SDK_HELPER"
 # -- warning codes: validate() ---------------------------------------------------
 W_DATA_AS_CODE = "W_DATA_AS_CODE"
 W_UNUSED_INPUT = "W_UNUSED_INPUT"
+W_UNKNOWN_COMMAND = "W_UNKNOWN_COMMAND"
 
 # -- runtime codes: the bundle host (bundle.py) --------------------------------
 E_INPUT_TYPE = "E_INPUT_TYPE"
