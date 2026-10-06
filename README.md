@@ -65,10 +65,51 @@ rwtask run <capability-dir> --request request.json [--credentials creds.json]
 rwtask run --local <bundle-dir> --task <name> [--inputs '<json>'] [--credentials creds.json]
 rwtask serve [--capability-dir DIR] [--allow-bundles]
              # RELAY_URL, POOL_ID, EXECUTOR_TOKEN_FILE from the env
+rwtask plan <dir> [--prune]
+rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]
+rwtask export <dir> [--name NAME ...] [--force]
+rwtask test <dir> [--task NAME]
 ```
 
 `rwtask run` is the same code path as `rwtask serve`, against the local filesystem: a capability
 author needs no cluster.
+
+### GitOps
+
+`rwtask plan`/`apply`/`export` manage custom capability bundles -- a directory holding a
+`capability.yaml` plus its `tasks/`, `lib/`, `schemas/`, `tests/` files (see "Custom capability
+bundles" below) -- against the RunWhen platform API, so a repository of them can be reviewed and
+merged like any other code:
+
+```
+rwtask plan capabilities/            # find every capability.yaml under the dir, recursively
+rwtask apply capabilities/ -m "add pgbouncer-health"
+rwtask export capabilities/ --name pgbouncer-health
+```
+
+- `rwtask plan <dir>` validates every capability locally first (a local error prints as
+  `file:line code message` and exits 1, with no network call); it then asks the platform API what
+  `apply` would change and prints each capability's action (`create`, `update`, `unchanged`,
+  `delete`, or `conflict` -- it exists but is not git-managed) and its file diffs. Exit codes are
+  Terraform-style, for CI: 0 when nothing would change, 2 when something would, 1 on error.
+- `rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]` plans first, prints the plan, then
+  applies it. A `conflict` is refused unless `--adopt` is given. `--prune` also removes every
+  git-managed capability missing from `dir`. Without `--yes` on a TTY, it asks for confirmation;
+  off a TTY (e.g. CI) it proceeds without asking, since there is no one to ask -- the pipeline that
+  invoked it is the actual gate.
+- `rwtask export <dir> [--name NAME ...] [--force]` writes each capability's published files under
+  `<dir>/<name>/`. Given no `--name`, every capability in the workspace is exported. It refuses to
+  overwrite a local file whose content has changed, unless `--force` is given.
+- All three take `--api-url`/`--token`/`--workspace`, or the `RW_API_URL`/`RW_API_TOKEN`/
+  `RW_WORKSPACE` env vars. The token is sent as `Authorization: Bearer` and never printed.
+
+`rwtask test <dir> [--task NAME]` runs a capability's own tests locally, with no platform API
+involved. For each capability under `dir` and each of its tasks that has a `tests/<task>.json`
+(`{"inputs": {...}, "target"?: {...}, "expect"?: {"status": "ok"}}`), it runs that task through the
+same code path `run --local` uses and checks the resulting status against `expect.status` (default
+`"ok"`) -- the task's outputs are already checked against their declared schema as part of that
+run, so a status match means the outputs validated too. A task with no test file is reported as
+`no test`, which does not fail the run. Exits 1 if any task's test fails.
 
 ### Custom capability bundles
 

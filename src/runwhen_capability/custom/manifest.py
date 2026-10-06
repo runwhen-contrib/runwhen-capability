@@ -29,15 +29,34 @@ MAX_FILE_BYTES = 64 * 1024
 MAX_FILES = 40
 MAX_BUNDLE_BYTES = 256 * 1024
 
-_CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
+# A word boundary is a lower-case letter or digit followed by a capital
+# ("maxWait"), or the last capital of an acronym followed by a lower-case
+# letter ("HTTPTimeout" -> HTTP|Timeout). A run of capitals is one word, so an
+# all-caps name ("THRESHOLD", "DRY_RUN") maps to itself.
+_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+# The pre-0.3.0 mapping: every capital starts a new word, so an upper-case name was split
+# per letter ("THRESHOLD" -> "T_H_R_E_S_H_O_L_D"). Kept only so bundles published against
+# it keep running; see legacy_input_env_name.
+_LEGACY_CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def legacy_input_env_name(name: str) -> str:
+    """The env var name input_env_name produced before 0.3.0. A published bundle is
+    immutable and may read this spelling, so the host still delivers the value under
+    it and validate() still accepts reading it. Equal to input_env_name for every
+    camelCase / snake_case name."""
+    return _LEGACY_CAMEL_RE.sub("_", name).upper()
 
 
 def input_env_name(name: str) -> str:
     """The bash env var a declared input's value arrives on:
     camelCase -> SCREAMING_SNAKE_CASE (e.g. "maxWait" -> "MAX_WAIT",
-    "since" -> "SINCE"). Shared between validate.py (E_UNDECLARED_INPUT) and
-    bundle.py (building the child process's environment), so the two never
-    drift apart."""
+    "since" -> "SINCE", "HTTPTimeout" -> "HTTP_TIMEOUT"); a name that is
+    already upper case keeps its spelling ("DRY_RUN" -> "DRY_RUN"). Shared
+    between validate.py (E_UNDECLARED_INPUT) and bundle.py (building the child
+    process's environment), so the two never drift apart."""
     return _CAMEL_RE.sub("_", name).upper()
 
 
@@ -78,6 +97,13 @@ class TaskSpec(BaseModel):
     file: str
     description: str = ""
     readOnly: bool = False
+    #: Plain-language sentences saying what the task changes. Required when readOnly is false
+    #: (E_EFFECTS_REQUIRED); optional description on a read-only task.
+    effects: list[str] = Field(
+        default_factory=list,
+        description="Plain-language sentences saying what the task changes. "
+        "Required unless readOnly is true.",
+    )
     inputs: dict[str, InputSpec] = Field(default_factory=dict)
     outputs: dict[str, OutputSpec] = Field(default_factory=dict)
 
@@ -177,3 +203,23 @@ def task_file_language(path: str) -> TaskFileLanguage | None:
     if path.endswith(".sh"):
         return "bash"
     return None
+
+
+#: The description the platform's /capabilities/schema.json carries, verbatim.
+MANIFEST_SCHEMA_DESCRIPTION = (
+    "JSON Schema for capability.yaml, apiVersion: runwhen.com/custom-capability/v1. Generated "
+    "from runwhen_capability.custom.manifest.Manifest, the same Pydantic model the SDK's "
+    "validate() uses for E_MANIFEST_SCHEMA -- this file is never hand-written, only "
+    "regenerated from the SDK."
+)
+
+
+def manifest_json_schema() -> dict[str, Any]:
+    """The capability.yaml JSON Schema the platform serves at /capabilities/schema.json."""
+    model = Manifest.model_json_schema()
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": model.pop("title", "Manifest"),
+        "description": MANIFEST_SCHEMA_DESCRIPTION,
+        **model,
+    }

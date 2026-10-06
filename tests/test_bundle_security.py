@@ -28,6 +28,7 @@ inputs:
 tasks:
   - name: t
     file: tasks/{file}
+    effects: [Test fixture]
     outputs:
       o: {{ schema: "{schema}" }}
 """
@@ -229,13 +230,31 @@ _BASH = 'source "$RW_SDK/rw.sh"\n'
         '{"op": "set", "name": "o", "value": ' + "[" * 100 + "]" * 100 + "}",
     ],
 )
-def test_a_malformed_event_line_is_ignored_not_fatal(tmp_path, line):
+def test_a_malformed_event_line_fails_the_run_but_keeps_good_outputs(tmp_path, line):
+    """A dropped line is a lost output: the run fails (E_OUTPUT_MALFORMED),
+    so it can never count as evidence, but every well-formed line still
+    populates outputs."""
     source = _BASH + f'echo {json.dumps(line)} >&"$RW_OUTPUT_FD"\nrw_set o \'"kept"\'\n'
     result = _run(_files("t.sh", source), tmp_path)
     [task] = result.tasks
-    assert task.status == "ok"
+    assert task.status == "failed"
     assert task.outputs == {"o": "kept"}
-    assert any("were ignored" in e for e in task.errors)
+    [error] = task.errors
+    assert error.startswith("E_OUTPUT_MALFORMED: 1 output line(s)")
+    assert "an output was lost" in error
+    assert task.error == error
+
+
+def test_a_malformed_line_in_a_skipped_run_behaves_like_a_schema_violation(tmp_path):
+    """rw_skip wins over anything that would otherwise fail the run (exit
+    code, schema violation): a malformed line is treated exactly the same."""
+    schema_violation = _BASH + "rw_set o 1\nrw_skip 'nothing here'\n"
+    malformed = _BASH + 'echo "[1, 2]" >&"$RW_OUTPUT_FD"\nrw_skip \'nothing here\'\n'
+    by_schema = _run(_files("t.sh", schema_violation), tmp_path / "a").tasks[0]
+    by_malformed = _run(_files("t.sh", malformed), tmp_path / "b").tasks[0]
+    assert by_schema.status == by_malformed.status == "skipped"
+    assert by_schema.reason == by_malformed.reason == "nothing here"
+    assert by_schema.errors == by_malformed.errors == []
 
 
 @pytest.mark.parametrize(
@@ -251,9 +270,11 @@ def test_a_value_cannot_inject_a_second_event(tmp_path, value):
     source = source.replace("\\n", "\n")  # a real newline inside the value
     result = _run(_files("t.sh", source), tmp_path)
     [task] = result.tasks
-    assert task.status == "ok"
+    # the line is rejected whole: no spoofed skip, and the lost output fails the run
+    assert task.status == "failed"
     assert task.reason is None
     assert task.outputs == {}
+    assert [e.split(":")[0] for e in task.errors] == ["E_OUTPUT_MALFORMED"]
 
 
 def test_an_endless_output_stream_is_capped_and_fails_the_task(tmp_path):
@@ -382,6 +403,7 @@ inputs:
 tasks:
   - name: t
     file: tasks/t.sh
+    effects: [Test fixture]
     outputs:
       o: { schema: "string" }
 """,
@@ -412,10 +434,12 @@ name: probe
 tasks:
   - name: big
     file: tasks/t.sh
+    effects: [Test fixture]
     inputs:
       blob: { type: string, runtime: true }
   - name: ok
     file: tasks/ok.sh
+    effects: [Test fixture]
 """,
         "tasks/t.sh": "echo $BLOB\n",
         "tasks/ok.sh": "echo fine\n",
@@ -435,7 +459,9 @@ def test_a_result_over_the_per_result_limit_is_not_sent(tmp_path):
     files = {
         "capability.yaml": (
             "apiVersion: runwhen.com/custom-capability/v1\nname: probe\ntasks:\n"
-            "  - name: t\n    file: tasks/t.py\n    outputs:\n" + outputs + "\n"
+            "  - name: t\n    file: tasks/t.py\n    effects: [Test fixture]\n    outputs:\n"
+            + outputs
+            + "\n"
         ),
         "tasks/t.py": source,
     }
@@ -454,3 +480,61 @@ def test_the_host_never_evaluates_a_schema_with_a_regex_keyword():
     messages = _validate_output_schema("o", {"v": "a" * 64 + "!"}, schema)
     assert time.monotonic() - started < 1
     assert messages and messages[0].startswith("E_SCHEMA_FEATURE outputs.o")
+
+
+def test_a_published_bundle_calling_an_unknown_sdk_helper_still_runs(tmp_path):
+    # E_UNKNOWN_SDK_HELPER is an authoring gate: the host re-validates
+    # every run and must not start refusing an already-published bundle.
+    source = _BASH + "rw_set_severity 3\nrw_set o '\"ran\"'\n"
+    result = _run(_files("t.sh", source), tmp_path)
+    assert result.setup is None or result.setup.status != "failed"
+    [task] = result.tasks
+    assert task.outputs == {"o": "ran"}
+    # ...and the invented helper is now caught when it runs.
+    assert task.status == "failed"
+    assert task.error.startswith("E_COMMAND_NOT_FOUND: 'rw_set_severity'")
+
+
+# -- a command the image doesn't have  ---------------------------------------
+
+
+def test_a_missing_command_fails_the_run_naming_it(tmp_path):
+    """`bc` isn't on the image; bash printed "command not found",
+    carried on, and the run came back ok. The image's own shell now reports it."""
+    source = _BASH + "x=$(no-such-tool-xyz 1 2)\nrw_set o '\"after\"'\n"
+    [task] = _run(_files("t.sh", source), tmp_path).tasks
+    assert task.status == "failed"
+    assert task.outputs == {"o": "after"}
+    [error] = [e for e in task.errors if e.startswith("E_COMMAND_NOT_FOUND")]
+    assert "'no-such-tool-xyz'" in error
+    assert task.error == error
+
+
+def test_a_missing_command_is_not_hidden_by_a_later_skip(tmp_path):
+    """A missing tool is a bug in the task, never "nothing to check": a skip
+    after it must not turn the run into a pass."""
+    source = _BASH + "no-such-tool-xyz\nrw_skip 'nothing found'\n"
+    [task] = _run(_files("t.sh", source), tmp_path).tasks
+    assert task.status == "failed"
+    assert task.error.startswith("E_COMMAND_NOT_FOUND")
+
+
+def test_probing_for_a_tool_does_not_fail_the_run(tmp_path):
+    """`command -v` / `type` only ask; they never run the missing command."""
+    source = (
+        _BASH
+        + "if command -v no-such-tool-xyz >/dev/null; then t=1; else t=0; fi\n"
+        + "type no-such-tool-xyz >/dev/null 2>&1 || true\n"
+        + "rw_set o '\"probed\"'\n"
+    )
+    [task] = _run(_files("t.sh", source), tmp_path).tasks
+    assert task.status == "ok"
+    assert task.outputs == {"o": "probed"}
+
+
+def test_a_missing_command_in_a_task_that_never_sources_rw_sh_still_fails(tmp_path):
+    """The hook comes from BASH_ENV, not from rw.sh."""
+    source = "#!/usr/bin/env bash\nno-such-tool-xyz\n"
+    [task] = _run(_files("t.sh", source), tmp_path).tasks
+    assert task.status == "failed"
+    assert task.error.startswith("E_COMMAND_NOT_FOUND")

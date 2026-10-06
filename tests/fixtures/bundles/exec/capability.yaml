@@ -8,49 +8,63 @@ inputs:
 tasks:
   - name: ok-py
     file: tasks/ok.py
+    effects: [Test fixture]
     outputs:
       greeting: { schema: "string" }
   - name: ok-bash
     file: tasks/ok.sh
+    effects: [Test fixture]
     outputs:
       greeting: { schema: "string" }
   - name: skip-py
     file: tasks/skip.py
+    effects: [Test fixture]
   - name: skip-bash
     file: tasks/skip.sh
+    effects: [Test fixture]
   - name: fail-py
     file: tasks/fail.py
+    effects: [Test fixture]
   - name: fail-bash
     file: tasks/fail.sh
+    effects: [Test fixture]
   - name: schema-bad
     file: tasks/schema_bad.py
+    effects: [Test fixture]
     outputs:
       count: { schema: "integer" }
   - name: slow
     file: tasks/slow.sh
+    effects: [Test fixture]
   - name: secret-echo
     file: tasks/secret_echo.py
+    effects: [Test fixture]
     inputs:
       token: { type: secret, optional: false }
     outputs:
       leaked: { schema: "string" }
   - name: kubeconfig-echo
     file: tasks/kubeconfig_echo.sh
+    effects: [Test fixture]
     outputs:
       content: { schema: "string" }
   - name: target-echo
     file: tasks/target_echo.py
+    effects: [Test fixture]
     outputs:
       urn: { schema: "string" }
   - name: secret-log
     file: tasks/secret_log.sh
+    effects: [Test fixture]
     inputs:
       token: { type: secret, optional: false }
   - name: big-list
     file: tasks/big_list.py
+    effects: [Test fixture]
     outputs:
       items: { schema: "integer[]" }
   - name: big-scalar
     file: tasks/big_scalar.py
+    effects: [Test fixture]
     outputs:
       blob: { schema: "string" }

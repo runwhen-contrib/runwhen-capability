@@ -3,6 +3,104 @@
 This project follows [Semantic Versioning](https://semver.org/). Releases are git tags `v<version>`
 with the wheel and sdist attached to the GitHub Release.
 
+## 0.3.0
+
+### Fixed
+
+- **`type: secret` inputs reach the run.** The compiler now declares every `type: secret` input in `needs.credentials` as kind `secret`, so the platform resolves it (from an admin's binding) and the run gets the file. Before, only `type: credential` inputs were declared and a secret input always failed `E_INPUT_TYPE … no secret resolved`.
+- `W_UNUSED_INPUT` now says to remove the unread input; the old wording read like a reason to keep it.
+- An input name that is already upper case (`THRESHOLD`, `DRY_RUN`) keeps its spelling as its env
+  var instead of splitting per letter (`T_H_R_E_S_H_O_L_D`); acronyms split once (`HTTPTimeout` →
+  `HTTP_TIMEOUT`). camelCase and snake_case names map as before. Bundles published against the old
+  spelling keep running: the host still sets the old per-letter name beside the new one, and
+  `validate` still accepts reading it. **Behaviour change for authors:** two inputs that differ
+  only in case (`foo` and `FOO`) now collide (`E_DUPLICATE_NAME`), and an upper-case name that now
+  hits a reserved variable (`ENV`, `USER`, `PATH`, ...) warns and arrives under the old name only;
+  rename it.
+- `validate`: bash variables bound without a plain `name=` at the start of a line are local, not
+  undeclared inputs. This covers `read`/`read -a` (including after an env prefix such as
+  `while IFS='|' read -ra X`), `mapfile`/`readarray`, `declare`/`typeset` and flag forms of
+  `local`/`export`/`readonly`, `printf -v`, `getopts`, `select`, `x+=`, and assignments after `;`,
+  `&&`, `||`, `then`, `do` or `else`. Before this, `E_UNDECLARED_INPUT` flagged them falsely.
+- `validate`: a `$name` inside a single-quoted string (a jq or awk variable, as in
+  `jq -n --argjson t "$n" '{t: $t}'`) is not an env read. Quote context is tracked across lines
+  and restarts inside each `$(...)`. Before this, `E_UNDECLARED_INPUT` flagged `$t`.
+- `rw_input` in `rw.sh` derives an input's env var name with the same rule as the host
+  (`THRESHOLD` → `THRESHOLD`, `HTTPTimeout` → `HTTP_TIMEOUT`, `maxWait` → `MAX_WAIT`); before
+  this it still split per letter, so `rw_input THRESHOLD` read nothing on a new host. If that
+  variable is unset it falls back to the legacy per-letter name, so it also works under an older
+  host.
+- `validate`: `W_UNUSED_INPUT` accepts a bash read of an input under its legacy env name (for
+  example `$E_N_V` for an input named `ENV`, which the reserved-name warning tells authors to use).
+
+### Added
+
+- `validate`: two new warnings (severity `warning`; they never block a write, plan, apply or run):
+  - `W_DATA_AS_CODE`: text built from a variable is run as a command. Bash: `eval` with a `$`
+    expansion, `sh -c`/`bash -c` whose command string has an expansion, `xargs ... sh -c` with a
+    replace string, and an awk program containing `system(` or a `| getline` pipe (plain `getline` is safe). Python: `shell=True` on
+    `subprocess` calls and `os.system(`. One diagnostic per line, with a hint to pass data as data.
+  - `W_UNUSED_INPUT`: a `secret` or `credential` input (task- or capability-level) the task never
+    reads. A capability-level input warns once, and only when no task (nor setup/lib) reads it. A `k8s.kubeconfig` credential counts as used when the task calls `kubectl`.
+- `validate`: `E_UNKNOWN_SDK_HELPER` (error) for a bash task that calls an `rw_*` command rw.sh
+  doesn't define (only `rw_input`, `rw_append`, `rw_set` and `rw_skip` exist), for example
+  `rw_set_severity`. Before this, bash printed "command not found" and the task carried on and
+  passed. Comments, heredocs, quoted strings and `rw_*` functions the script (or `lib/`, or a
+  bash setup file) defines are ignored. It is an authoring gate: the bundle host ignores it at run
+  time, so already-published bundles run exactly as before.
+- `TaskSpec.effects`: plain-language sentences saying what a task changes. Required when
+  `readOnly` is false (`E_EFFECTS_REQUIRED`), optional on a read-only task, and carried into the
+  compiled manifest beside `readOnly`.
+- GitOps commands, speaking to the RunWhen platform API's `custom-capabilities:plan`/`:apply`/
+  `:export` routes:
+  - `rwtask plan <dir>` finds every `capability.yaml` bundle under `dir`, recursively, validates
+    each locally first (`runwhen_capability.custom.validate`; a local error prints as
+    `file:line code message` and exits 1 without calling the API), then posts the bundles to
+    `:plan` and prints each capability's action and file diffs. Exit codes are Terraform-style: 0
+    when nothing would change, 2 when something would, 1 on error -- for use in CI.
+  - `rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]` plans first, prints the plan,
+    then applies it. A capability that exists but is not git-managed is reported as `conflict` and
+    refused unless `--adopt` is given. Without `--yes` on a TTY, it asks for confirmation; off a
+    TTY, it proceeds (the pipeline that invoked it is the actual gate).
+  - `rwtask export <dir> [--name NAME ...] [--force]` writes each capability's published files
+    under `<dir>/<name>/`, refusing to overwrite a local file whose content has changed unless
+    `--force` is given.
+  - `--api-url`, `--token` and `--workspace` flags (env fallbacks `RW_API_URL`, `RW_API_TOKEN`,
+    `RW_WORKSPACE`); the token travels as `Authorization: Bearer` and is never printed. The
+    platform API's `{errors: [{code, file, line, path, message, hint}]}` shape is mapped to the
+    same `file:line code message` format as a local validation error.
+- `rwtask test <dir> [--task NAME]` runs, for each capability and task that has a
+  `tests/<task>.json` (`{inputs, target?, expect?: {status}}`), that task locally through the same
+  code path `run --local` uses, and reports pass/fail by comparing the resulting status to
+  `expect.status` (default `"ok"`) -- a task's outputs are already checked against their schema as
+  part of that run, so a status match means the outputs validated too. A task with no test file is
+  reported as `no test`, which is not a failure. Exits 1 if any task fails.
+- `manifest_json_schema()`: the capability.yaml JSON Schema document the platform serves as `/capabilities/schema.json`.
+
+### Changed
+
+- **Behaviour change:** a bundle run with an output line that is not a well-formed
+  `rw_set`/`rw_append`/`rw_skip` event now **fails** with `E_OUTPUT_MALFORMED` ("N output line(s)
+  were not a well-formed rw_set/rw_append/rw_skip event and were dropped; an output was lost").
+  Before, the line was dropped with a note and the run still came back `ok`, so a task that hit
+  `bc: command not found` and then wrote `rw_set x ""` passed as evidence. Well-formed lines
+  still populate outputs. A run that calls `rw_skip` is still `skipped`, exactly as with a
+  non-zero exit or a schema violation.
+- **Behaviour change:** a bash task that runs a command the image doesn't have now **fails** with
+  `E_COMMAND_NOT_FOUND` ("'bc' is not on this image; bash carried on without it (exit 127)").
+  The host sets `BASH_ENV` to a file defining bash's `command_not_found_handle`, which reports
+  the name on the private output channel, so it works whether or not the task sources `rw.sh` and
+  needs no list of tools: the image itself answers. A later `rw_skip` does not hide it (a missing
+  tool is a bug in the task, not "nothing to check"); well-formed outputs are kept. `command -v`
+  and `type` only ask, so probing for an optional tool still works. `command_not_found_handle`
+  needs bash 4 or later: the runtime image has it, but `rwtask run --local` and `rwtask test`
+  under macOS's bundled bash 3.2 report the task as bash itself does (often `ok`).
+- **Breaking:** a task that omits `readOnly` (it defaults to false, i.e. "changes things") must now
+  either set `readOnly: true` or declare `effects`; otherwise validation fails with
+  `E_EFFECTS_REQUIRED`. The check applies when authoring/validating and publishing; the runtime
+  does not apply it when executing an already-published bundle. Bundles whose read-only tasks never
+  set `readOnly: true` must add it before their next publish.
+
 ## 0.2.0
 
 ### Added

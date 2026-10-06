@@ -17,10 +17,13 @@ from __future__ import annotations
 
 from .compiler import CompileError, compile_manifest
 from .diagnostics import (
+    E_COMMAND_NOT_FOUND,
     E_DUPLICATE_NAME,
+    E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
     E_LIMIT,
     E_MANIFEST_SCHEMA,
+    E_OUTPUT_MALFORMED,
     E_OUTPUT_SCHEMA,
     E_OUTPUT_TOO_LARGE,
     E_OUTPUT_UNDECLARED,
@@ -31,10 +34,11 @@ from .diagnostics import (
     E_TASK_FILE_MISSING,
     E_TIMEOUT,
     E_UNDECLARED_INPUT,
+    E_UNKNOWN_SDK_HELPER,
     Diagnostic,
 )
 from .hashing import content_hash, task_hash
-from .manifest import Manifest
+from .manifest import Manifest, manifest_json_schema
 from .schema_notation import SchemaNotationError, compile_schema_notation
 from .validate import validate
 
@@ -43,6 +47,7 @@ __all__ = [
     "CompileError",
     "SchemaNotationError",
     "Manifest",
+    "manifest_json_schema",
     "validate",
     "compile_manifest",
     "compile_schema_notation",
@@ -57,9 +62,13 @@ __all__ = [
     "E_OUTPUT_UNDECLARED",
     "E_READONLY_WRITE",
     "E_DUPLICATE_NAME",
+    "E_EFFECTS_REQUIRED",
+    "E_UNKNOWN_SDK_HELPER",
     "E_SCHEMA_FEATURE",
     "E_INPUT_TYPE",
     "E_OUTPUT_SCHEMA",
     "E_OUTPUT_TOO_LARGE",
+    "E_COMMAND_NOT_FOUND",
+    "E_OUTPUT_MALFORMED",
     "E_TIMEOUT",
 ]

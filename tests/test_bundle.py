@@ -9,6 +9,7 @@ import time
 from bundle_fixtures import load_bundle
 
 from runwhen_capability.bundle import run_bundle_request
+from runwhen_capability.custom import validate
 from runwhen_capability.custom.hashing import content_hash
 from runwhen_capability.models import Bundle, BundleFile, BundleRequestEnvelope, BundleTarget
 
@@ -59,6 +60,28 @@ def test_an_invalid_bundle_fails_closed_with_no_execution(tmp_path):
     assert result.setup.status == "failed"
     assert "invalid bundle" in result.setup.error
     assert result.tasks == []
+
+
+def test_a_published_bundle_without_read_only_or_effects_still_runs(tmp_path):
+    # E_EFFECTS_REQUIRED gates authoring; the runtime must not refuse an
+    # immutable bundle published before it existed.
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\n"
+            "name: legacy\n"
+            "appliesTo:\n"
+            "  - { platform: kubernetes, type: statefulset }\n"
+            "tasks:\n"
+            "  - name: hello\n"
+            "    file: tasks/hello.py\n"
+        ),
+        "tasks/hello.py": "def main(ctx):\n    return {}\n",
+    }
+    assert "E_EFFECTS_REQUIRED" in [d.code for d in validate(files)]
+    result = _run(files, ["hello"], tmp_path)
+    assert result.setup is None or result.setup.status != "failed"
+    [task] = result.tasks
+    assert task.status == "ok"
 
 
 def test_ok_python_task(tmp_path):
@@ -239,3 +262,36 @@ def test_a_setup_runs_once_before_the_requested_tasks(tmp_path):
     )
     assert result.setup.status == "ok"
     assert result.tasks[0].status == "ok"
+
+
+_UPPER_INPUT_BUNDLE = {
+    "capability.yaml": (
+        "apiVersion: runwhen.com/custom-capability/v1\n"
+        "name: legacy-upper\n"
+        "appliesTo:\n"
+        "  - { platform: kubernetes, type: statefulset }\n"
+        "tasks:\n"
+        "  - name: show\n"
+        "    file: tasks/show.sh\n"
+        "    readOnly: true\n"
+        "    inputs:\n"
+        "      THRESHOLD: { type: number, default: 1, runtime: true }\n"
+        "      ENV: { type: string, default: prod, runtime: true }\n"
+        "    outputs:\n"
+        '      seen: { schema: "string" }\n'
+    ),
+    # Written against the pre-0.3.0 mapping: THRESHOLD -> T_H_R_E_S_H_O_L_D, ENV -> E_N_V.
+    "tasks/show.sh": (
+        'source "$RW_SDK/rw.sh"\nrw_set seen "\\"t=$T_H_R_E_S_H_O_L_D e=$E_N_V\\""\n'
+    ),
+}
+
+
+def test_a_published_bundle_reading_a_legacy_mangled_env_name_still_runs(tmp_path):
+    # 0.3.0 changed input_env_name; bundles published before it read the per-letter
+    # names (the old validator demanded them) and must keep running unchanged.
+    result = _run(_UPPER_INPUT_BUNDLE, ["show"], tmp_path, inputs={"THRESHOLD": 7, "ENV": "stg"})
+    assert result.setup is None or result.setup.status != "failed", result.setup
+    [task] = result.tasks
+    assert task.status == "ok", task
+    assert task.outputs["seen"] == "t=7 e=stg"
