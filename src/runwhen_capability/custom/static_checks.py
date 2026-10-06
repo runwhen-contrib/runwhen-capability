@@ -635,7 +635,7 @@ def bash_input_used(text: str, name: str) -> bool:
     heredoc expands `$NAME`. Biased to "used": a spurious mention only hides
     a warning."""
     text = _strip_comments_and_heredocs(text, keep_heredocs=True)
-    # The legacy (pre-H48) spelling counts too: the host still sets it, and
+    # The legacy (pre-0.3.0) spelling counts too: the host still sets it, and
     # the reserved-name warning tells authors to read it (`ENV` -> $E_N_V).
     for env in {_input_env_name(name), _legacy_input_env_name(name)}:
         if re.search(rf"(?<![A-Za-z0-9_]){re.escape(env)}(?![A-Za-z0-9_])", text):

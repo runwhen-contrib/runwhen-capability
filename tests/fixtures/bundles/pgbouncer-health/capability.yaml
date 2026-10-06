@@ -2,7 +2,7 @@ apiVersion: runwhen.com/custom-capability/v1
 name: pgbouncer-health
 description: Pool health for pgbouncer
 appliesTo:
-  - { platform: kubernetes, type: deployment, where: { namespace: runwhen-env-staging, labels.app: pgbouncer } }
+  - { platform: kubernetes, type: deployment, where: { namespace: payments, labels.app: pgbouncer } }
 inputs:
   target:     { type: resource }
   kubeconfig: { type: credential, kind: k8s.kubeconfig }

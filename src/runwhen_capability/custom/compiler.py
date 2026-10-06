@@ -55,7 +55,7 @@ def compile_manifest(files: dict[str, str], *, ignore: frozenset[str] = frozense
 
 def _needs_credentials(manifest: Manifest) -> list[dict]:
     """Every `type: credential` and `type: secret` input (a secret as kind
-    `secret`, which papi resolves from an admin's binding), capability-level
+    `secret`, which the platform resolves from an admin's binding), capability-level
     and task-level alike,
     deduped by name (first declaration wins -- validate() does not currently
     flag a name redeclared with a different kind/optional, so this is a

@@ -155,7 +155,7 @@ DETAILS=$(awk '
 """
 
 
-def test_the_sdlc_t4_awk_getline_is_flagged_on_its_own_line():
+def test_an_awk_getline_built_from_data_is_flagged_on_its_own_line():
     assert bash_data_as_code(T4_AWK) == [(3, "awk | getline")]
 
 

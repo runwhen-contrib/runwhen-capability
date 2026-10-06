@@ -368,7 +368,7 @@ def _check_input_names(
         elif is_reserved_env_name(input_env_name(name)):
             message = f"input name {name!r} would set the reserved env var {input_env_name(name)!r}"
             if not is_reserved_env_name(legacy_input_env_name(name)):
-                # An upper-case name published before H48 mapped to a harmless
+                # An upper-case name published before 0.3.0 mapped to a harmless
                 # per-letter name, so refusing it now would break a bundle that ran
                 # fine. Warn; the host delivers it under the legacy name only.
                 diagnostics.append(
@@ -917,7 +917,7 @@ def _check_source(
     )
     expected_env = (
         {input_env_name(name) for name in declared_inputs}
-        # the pre-H48 spelling, which the host still sets: a published bundle may read it
+        # the pre-0.3.0 spelling, which the host still sets: a published bundle may read it
         | {legacy_input_env_name(name) for name in declared_inputs}
         | _STANDARD_BASH_ENV
     )

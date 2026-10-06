@@ -802,7 +802,7 @@ def test_w_data_as_code_is_a_warning_with_file_line_and_hint():
     assert diag.hint == "pass data as data: environment variables, stdin, jq --arg, or Python"
 
 
-def test_w_data_as_code_flags_the_sdlc_t4_awk_getline():
+def test_w_data_as_code_flags_an_awk_getline_built_from_data():
     src = (
         "DETAILS=$(awk '\n"
         '  { cmd = "printf \\047%s\\047 \\047" $0 "\\047 | jq -r \\047.kind\\047"\n'
@@ -871,7 +871,7 @@ def test_w_unused_input_python_param_never_used_in_body():
     assert _of(files, W_UNUSED_INPUT) == []
 
 
-def test_w_unused_input_sdlc_t9b_python_http_task_with_unused_kubeconfig():
+def test_w_unused_input_flags_an_http_task_with_an_unused_kubeconfig():
     src = (
         "import urllib.request\n"
         "def main(ctx, url):\n"
@@ -981,7 +981,7 @@ def test_task_level_unused_inputs_still_warn_per_task():
     assert [d.path for d in _of(files, W_UNUSED_INPUT)] == ["tasks[0].inputs.tok"]
 
 
-# -- E_UNKNOWN_SDK_HELPER: an rw_* call rw.sh doesn't define (H51) ---------------
+# -- E_UNKNOWN_SDK_HELPER: an rw_* call rw.sh doesn't define  ---------------
 
 _HELPER_MANIFEST = """\
 apiVersion: runwhen.com/custom-capability/v1
@@ -999,7 +999,7 @@ def _helper_bundle(source: str, **extra) -> dict[str, str]:
     return {"capability.yaml": _HELPER_MANIFEST, "tasks/t.sh": source, **extra}
 
 
-def test_e_unknown_sdk_helper_flags_the_sdlc_rw_set_severity_call():
+def test_e_unknown_sdk_helper_flags_an_invented_rw_set_severity_call():
     src = 'source "$RW_SDK/rw.sh"\necho start\nrw_set_severity 3\n'
     (diag,) = _of(_helper_bundle(src), E_UNKNOWN_SDK_HELPER)
     assert (diag.severity, diag.file, diag.line) == ("error", "tasks/t.sh", 3)
@@ -1056,7 +1056,7 @@ def test_e_unknown_sdk_helper_is_not_checked_in_python():
     assert _of(files, E_UNKNOWN_SDK_HELPER) == []
 
 
-# -- W_UNUSED_INPUT: reading an input under its legacy env name (H51) -----------
+# -- W_UNUSED_INPUT: reading an input under its legacy env name  -----------
 
 
 def test_w_unused_input_accepts_a_read_under_the_legacy_env_name():

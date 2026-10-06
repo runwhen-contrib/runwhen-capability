@@ -3,7 +3,7 @@
 This project follows [Semantic Versioning](https://semver.org/). Releases are git tags `v<version>`
 with the wheel and sdist attached to the GitHub Release.
 
-## Unreleased
+## 0.3.0
 
 ### Fixed
 
@@ -75,7 +75,7 @@ with the wheel and sdist attached to the GitHub Release.
   `expect.status` (default `"ok"`) -- a task's outputs are already checked against their schema as
   part of that run, so a status match means the outputs validated too. A task with no test file is
   reported as `no test`, which is not a failure. Exits 1 if any task fails.
-- `manifest_json_schema()`: the capability.yaml JSON Schema document papi serves as `/capabilities/schema.json`.
+- `manifest_json_schema()`: the capability.yaml JSON Schema document the platform serves as `/capabilities/schema.json`.
 
 ### Changed
 
@@ -92,7 +92,9 @@ with the wheel and sdist attached to the GitHub Release.
   the name on the private output channel, so it works whether or not the task sources `rw.sh` and
   needs no list of tools: the image itself answers. A later `rw_skip` does not hide it (a missing
   tool is a bug in the task, not "nothing to check"); well-formed outputs are kept. `command -v`
-  and `type` only ask, so probing for an optional tool still works.
+  and `type` only ask, so probing for an optional tool still works. `command_not_found_handle`
+  needs bash 4 or later: the runtime image has it, but `rwtask run --local` and `rwtask test`
+  under macOS's bundled bash 3.2 report the task as bash itself does (often `ok`).
 - **Breaking:** a task that omits `readOnly` (it defaults to false, i.e. "changes things") must now
   either set `readOnly: true` or declare `effects`; otherwise validation fails with
   `E_EFFECTS_REQUIRED`. The check applies when authoring/validating and publishing; the runtime

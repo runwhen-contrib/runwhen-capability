@@ -280,7 +280,7 @@ _UPPER_INPUT_BUNDLE = {
         "    outputs:\n"
         '      seen: { schema: "string" }\n'
     ),
-    # Written against the pre-H48 mapping: THRESHOLD -> T_H_R_E_S_H_O_L_D, ENV -> E_N_V.
+    # Written against the pre-0.3.0 mapping: THRESHOLD -> T_H_R_E_S_H_O_L_D, ENV -> E_N_V.
     "tasks/show.sh": (
         'source "$RW_SDK/rw.sh"\nrw_set seen "\\"t=$T_H_R_E_S_H_O_L_D e=$E_N_V\\""\n'
     ),
@@ -288,7 +288,7 @@ _UPPER_INPUT_BUNDLE = {
 
 
 def test_a_published_bundle_reading_a_legacy_mangled_env_name_still_runs(tmp_path):
-    # H48 changed input_env_name; bundles published before it read the per-letter
+    # 0.3.0 changed input_env_name; bundles published before it read the per-letter
     # names (the old validator demanded them) and must keep running unchanged.
     result = _run(_UPPER_INPUT_BUNDLE, ["show"], tmp_path, inputs={"THRESHOLD": 7, "ENV": "stg"})
     assert result.setup is None or result.setup.status != "failed", result.setup

@@ -18,7 +18,7 @@ def test_compiles_the_pgbouncer_health_fixture():
         {
             "platform": "kubernetes",
             "type": "deployment",
-            "where": {"namespace": "runwhen-env-staging", "labels.app": "pgbouncer"},
+            "where": {"namespace": "payments", "labels.app": "pgbouncer"},
         }
     ]
     assert compiled["needs"] == {
@@ -109,7 +109,7 @@ tasks:
 
 
 def test_secret_inputs_are_declared_as_secret_credential_needs():
-    """sdlc S-DB (H52): only `type: credential` inputs became needs, so papi never resolved a
+    """Before 0.3.0 only `type: credential` inputs became needs, so the platform never resolved a
     `type: secret` input and every run failed `no secret resolved`."""
     files = {
         "capability.yaml": """\

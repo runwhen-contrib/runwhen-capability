@@ -483,23 +483,23 @@ def test_the_host_never_evaluates_a_schema_with_a_regex_keyword():
 
 
 def test_a_published_bundle_calling_an_unknown_sdk_helper_still_runs(tmp_path):
-    # E_UNKNOWN_SDK_HELPER is an authoring gate (H51): the host re-validates
+    # E_UNKNOWN_SDK_HELPER is an authoring gate: the host re-validates
     # every run and must not start refusing an already-published bundle.
     source = _BASH + "rw_set_severity 3\nrw_set o '\"ran\"'\n"
     result = _run(_files("t.sh", source), tmp_path)
     assert result.setup is None or result.setup.status != "failed"
     [task] = result.tasks
     assert task.outputs == {"o": "ran"}
-    # ...and the invented helper is now caught when it runs (H57).
+    # ...and the invented helper is now caught when it runs.
     assert task.status == "failed"
     assert task.error.startswith("E_COMMAND_NOT_FOUND: 'rw_set_severity'")
 
 
-# -- a command the image doesn't have (H57) ---------------------------------------
+# -- a command the image doesn't have  ---------------------------------------
 
 
 def test_a_missing_command_fails_the_run_naming_it(tmp_path):
-    """sdlc S-DB-R: `bc` isn't on the image; bash printed "command not found",
+    """`bc` isn't on the image; bash printed "command not found",
     carried on, and the run came back ok. The image's own shell now reports it."""
     source = _BASH + "x=$(no-such-tool-xyz 1 2)\nrw_set o '\"after\"'\n"
     [task] = _run(_files("t.sh", source), tmp_path).tasks

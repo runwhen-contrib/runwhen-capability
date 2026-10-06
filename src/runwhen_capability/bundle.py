@@ -873,7 +873,7 @@ def _execute(
         }
         for name, value in resolved_inputs.items():
             text = value if isinstance(value, str) else json.dumps(value)
-            # The legacy (pre-H48) spelling too, for bundles published against it;
+            # The legacy (pre-0.3.0) spelling too, for bundles published against it;
             # never a reserved variable, and the current name wins any clash.
             legacy = legacy_input_env_name(name)
             if not is_reserved_env_name(legacy):

@@ -1,4 +1,4 @@
-"""manifest_json_schema(): the document papi serves as /capabilities/schema.json."""
+"""manifest_json_schema(): the document the platform serves as /capabilities/schema.json."""
 
 from __future__ import annotations
 

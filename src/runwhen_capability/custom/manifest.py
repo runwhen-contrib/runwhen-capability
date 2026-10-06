@@ -36,14 +36,14 @@ MAX_BUNDLE_BYTES = 256 * 1024
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
-# The pre-H48 mapping: every capital starts a new word, so an upper-case name was split
+# The pre-0.3.0 mapping: every capital starts a new word, so an upper-case name was split
 # per letter ("THRESHOLD" -> "T_H_R_E_S_H_O_L_D"). Kept only so bundles published against
 # it keep running; see legacy_input_env_name.
 _LEGACY_CAMEL_RE = re.compile(r"(?<!^)(?=[A-Z])")
 
 
 def legacy_input_env_name(name: str) -> str:
-    """The env var name input_env_name produced before H48. A published bundle is
+    """The env var name input_env_name produced before 0.3.0. A published bundle is
     immutable and may read this spelling, so the host still delivers the value under
     it and validate() still accepts reading it. Equal to input_env_name for every
     camelCase / snake_case name."""
@@ -205,7 +205,7 @@ def task_file_language(path: str) -> TaskFileLanguage | None:
     return None
 
 
-#: The description papi's /capabilities/schema.json carries, verbatim.
+#: The description the platform's /capabilities/schema.json carries, verbatim.
 MANIFEST_SCHEMA_DESCRIPTION = (
     "JSON Schema for capability.yaml, apiVersion: runwhen.com/custom-capability/v1. Generated "
     "from runwhen_capability.custom.manifest.Manifest, the same Pydantic model the SDK's "
@@ -215,7 +215,7 @@ MANIFEST_SCHEMA_DESCRIPTION = (
 
 
 def manifest_json_schema() -> dict[str, Any]:
-    """The capability.yaml JSON Schema document, as papi serves it at /capabilities/schema.json."""
+    """The capability.yaml JSON Schema the platform serves at /capabilities/schema.json."""
     model = Manifest.model_json_schema()
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

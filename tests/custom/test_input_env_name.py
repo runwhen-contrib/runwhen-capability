@@ -1,4 +1,4 @@
-"""An input's env var name (sdlc trial, 2026-10-04, H48): `THRESHOLD` mapped to
+"""An input's env var name: `THRESHOLD` mapped to
 `T_H_R_E_S_H_O_L_D`, so a task reading `$THRESHOLD` failed E_UNDECLARED_INPUT and the
 runtime would have delivered the value under the mangled name."""
 
@@ -80,7 +80,7 @@ _RESERVED_UPPER = {
 
 
 def test_an_upper_case_name_that_now_maps_to_a_reserved_var_only_warns():
-    # `ENV` was E_N_V before H48 -- harmless and published; it must not become an error.
+    # `ENV` was E_N_V before 0.3.0 -- harmless and published; it must not become an error.
     diagnostics = validate(_RESERVED_UPPER)
     assert [d for d in diagnostics if d.severity == "error"] == []
     assert any(d.severity == "warning" and d.path.endswith(".ENV") for d in diagnostics)

@@ -1,6 +1,6 @@
 """rw.sh's `rw_input`, run in a real bash: it must derive an input's env var
 name exactly as the host does (manifest.input_env_name), and fall back to the
-legacy per-letter name an older host sets (H51)."""
+legacy per-letter name an older host sets."""
 
 from __future__ import annotations
 
