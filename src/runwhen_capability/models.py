@@ -360,7 +360,7 @@ class TaskHostRequest(BaseModel):
     which RequestEnvelope does not have).
 
     `maxResultBytes`, `outputs` and `inputArtifacts` are the artifact fields:
-    the cap on the inline result (None = the runner sent none; no cap is
+    the cap on the inline result (None, or 0 or less, = unset; no cap is
     applied here), and the lease's declared artifact/spill outputs and input
     artifacts. An older runner omits all three."""
 

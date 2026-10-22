@@ -36,7 +36,8 @@ instead -- the runner refuses a bigger body anyway, and a failed result it
 accepts says why. `outputs`/`inputArtifacts` on the request are the lease's
 artifact declarations; they and a `RelayClient` for the request (the
 artifact routes -- see relay.py) travel with it into the Context each task
-gets. A result with no `maxResultBytes` is never capped here.
+gets. A result with no `maxResultBytes`, or one of 0 or less (the lease's
+"unset"), is never capped here.
 
 A `request` that carries a `bundle` (a custom capability's code, inline --
 see bundle.py) is run only when this executor was started with
@@ -208,11 +209,13 @@ def _is_safe_scope_id(scope_id: str) -> bool:
 def _encode_result(payload: dict, log, max_result_bytes: int | None = None) -> bytes:
     """Serialises one PutResult body (compact JSON), and is where the inline
     result cap lives. Only an `ok` payload is ever replaced, and only when
-    the request carried a `max_result_bytes`: if the encoded body is bigger,
-    it becomes a `failed` payload saying so -- the runner would refuse the
-    oversized body, and a small failed result is one it accepts and can
-    show. Failed payloads are never capped; they are an error message, not
-    data a task produced.
+    the request carried a positive `max_result_bytes`: if the encoded body is
+    bigger, it becomes a `failed` payload saying so -- the runner would
+    refuse the oversized body, and a small failed result is one it accepts
+    and can show. None or a value <= 0 means "unset" (the lease's 0 may be
+    forwarded raw), and no cap is applied here; the runner enforces its own
+    ceiling then. Failed payloads are never capped; they are an error
+    message, not data a task produced.
 
     A payload that cannot be encoded as JSON (a NaN or a non-JSON type in a
     task's output) likewise becomes a failed payload, so the caller always
@@ -222,7 +225,12 @@ def _encode_result(payload: dict, log, max_result_bytes: int | None = None) -> b
     except (TypeError, ValueError) as exc:
         log.error("result is not valid JSON: %s", exc)
         return _dumps({"status": "failed", "error": f"result is not valid JSON: {exc}"})
-    if max_result_bytes is None or payload.get("status") != "ok" or len(body) <= max_result_bytes:
+    if (
+        max_result_bytes is None
+        or max_result_bytes <= 0
+        or payload.get("status") != "ok"
+        or len(body) <= max_result_bytes
+    ):
         return body
     log.error(
         "result is %d bytes, over the request's maxResultBytes (%d); posting a failure instead",

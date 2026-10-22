@@ -730,6 +730,26 @@ def test_result_is_not_capped_when_the_request_carries_no_max(tmp_path):
 
 
 @responses.activate
+@pytest.mark.parametrize("unset", [0, -1])
+def test_a_non_positive_max_result_bytes_means_unset_and_applies_no_cap(tmp_path, unset):
+    """The lease's 0 means "unset" and the runner may forward it raw; the
+    runner enforces its own ceiling then, so the SDK must not cap at 0."""
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json=_next_body("req-1", task="big", maxResultBytes=unset),
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "big_result")
+
+    posted = json.loads(responses.calls[1].request.body)
+    assert posted["status"] == "ok"
+    assert posted["result"]["tasks"][0]["outputs"]["blob"] == "x" * 4096
+
+
+@responses.activate
 def test_result_is_posted_as_json_bytes_with_a_size_scaled_timeout(tmp_path, monkeypatch):
     import runwhen_capability.serve as serve_mod
 
