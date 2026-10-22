@@ -6,12 +6,15 @@ docstring: POST {relay}/v1/tasks/next -> 200|204, POST
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
 import pytest
 import responses
 
+from runwhen_capability.models import ResultEnvelope, TaskHostRequest, TaskResult
+from runwhen_capability.relay import RelayClient
 from runwhen_capability.serve import serve
 
 FIXTURES = Path(__file__).parent / "fixtures" / "capabilities"
@@ -440,8 +443,8 @@ def test_serve_rereads_the_token_immediately_before_posting_the_result(tmp_path,
     token_file = tmp_path / "token"
     token_file.write_text("token-old")
 
-    def rotate_after_running(capability, request, credentials, scope_dir, log=None):
-        result = real_run_request(capability, request, credentials, scope_dir, log=log)
+    def rotate_after_running(capability, request, credentials, scope_dir, log=None, **kwargs):
+        result = real_run_request(capability, request, credentials, scope_dir, log=log, **kwargs)
         # The rotation happens AFTER the request ran but BEFORE the result
         # is posted -- exactly the window _post_result must re-read across.
         token_file.write_text("token-new")
@@ -493,8 +496,8 @@ def test_serve_falls_back_to_the_polls_token_when_the_token_file_is_unreadable_a
     token_file = tmp_path / "token"
     token_file.write_text("token-old")
 
-    def remove_token_after_running(capability, request, credentials, scope_dir, log=None):
-        result = real_run_request(capability, request, credentials, scope_dir, log=log)
+    def remove_token_after_running(capability, request, credentials, scope_dir, log=None, **kwargs):
+        result = real_run_request(capability, request, credentials, scope_dir, log=log, **kwargs)
         token_file.unlink()  # transient unreadable-ness right before the POST
         return result
 
@@ -562,3 +565,220 @@ def test_serve_logs_a_non_2xx_on_the_result_post_instead_of_assuming_delivery(tm
         )
 
     assert "result not delivered" in caplog.text
+
+
+# -- artifact request fields and the inline result cap --------------------------
+
+
+def _next_body(request_id: str, task: str = "echo", **extra) -> dict:
+    return {
+        "requestId": request_id,
+        "request": {"version": 1, "tasks": [{"task": task, "inputs": {}}]},
+        "credentials": {},
+        "scopeId": f"scope-{request_id}",
+        "deadlineMs": 60000,
+        **extra,
+    }
+
+
+def _serve_one(tmp_path, capability: str) -> None:
+    serve(
+        relay=RELAY,
+        pool_id="pool-1",
+        workdir=tmp_path / "work",
+        capability_dir=FIXTURES / capability,
+        token_file=_token_file(tmp_path),
+        max_iterations=1,
+    )
+
+
+def test_task_host_request_accepts_artifact_fields():
+    request = TaskHostRequest.model_validate(
+        {
+            **_next_body("req-1"),
+            "maxResultBytes": 1048576,
+            "outputs": [
+                {
+                    "task": "scan",
+                    "name": "report.txt",
+                    "artifact": True,
+                    "spill": False,
+                    "maxBytes": 52428800,
+                    "contentType": "text/plain",
+                    "wildcard": False,
+                },
+                {"task": "scan", "name": "logs", "spill": True, "maxBytes": 1024},
+                {"task": "scan", "name": "shots", "artifact": True, "wildcard": True},
+            ],
+            "inputArtifacts": [{"input": "prior", "sizeBytes": 12, "sha256": "ab" * 32}],
+        }
+    )
+
+    assert request.maxResultBytes == 1048576
+    report, logs, shots = request.outputs
+    assert (report.task, report.name, report.artifact, report.spill) == (
+        "scan",
+        "report.txt",
+        True,
+        False,
+    )
+    assert (report.maxBytes, report.contentType, report.wildcard) == (
+        52428800,
+        "text/plain",
+        False,
+    )
+    assert logs.spill and not logs.artifact and logs.contentType is None
+    assert shots.wildcard
+    (prior,) = request.inputArtifacts
+    assert (prior.input, prior.sizeBytes, prior.sha256) == ("prior", 12, "ab" * 32)
+
+
+def test_task_host_request_artifact_fields_are_optional():
+    request = TaskHostRequest.model_validate(_next_body("req-1"))
+
+    assert request.maxResultBytes is None
+    assert request.outputs == []
+    assert request.inputArtifacts == []
+
+
+@responses.activate
+def test_result_over_max_posts_small_failure(tmp_path):
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json=_next_body("req-1", task="big", maxResultBytes=1024),
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "big_result")
+
+    result_call = responses.calls[1].request
+    assert len(result_call.body) < 1024
+    posted = json.loads(result_call.body)
+    assert posted["status"] == "failed"
+    assert posted["error"].startswith("E_RESULT_TOO_LARGE")
+    assert "result" not in posted
+
+
+@responses.activate
+def test_result_over_max_error_text_names_both_sizes(tmp_path, monkeypatch):
+    import runwhen_capability.serve as serve_mod
+
+    envelope = ResultEnvelope(
+        tasks=[TaskResult(task="big", status="ok", outputs={"blob": "é" * 3000})]
+    )
+    monkeypatch.setattr(serve_mod, "run_request", lambda *args, **kwargs: envelope)
+    # N is the byte length of the serialised ok payload as posted: compact
+    # separators, non-ASCII escaped (the same wire form as before the cap).
+    ok_payload = {"status": "ok", "result": envelope.model_dump(mode="json")}
+    n = len(json.dumps(ok_payload, separators=(",", ":")).encode())
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json=_next_body("req-1", maxResultBytes=2000),
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "echo")
+
+    assert json.loads(responses.calls[1].request.body) == {
+        "status": "failed",
+        "error": (
+            f"E_RESULT_TOO_LARGE: result is {n} bytes; maxResultBytes is 2000; "
+            "write large data with ctx.artifacts"
+        ),
+    }
+
+
+@responses.activate
+def test_result_at_or_under_max_is_posted_unchanged(tmp_path, monkeypatch):
+    import runwhen_capability.serve as serve_mod
+
+    envelope = ResultEnvelope(
+        tasks=[TaskResult(task="big", status="ok", outputs={"blob": "x" * 500})]
+    )
+    monkeypatch.setattr(serve_mod, "run_request", lambda *args, **kwargs: envelope)
+    ok_payload = {"status": "ok", "result": envelope.model_dump(mode="json")}
+    size = len(json.dumps(ok_payload, separators=(",", ":")).encode())
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json=_next_body("req-1", maxResultBytes=size),  # exactly at the cap is allowed
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "echo")
+
+    assert json.loads(responses.calls[1].request.body) == ok_payload
+
+
+@responses.activate
+def test_result_is_not_capped_when_the_request_carries_no_max(tmp_path):
+    responses.add(
+        responses.POST, f"{RELAY}/v1/tasks/next", json=_next_body("req-1", task="big"), status=200
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "big_result")
+
+    posted = json.loads(responses.calls[1].request.body)
+    assert posted["status"] == "ok"
+    assert posted["result"]["tasks"][0]["outputs"]["blob"] == "x" * 4096
+
+
+@responses.activate
+def test_result_is_posted_as_json_bytes_with_a_size_scaled_timeout(tmp_path, monkeypatch):
+    import runwhen_capability.serve as serve_mod
+
+    envelope = ResultEnvelope(
+        tasks=[TaskResult(task="big", status="ok", outputs={"blob": "x" * (3 * (1 << 20))})]
+    )
+    monkeypatch.setattr(serve_mod, "run_request", lambda *args, **kwargs: envelope)
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/next", json=_next_body("req-1"), status=200)
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "echo")
+
+    result_call = responses.calls[1].request
+    assert result_call.headers["Content-Type"] == "application/json"
+    assert result_call.headers["Authorization"] == "Bearer test-token"
+    assert isinstance(result_call.body, bytes)
+    timeout = result_call.req_kwargs["timeout"]
+    assert timeout == serve_mod.RESULT_TIMEOUT + len(result_call.body) // (1 << 20)
+    assert timeout > serve_mod.RESULT_TIMEOUT
+
+
+@responses.activate
+def test_serve_hands_the_relay_and_artifact_fields_to_run_request(tmp_path, monkeypatch):
+    import runwhen_capability.serve as serve_mod
+
+    seen: dict = {}
+
+    def capture(capability, request, credentials, scope_dir, log=None, **kwargs):
+        seen.update(kwargs)
+        return ResultEnvelope()
+
+    monkeypatch.setattr(serve_mod, "run_request", capture)
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json=_next_body(
+            "req-9",
+            outputs=[{"task": "echo", "name": "r.txt", "artifact": True}],
+            inputArtifacts=[{"input": "prior", "sizeBytes": 3, "sha256": "cd" * 32}],
+        ),
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-9/result", json={}, status=200)
+
+    _serve_one(tmp_path, "echo")
+
+    relay = seen["relay"]
+    assert isinstance(relay, RelayClient)
+    assert relay.request_id == "req-9"
+    assert relay.base_url == RELAY
+    assert [o.name for o in seen["outputs"]] == ["r.txt"]
+    assert [i.input for i in seen["input_artifacts"]] == ["prior"]

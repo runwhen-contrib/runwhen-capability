@@ -11,13 +11,21 @@ import os
 import signal
 import subprocess
 import threading
+from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .errors import CredentialNotFoundError, OutputTooLargeError, SkipTask
 from .findings import FindingsClient
 from .git import GitClient
+from .models import InputArtifactDecl, OutputDecl
 from .repo_fs import RepoFsClient
 from .sarif import SARIF_BYTE_BUDGET, SarifClient
+
+if TYPE_CHECKING:
+    # Annotation only: a bundle's Python child process imports this module and
+    # never touches the relay, so it must not pay for importing requests.
+    from .relay import RelayClient
 
 DEFAULT_RUN_TIMEOUT = 600  # seconds
 
@@ -102,17 +110,25 @@ def _drain(stream, budget: int, chunks: list[str], state: dict, kill) -> None:
 
 
 class StorageClient:
-    """`ctx.storage` -- object storage. Reserved: results travel inline in
-    the result envelope, and no storage backend exists yet."""
+    """`ctx.storage` -- retired. Large data goes through `ctx.artifacts`;
+    this stays only so code written against the old name fails with a
+    pointer to its replacement instead of an AttributeError."""
 
     def __init__(self, ctx: Context) -> None:
         self._ctx = ctx
 
     def put(self, name: str, data: bytes):
-        raise NotImplementedError(
-            "ctx.storage.put() is not implemented: results travel inline in the "
-            "result envelope; no object storage backend exists yet"
-        )
+        raise NotImplementedError("use ctx.artifacts")
+
+
+class ArtifactsClient:
+    """`ctx.artifacts` -- writing and reading artifacts through the runner's
+    relay. A stub for now: the write and read methods arrive in a later
+    change. It already holds the Context it will read the relay, the task
+    name and the declared outputs/inputs from."""
+
+    def __init__(self, ctx: Context) -> None:
+        self._ctx = ctx
 
 
 class Context:
@@ -120,7 +136,14 @@ class Context:
     and `operation` are the task host's own knowledge (from the manifest and
     the request), never read by the task function itself -- they exist on
     Context so ctx.sarif and ctx.findings can tag findings with them without
-    the task passing them explicitly."""
+    the task passing them explicitly.
+
+    The keyword-only arguments carry what `ctx.artifacts` needs, all supplied
+    by the task host from the request and unset outside `rwtask serve`
+    (`rwtask run` has no relay): `relay` is the client for the runner's
+    relay; `task` is the name of the task (or setup task) this Context runs;
+    `outputs` and `input_artifacts` are the request's declared artifact
+    outputs and bound input artifacts."""
 
     def __init__(
         self,
@@ -130,6 +153,11 @@ class Context:
         credentials: dict[str, str] | None = None,
         log: logging.Logger | None = None,
         allow_anonymous_credentials: bool = False,
+        *,
+        relay: RelayClient | None = None,
+        task: str | None = None,
+        outputs: Sequence[OutputDecl] = (),
+        input_artifacts: Sequence[InputArtifactDecl] = (),
     ) -> None:
         self.capability = capability
         self.operation = operation
@@ -141,11 +169,16 @@ class Context:
         # credential to anonymous must be a deliberate local-dev act, not
         # something reachable from a running pod.
         self._allow_anonymous_credentials = allow_anonymous_credentials
+        self.relay = relay
+        self.task = task
+        self.outputs = list(outputs)
+        self.input_artifacts = list(input_artifacts)
 
         self.git = GitClient(self)
         self.sarif = SarifClient(self)
         self.findings = FindingsClient(self)
         self.storage = StorageClient(self)
+        self.artifacts = ArtifactsClient(self)
         self.repo_fs = RepoFsClient(self)
 
     def credential(self, name: str, optional: bool = False) -> str | None:

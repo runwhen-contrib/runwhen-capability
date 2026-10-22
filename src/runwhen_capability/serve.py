@@ -4,7 +4,8 @@ Relay HTTP contract (this is the wire the runner must implement to match):
 
     POST {relay}/v1/tasks/next
         body: {"poolId": "<poolId>"}
-        -> 200 {"requestId", "request", "credentials": {name: value}, "scopeId", "deadlineMs"}
+        -> 200 {"requestId", "request", "credentials": {name: value}, "scopeId", "deadlineMs",
+                "maxResultBytes"?, "outputs"?, "inputArtifacts"?}
            (the "request" field is a RequestEnvelope; see models.py)
         -> 204 when idle (the server may hold the connection up to ~30s)
 
@@ -27,6 +28,15 @@ dropping the result (see _post_result). The token file path comes from
 --token-file, else the EXECUTOR_TOKEN_FILE env var, else DEFAULT_TOKEN_FILE.
 A missing/unreadable token file at GetTask time is logged and the loop
 keeps polling -- it never falls back to an unauthenticated request.
+
+A request may carry `maxResultBytes`. The result body is serialised (compact
+JSON) before it is posted, and an `ok` result whose body is larger than that
+is replaced by `{"status": "failed", "error": "E_RESULT_TOO_LARGE: ..."}`
+instead -- the runner refuses a bigger body anyway, and a failed result it
+accepts says why. `outputs`/`inputArtifacts` on the request are the lease's
+artifact declarations; they and a `RelayClient` for the request (the
+artifact routes -- see relay.py) travel with it into the Context each task
+gets. A result with no `maxResultBytes` is never capped here.
 
 A `request` that carries a `bundle` (a custom capability's code, inline --
 see bundle.py) is run only when this executor was started with
@@ -59,6 +69,7 @@ a crash.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -72,6 +83,7 @@ from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
 from .models import BundleRequestEnvelope, TaskHostRequest
+from .relay import RelayClient
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
@@ -193,26 +205,72 @@ def _is_safe_scope_id(scope_id: str) -> bool:
     return scope_id not in ("", ".", "..") and scope_id == Path(scope_id).name
 
 
+def _encode_result(payload: dict, log, max_result_bytes: int | None = None) -> bytes:
+    """Serialises one PutResult body (compact JSON), and is where the inline
+    result cap lives. Only an `ok` payload is ever replaced, and only when
+    the request carried a `max_result_bytes`: if the encoded body is bigger,
+    it becomes a `failed` payload saying so -- the runner would refuse the
+    oversized body, and a small failed result is one it accepts and can
+    show. Failed payloads are never capped; they are an error message, not
+    data a task produced.
+
+    A payload that cannot be encoded as JSON (a NaN or a non-JSON type in a
+    task's output) likewise becomes a failed payload, so the caller always
+    has bytes to post and the loop never raises."""
+    try:
+        body = _dumps(payload)
+    except (TypeError, ValueError) as exc:
+        log.error("result is not valid JSON: %s", exc)
+        return _dumps({"status": "failed", "error": f"result is not valid JSON: {exc}"})
+    if max_result_bytes is None or payload.get("status") != "ok" or len(body) <= max_result_bytes:
+        return body
+    log.error(
+        "result is %d bytes, over the request's maxResultBytes (%d); posting a failure instead",
+        len(body),
+        max_result_bytes,
+    )
+    return _dumps(
+        {
+            "status": "failed",
+            "error": (
+                f"E_RESULT_TOO_LARGE: result is {len(body)} bytes; "
+                f"maxResultBytes is {max_result_bytes}; write large data with ctx.artifacts"
+            ),
+        }
+    )
+
+
+def _dumps(payload: dict) -> bytes:
+    # Compact separators keep the size we measure small and equal to what is
+    # sent. Like `requests`' json= (which this replaced), it escapes non-ASCII
+    # (so encoding can never fail on a stray surrogate) and refuses NaN.
+    return json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
+
+
 def _post_result(
     session,
     relay: str,
     request_id: str,
-    payload: dict,
+    body: bytes,
     token_file: Path,
     fallback_token: str,
     log,
 ) -> None:
-    """POSTs one PutResult. Re-reads the bearer token from `token_file`
-    immediately before posting, rather than reusing the one the poll
-    started with: a request can run up to the manifest's
-    requestTimeoutSeconds before this runs, so a mid-request rotation would otherwise
-    mean the POST carries a now-stale token and gets a 401 -- silently
-    losing a result that was already computed, which defeats the whole
-    reason the token is re-read per poll rather than cached at startup (see
-    the module docstring). If the token file is briefly unreadable right at
-    this moment, falls back to `fallback_token` -- the token the poll
-    already had -- and logs the fallback, rather than dropping a result in
-    hand over a transient read.
+    """POSTs one PutResult; `body` is the JSON that `_encode_result` made.
+    Re-reads the bearer token from `token_file` immediately before posting,
+    rather than reusing the one the poll started with: a request can run up
+    to the manifest's requestTimeoutSeconds before this runs, so a
+    mid-request rotation would otherwise mean the POST carries a now-stale
+    token and gets a 401 -- silently losing a result that was already
+    computed, which defeats the whole reason the token is re-read per poll
+    rather than cached at startup (see the module docstring). If the token
+    file is briefly unreadable right at this moment, falls back to
+    `fallback_token` -- the token the poll already had -- and logs the
+    fallback, rather than dropping a result in hand over a transient read.
+
+    The timeout grows by a second per MiB of body: a result near the cap
+    takes real time to upload, and the flat RESULT_TIMEOUT is sized for a
+    small one.
 
     A transport failure or a non-2xx is logged and dropped -- the runner's
     lease expiry is what recovers the request -- but it is never treated as
@@ -226,13 +284,13 @@ def _post_result(
             request_id,
         )
         token = fallback_token
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     try:
         resp = session.post(
             f"{relay}/v1/tasks/{request_id}/result",
-            json=payload,
-            timeout=RESULT_TIMEOUT,
+            data=body,
+            timeout=RESULT_TIMEOUT + len(body) // (1 << 20),
             headers=headers,
         )
     except requests.RequestException as exc:
@@ -339,7 +397,9 @@ def _poll_once(
             session,
             relay,
             task_request.requestId,
-            {"status": "failed", "error": f"invalid scopeId {task_request.scopeId!r}"},
+            _encode_result(
+                {"status": "failed", "error": f"invalid scopeId {task_request.scopeId!r}"}, log
+            ),
             token_file,
             token,
             log,
@@ -360,7 +420,7 @@ def _poll_once(
             session,
             relay,
             task_request.requestId,
-            {"status": "failed", "error": BUNDLES_NOT_ALLOWED},
+            _encode_result({"status": "failed", "error": BUNDLES_NOT_ALLOWED}, log),
             token_file,
             token,
             log,
@@ -369,6 +429,9 @@ def _poll_once(
 
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
+    # One client per request: it carries the request id the artifact routes
+    # are scoped to, and re-reads the token file on every call.
+    relay_client = RelayClient(relay, token_file, task_request.requestId, session)
     try:
         if is_bundle:
             # A bundle's code travels with the request, not baked into this
@@ -384,6 +447,9 @@ def _poll_once(
                 scope_dir,
                 log=log.getChild(task_request.requestId),
                 deadline_seconds=task_request.deadlineMs / 1000,
+                relay=relay_client,
+                outputs=task_request.outputs,
+                input_artifacts=task_request.inputArtifacts,
             )
         else:
             result = run_request(
@@ -392,6 +458,9 @@ def _poll_once(
                 task_request.credentials,
                 scope_dir,
                 log=log.getChild(task_request.requestId),
+                relay=relay_client,
+                outputs=task_request.outputs,
+                input_artifacts=task_request.inputArtifacts,
             )
         payload = {"status": "ok", "result": result.model_dump(mode="json")}
     except Exception as exc:  # noqa: BLE001 -- one request must never take down the loop
@@ -408,4 +477,5 @@ def _poll_once(
                 capability, scope_dir, workdir, stateful_scopes, max_stateful_scopes, log
             )
 
-    _post_result(session, relay, task_request.requestId, payload, token_file, token, log)
+    body = _encode_result(payload, log, task_request.maxResultBytes)
+    _post_result(session, relay, task_request.requestId, body, token_file, token, log)

@@ -1,0 +1,251 @@
+"""RelayClient against a real local server (tests/relay_server.py): the
+chunked artifact PUT, the input GET, and the mapping of the relay's error
+responses onto the artifact exceptions."""
+
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+import pytest
+import requests
+from relay_server import Response
+
+from runwhen_capability.errors import (
+    ArtifactBusyError,
+    ArtifactError,
+    ArtifactExistsError,
+    ArtifactLeaseLostError,
+    ArtifactQuotaError,
+    ArtifactsUnavailableError,
+    ArtifactTooLargeError,
+    ArtifactUndeclaredError,
+    ResultTooLargeError,
+)
+from runwhen_capability.relay import RelayClient
+
+CREATED = {
+    "artifactRef": "art_abc",
+    "sizeBytes": 9,
+    "sha256": "0" * 64,
+    "lineCount": 1,
+    "isText": True,
+}
+
+
+def _client(relay_server, tmp_path: Path, token: str = "tok-1") -> RelayClient:
+    token_file = tmp_path / "token"
+    token_file.write_text(token)
+    return RelayClient(relay_server.url, token_file, "req-1", requests.Session())
+
+
+def _put(client: RelayClient, body, name: str = "report.txt") -> dict:
+    return client.put_artifact(task="scan", name=name, content_type="text/plain", body=body)
+
+
+def test_put_artifact_streams_chunked_body(relay_server, tmp_path):
+    relay_server.script("PUT", "/v1/tasks/req-1/artifacts/", Response(201, json=CREATED))
+    pieces = [b"abc", b"d" * 100_000, b"", b"efg"]  # the empty piece must not end the body early
+
+    created = _put(_client(relay_server, tmp_path), iter(pieces))
+
+    assert created == CREATED
+    (seen,) = relay_server.requests
+    assert seen.method == "PUT"
+    assert seen.path == "/v1/tasks/req-1/artifacts/report.txt"
+    assert seen.body == b"".join(pieces)
+    assert seen.body_complete  # the terminating 0-length chunk arrived
+    assert seen.chunked
+    assert seen.header("Transfer-Encoding") == "chunked"
+    assert seen.header("Content-Length") is None
+    assert seen.header("X-RW-Task") == "scan"
+    assert seen.header("Content-Type") == "text/plain"
+    assert seen.header("Authorization") == "Bearer tok-1"
+
+
+def test_put_artifact_accepts_a_list_of_chunks(relay_server, tmp_path):
+    """`body` is any Iterable[bytes]; requests would form-encode a bare list."""
+    relay_server.script("PUT", "/", Response(201, json=CREATED))
+
+    _put(_client(relay_server, tmp_path), [b"one", b"two"])
+
+    assert relay_server.requests[0].body == b"onetwo"
+    assert relay_server.requests[0].chunked
+
+
+def test_put_artifact_empty_body(relay_server, tmp_path):
+    relay_server.script("PUT", "/", Response(201, json=CREATED))
+
+    _put(_client(relay_server, tmp_path), iter(()))
+
+    (seen,) = relay_server.requests
+    assert seen.body == b""
+    assert seen.body_complete
+
+
+def test_put_artifact_quotes_the_name_but_keeps_slashes(relay_server, tmp_path):
+    relay_server.script("PUT", "/", Response(201, json=CREATED))
+
+    _put(_client(relay_server, tmp_path), [b"x"], name="out dir/a b#1.txt")
+
+    assert relay_server.requests[0].path == "/v1/tasks/req-1/artifacts/out%20dir/a%20b%231.txt"
+
+
+def test_put_artifact_rereads_the_token_file_on_every_call(relay_server, tmp_path):
+    relay_server.script("PUT", "/", Response(201, json=CREATED), Response(201, json=CREATED))
+    client = _client(relay_server, tmp_path, token="tok-old")
+
+    _put(client, [b"a"])
+    (tmp_path / "token").write_text("tok-new\n")
+    _put(client, [b"b"])
+
+    assert [r.header("Authorization") for r in relay_server.requests] == [
+        "Bearer tok-old",
+        "Bearer tok-new",
+    ]
+
+
+def test_put_artifact_maps_413_to_too_large(relay_server, tmp_path):
+    """The runner answers 413 after reading maxBytes+1 bytes, while the
+    client is still mid-upload; the client must surface the mapped error,
+    not a connection error."""
+    max_bytes = 1024
+    relay_server.script(
+        "PUT",
+        "/",
+        Response(
+            413,
+            json={"code": "E_ARTIFACT_TOO_LARGE", "maxBytes": max_bytes},
+            read_limit=max_bytes + 1,
+        ),
+    )
+    megabyte = b"x" * (1 << 20)
+    body = (megabyte for _ in range(16))  # far more than the socket buffers hold
+
+    with pytest.raises(ArtifactTooLargeError) as excinfo:
+        _put(_client(relay_server, tmp_path), body)
+
+    assert excinfo.value.code == "E_ARTIFACT_TOO_LARGE"
+    assert excinfo.value.max_bytes == max_bytes
+    assert str(max_bytes) in excinfo.value.message
+    (seen,) = relay_server.requests
+    assert seen.body_length == max_bytes + 1  # the server stopped reading there
+    assert not seen.body_complete
+
+
+def test_put_artifact_maps_409_exists(relay_server, tmp_path):
+    relay_server.script("PUT", "/", Response(409, json={"code": "E_ARTIFACT_EXISTS"}))
+
+    with pytest.raises(ArtifactExistsError) as excinfo:
+        _put(_client(relay_server, tmp_path), [b"x"])
+
+    assert excinfo.value.code == "E_ARTIFACT_EXISTS"
+
+
+def test_put_artifact_maps_503_busy_sent_before_any_body_is_read(relay_server, tmp_path):
+    relay_server.script("PUT", "/", Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0))
+    megabyte = b"x" * (1 << 20)
+
+    with pytest.raises(ArtifactBusyError):
+        _put(_client(relay_server, tmp_path), (megabyte for _ in range(8)))
+
+    assert relay_server.requests[0].body_length == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "exc_type"),
+    [
+        (404, "E_ARTIFACT_UNDECLARED", ArtifactUndeclaredError),
+        (409, "E_ARTIFACT_EXISTS", ArtifactExistsError),
+        (409, "E_ARTIFACT_LEASE_LOST", ArtifactLeaseLostError),
+        (413, "E_ARTIFACT_TOO_LARGE", ArtifactTooLargeError),
+        (422, "E_ARTIFACT_QUOTA", ArtifactQuotaError),
+        (422, "E_ARTIFACTS_DISABLED", ArtifactsUnavailableError),
+        (422, "E_ARTIFACTS_UNSUPPORTED", ArtifactsUnavailableError),
+        (503, "E_ARTIFACT_BUSY", ArtifactBusyError),
+    ],
+)
+def test_raise_for_maps_each_relay_code_to_its_exception(status, code, exc_type):
+    resp = _response(status, f'{{"code": "{code}", "message": "from the relay"}}')
+
+    with pytest.raises(exc_type) as excinfo:
+        RelayClient._raise_for(resp)
+
+    assert type(excinfo.value) is exc_type
+    assert excinfo.value.code == code
+    assert excinfo.value.message == "from the relay"
+    assert isinstance(excinfo.value, ArtifactError)
+
+
+def test_raise_for_404_without_a_code_is_undeclared():
+    """The input GET's 404 has no JSON body."""
+    with pytest.raises(ArtifactUndeclaredError) as excinfo:
+        RelayClient._raise_for(_response(404, ""))
+
+    assert excinfo.value.code == "E_ARTIFACT_UNDECLARED"
+
+
+def test_raise_for_413_keeps_max_bytes():
+    resp = _response(413, '{"code": "E_ARTIFACT_TOO_LARGE", "maxBytes": 2048}')
+
+    with pytest.raises(ArtifactTooLargeError) as excinfo:
+        RelayClient._raise_for(resp)
+
+    assert excinfo.value.max_bytes == 2048
+
+
+@pytest.mark.parametrize(
+    ("status", "text", "code"),
+    [
+        (401, "", "HTTP_401"),
+        (500, "<html>boom</html>", "HTTP_500"),
+        (409, '{"code": "E_SOMETHING_NEW"}', "E_SOMETHING_NEW"),
+        (422, '{"message": "no code here"}', "HTTP_422"),
+        (502, "[1, 2]", "HTTP_502"),
+    ],
+)
+def test_raise_for_anything_else_is_the_base_error_naming_the_status(status, text, code):
+    with pytest.raises(ArtifactError) as excinfo:
+        RelayClient._raise_for(_response(status, text))
+
+    err = excinfo.value
+    assert type(err) is ArtifactError
+    assert err.code == code
+    assert str(status) in err.message
+
+
+def test_result_too_large_error_is_an_ordinary_exception():
+    assert issubclass(ResultTooLargeError, Exception)
+    assert not issubclass(ResultTooLargeError, ArtifactError)
+
+
+def test_open_input_returns_a_streaming_response(relay_server, tmp_path):
+    payload = b"input-bytes" * 1000
+    relay_server.script(
+        "GET",
+        "/v1/tasks/req-1/artifacts/in/",
+        Response(200, body=payload, headers={"X-RW-Sha256": hashlib.sha256(payload).hexdigest()}),
+    )
+
+    resp = _client(relay_server, tmp_path).open_input("prior")
+
+    with resp:
+        assert resp.headers["X-RW-Sha256"] == hashlib.sha256(payload).hexdigest()
+        assert b"".join(resp.iter_content(chunk_size=4096)) == payload
+    (seen,) = relay_server.requests
+    assert seen.path == "/v1/tasks/req-1/artifacts/in/prior"
+    assert seen.header("Authorization") == "Bearer tok-1"
+
+
+def test_open_input_404_is_undeclared(relay_server, tmp_path):
+    relay_server.script("GET", "/", Response(404, body=b"not declared"))
+
+    with pytest.raises(ArtifactUndeclaredError):
+        _client(relay_server, tmp_path).open_input("nope")
+
+
+def _response(status: int, text: str) -> requests.Response:
+    resp = requests.Response()
+    resp.status_code = status
+    resp._content = text.encode()
+    return resp

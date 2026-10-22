@@ -1,0 +1,6 @@
+# Minimal fixture capability used by tests/test_serve.py: one task returns
+# a result far larger than a small maxResultBytes.
+capability: rw-big-result-fixture
+version: "0.0.0"
+tasks:
+  - name: big
