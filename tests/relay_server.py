@@ -40,6 +40,11 @@ body is at most `keep_limit` (1 MiB by default); a bigger body leaves
 `body` as None and `body_length`/`body_sha256` as the way to check it.
 A test that wants the bytes of a bigger body sets `relay_server.keep_limit`
 before sending.
+
+Memory-bound tests. `PieceStream` produces a large body lazily, one piece at
+a time, and keeps only its length and sha256 -- so a test can upload tens of
+MiB, compare `RecordedRequest.body_length`/`body_sha256` against the stream's,
+and measure (tracemalloc) that the code under test never held the whole body.
 """
 
 from __future__ import annotations
@@ -261,6 +266,40 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
         do_GET = do_PUT = do_POST = do_DELETE = do_HEAD = _handle
 
     return Handler
+
+
+class PieceStream:
+    """An iterator of `total` bytes in pieces of `piece_size`, each created
+    only when asked for and dropped once yielded, so the stream itself holds
+    one piece at a time. Piece `i` is filled with the byte `i % 251`, so a
+    lost, repeated or reordered piece changes the sha256. After (or while)
+    it is consumed, `.sent` is the bytes yielded so far and `.sha256` their
+    hex digest -- what the server should have recorded in `body_length` and
+    `body_sha256`."""
+
+    def __init__(self, total: int, piece_size: int = 64 * 1024) -> None:
+        self.total = total
+        self.piece_size = piece_size
+        self.sent = 0
+        self._index = 0
+        self._digest = hashlib.sha256()
+
+    @property
+    def sha256(self) -> str:
+        return self._digest.hexdigest()
+
+    def __iter__(self) -> PieceStream:
+        return self
+
+    def __next__(self) -> bytes:
+        if self.sent >= self.total:
+            raise StopIteration
+        size = min(self.piece_size, self.total - self.sent)
+        piece = bytes([self._index % 251]) * size
+        self._index += 1
+        self.sent += size
+        self._digest.update(piece)
+        return piece
 
 
 class _BodySink:

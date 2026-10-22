@@ -5,11 +5,12 @@ responses onto the artifact exceptions."""
 from __future__ import annotations
 
 import hashlib
+import tracemalloc
 from pathlib import Path
 
 import pytest
 import requests
-from relay_server import Response
+from relay_server import PieceStream, Response
 
 from runwhen_capability.errors import (
     ArtifactBusyError,
@@ -61,6 +62,39 @@ def test_put_artifact_streams_chunked_body(relay_server, tmp_path):
     assert seen.header("X-RW-Task") == "scan"
     assert seen.header("Content-Type") == "text/plain"
     assert seen.header("Authorization") == "Bearer tok-1"
+
+
+def test_put_artifact_streams_without_buffering_the_body(relay_server, tmp_path):
+    """Pins put_artifact's buffer bound: 32 MiB goes up in 64 KiB pieces while
+    the client's Python allocations peak at a few MiB, not at the body size.
+
+    Guards against any regression that materialises the body -- `list(body)`,
+    `b"".join(body)`, reading the iterator to size it -- which "chunked, no
+    Content-Length" alone would not catch. The measured peak counts every
+    thread, the fixture server's too (it keeps at most 1 MiB of body); a
+    buffering client would hold the full 32 MiB. Later upload tasks reuse
+    this shape for their own paths."""
+    total = 32 * (1 << 20)
+    relay_server.script("PUT", "/", Response(201, json=CREATED))
+    stream = PieceStream(total, piece_size=64 * 1024)
+    client = _client(relay_server, tmp_path)
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        _put(client, stream)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    (seen,) = relay_server.requests
+    assert stream.sent == total
+    assert seen.body_length == total
+    assert seen.body_sha256 == stream.sha256
+    assert seen.body is None  # over the fixture's keep_limit: it did not retain it either
+    assert seen.chunked
+    assert seen.body_complete
+    assert peak < 8 * (1 << 20), f"peak {peak / (1 << 20):.1f} MiB while uploading 32 MiB"
 
 
 def test_put_artifact_accepts_a_list_of_chunks(relay_server, tmp_path):
