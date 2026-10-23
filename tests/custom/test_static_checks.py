@@ -3,6 +3,8 @@ that depend on it not mistaking prose for code."""
 
 from __future__ import annotations
 
+import pytest
+
 from runwhen_capability.custom import validate
 from runwhen_capability.custom.diagnostics import (
     E_OUTPUT_UNDECLARED,
@@ -342,7 +344,38 @@ def test_rw_artifact_names_are_extracted_with_their_lines():
         "seq 1 3 | rw_artifact dump -\n"
         "cat <<EOF\nrw_artifact heredoc -\nEOF\n"
         "rw_artifact 'report.txt' ./r.txt\n"
-        'rw_artifact "files/a.bin" -\n'
+        'rw_artifact "v2.tar.gz" -\n'
         'rw_artifact "$dynamic" -\n'
+        'rw_artifact "dump$suffix" -\n'
+        "rw_artifact dump-${suffix} -\n"
     )
-    assert bash_artifact_registrations(text) == [(2, "dump"), (6, "report.txt"), (7, "files/a.bin")]
+    assert bash_artifact_registrations(text) == [(2, "dump"), (6, "report.txt"), (7, "v2.tar.gz")]
+
+
+def test_rw_artifact_names_are_taken_whole_so_a_bad_one_is_not_read_as_another():
+    text = (
+        'rw_artifact "my report.txt" -\n'
+        "rw_artifact dump:v2 -\n"
+        "rw_artifact -x -\n"
+        "rw_artifact a/b -\n"
+        'rw_artifact "" -\n'
+        "x=$(rw_artifact dump -)\n"
+        "rw_artifact dump; rw_artifact other\n"
+    )
+    assert [name for _, name in bash_artifact_registrations(text)] == [
+        "my report.txt",
+        "dump:v2",
+        "-x",
+        "a/b",
+        "",
+        "dump",
+        "dump",
+        "other",
+    ]
+
+
+@pytest.mark.parametrize("name", ["my report.txt", "dump:v2", "-x", "a/b", ".hidden", ""])
+def test_rw_artifact_with_a_name_that_is_not_a_plain_segment_is_flagged(name):
+    quoted = f'"{name}"'
+    (message,) = _messages_for(f"seq 1 3 | rw_artifact {quoted} -\n", E_OUTPUT_UNDECLARED)
+    assert "not a valid artifact name" in message

@@ -27,3 +27,15 @@ def test_it_documents_artifact_outputs():
     assert (
         defs["ArtifactSpec"]["properties"]["contentType"]["default"] == "application/octet-stream"
     )
+
+
+def test_it_states_the_max_size_rule_for_editors():
+    import re
+
+    max_size = manifest_json_schema()["$defs"]["ArtifactSpec"]["properties"]["maxSize"]
+    (string_type,) = [branch for branch in max_size["anyOf"] if branch.get("type") == "string"]
+    pattern = re.compile(string_type["pattern"])
+    for good in ("0", "1024", "512Mi", "2Gi", "1Ti", "3Ki"):
+        assert pattern.search(good), good
+    for bad in ("5GB", "1.5Gi", "-1", "1gi", "Gi", "1Pi", ""):
+        assert not pattern.search(bad), bad

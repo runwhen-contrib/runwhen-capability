@@ -12,12 +12,16 @@ same private-fd wire format through -- one JSON line per event:
     {"op": "append", "name": <output>, "value": <json>}
     {"op": "skip",   "reason": <string>}
 
+(bash's `rw_artifact` also writes {"op": "artifact", "name": <output>, "path":
+<file>}; this entry point never does -- `ctx.artifacts` writes into
+RW_ARTIFACTS_DIR instead.)
+
 A successful `main()` return value is emitted as one "set" event per key (a
 value with a `model_dump`, such as the ArtifactRef `ctx.artifacts` returns, is
-written as its JSON form). Any
-other exception is left to propagate: this process's non-zero exit code (and
-its stderr, captured by bundle.py as part of the task's log) is how bundle.py
-learns the task failed -- there is no separate error channel.
+written as its JSON form). Any other exception is left to propagate: this
+process's non-zero exit code (and its stderr, captured by bundle.py as part of
+the task's log) is how bundle.py learns the task failed -- there is no
+separate error channel.
 
 Everything this process needs arrives by environment variable -- see
 bundle.py's _execute() for exactly what it sets:

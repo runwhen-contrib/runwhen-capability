@@ -12,7 +12,8 @@ Static codes (validate() only, no execution):
 - E_UNDECLARED_INPUT -- a Python main() parameter, or a bash $VAR read (directly
   or via rw_input), with no declared input.
 - E_OUTPUT_UNDECLARED -- a returned or rw_append/rw_set output name that isn't
-  declared, or an `rw_artifact` name that isn't a declared artifact output.
+  declared, or an `rw_artifact` name that isn't a declared artifact output (or
+  isn't a valid artifact name at all).
 - E_READONLY_WRITE -- kubectl delete/apply/patch/edit/scale/rollout restart/exec
   and similar in a readOnly task.
 - E_DUPLICATE_NAME -- a name is used twice.
@@ -33,15 +34,16 @@ Runtime codes (the bundle host, bundle.py) reuse the same string constants:
 E_INPUT_TYPE, E_OUTPUT_SCHEMA, E_OUTPUT_TOO_LARGE, E_OUTPUT_MALFORMED,
 E_COMMAND_NOT_FOUND, E_TIMEOUT.
 E_OUTPUT_MALFORMED fails a run when a line on the private output channel is not
-a well-formed rw_set/rw_append/rw_skip event (the line is dropped, so an output
-was lost); well-formed lines still populate outputs.
+a well-formed rw_set/rw_append/rw_skip/rw_artifact event (the line is dropped,
+so an output was lost); well-formed lines still populate outputs.
 E_COMMAND_NOT_FOUND fails a bash task that ran a command the image doesn't have
 (bash's command_not_found_handle reports it), even if the task then skips.
 E_ARTIFACT_PATH fails a task whose artifact file is outside its scope, behind a
 symlink or not a regular file; E_ARTIFACT_UPLOAD fails it when the upload itself
 broke without a code of its own. The relay's own codes (E_ARTIFACT_TOO_LARGE,
 E_ARTIFACT_QUOTA, ...) fail it the same way, and no artifact is uploaded for a
-task that did not otherwise succeed.
+task that did not otherwise succeed. A task whose request deadline passes before
+one of its artifact uploads starts fails with E_TIMEOUT naming the artifact.
 """
 
 from __future__ import annotations

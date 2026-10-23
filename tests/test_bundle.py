@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
 import time
+from pathlib import Path
 
 import pytest
 import requests
@@ -14,7 +17,17 @@ from bundle_fixtures import load_bundle
 from relay_server import Response
 
 from runwhen_capability import artifacts as artifacts_module
-from runwhen_capability.bundle import _EventStream, _parse_event, run_bundle_request
+from runwhen_capability import bundle as bundle_module
+from runwhen_capability import relay as relay_module
+from runwhen_capability.bundle import (
+    _ArtifactPathError,
+    _collect_artifacts,
+    _EventStream,
+    _open_artifact,
+    _parse_event,
+    _upload_artifacts,
+    run_bundle_request,
+)
 from runwhen_capability.custom import validate
 from runwhen_capability.custom.hashing import content_hash
 from runwhen_capability.models import (
@@ -769,3 +782,322 @@ def test_a_spill_upload_error_fails_the_task_with_its_code(relay_server, tmp_pat
     assert task.error.startswith("E_ARTIFACT_TOO_LARGE: ")
     assert "blob" in task.error
     assert task.outputs == {}
+
+
+# -- the host opens each artifact file once, safely ---------------------------------------
+
+
+def _within(seconds: float, fn, *args, **kwargs):
+    """fn(*args, **kwargs) on a thread; fails, instead of hanging the suite, if it has
+    not returned in `seconds`."""
+    box: dict = {}
+
+    def run():
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised below, on the test's thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), f"did not finish within {seconds}s: it is blocked"
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _scope(tmp_path: Path) -> tuple[Path, Path]:
+    scope = tmp_path / "scope"
+    (scope / "sub").mkdir(parents=True)
+    (scope / "sub" / "f.txt").write_bytes(b"inside")
+    return scope, scope / ".secrets-test"
+
+
+def test_open_artifact_returns_the_regular_file_by_absolute_or_scope_relative_path(tmp_path):
+    scope, secrets = _scope(tmp_path)
+    for raw in (str(scope / "sub" / "f.txt"), "sub/f.txt", "./sub/../sub/f.txt"):
+        with _open_artifact(scope, secrets, raw) as handle:
+            assert handle.read() == b"inside"
+
+
+def test_open_artifact_accepts_the_scope_by_its_resolved_name(tmp_path):
+    scope, secrets = _scope(tmp_path)
+    link = tmp_path / "link-to-scope"
+    link.symlink_to(scope, target_is_directory=True)
+    # The host was given the scope through a symlink; the child's $PWD names it resolved.
+    with _open_artifact(link, secrets, str(scope.resolve() / "sub" / "f.txt")) as handle:
+        assert handle.read() == b"inside"
+
+
+def _make_symlink_leaf(scope: Path) -> str:
+    (scope / "leaf").symlink_to(scope / "sub" / "f.txt")
+    return "leaf"
+
+
+def _make_symlink_dir(scope: Path) -> str:
+    (scope / "linked").symlink_to(scope / "sub", target_is_directory=True)
+    return "linked/f.txt"
+
+
+@pytest.mark.parametrize(
+    ("make", "message"),
+    [
+        (_make_symlink_leaf, "symbolic link"),
+        (_make_symlink_dir, "symbolic link"),
+        (lambda scope: "sub", "not a regular file"),
+        (lambda scope: "missing.txt", "cannot be opened"),
+        (lambda scope: "sub/missing/f.txt", "cannot be opened"),
+        (lambda scope: "../outside.txt", "outside the task's scope"),
+        (lambda scope: "/etc/passwd", "outside the task's scope"),
+        (lambda scope: ".secrets-test/token", "credentials directory"),
+        (lambda scope: "", "empty"),
+        (lambda scope: "sub/f\x00.txt", "NUL"),
+    ],
+)
+def test_open_artifact_refuses_what_is_not_a_plain_file_inside_the_scope(tmp_path, make, message):
+    scope, secrets = _scope(tmp_path)
+    (tmp_path / "outside.txt").write_text("outside")
+    (secrets).mkdir()
+    (secrets / "token").write_text("secret")
+    raw = make(scope)
+
+    with pytest.raises(_ArtifactPathError, match=message):
+        _open_artifact(scope, secrets, raw)
+
+
+def test_open_artifact_refuses_a_character_device_without_reading_it():
+    # the same would be true of /dev/zero reached through a path inside a scope: it opens,
+    # and fstat on the descriptor says it is no regular file
+    with pytest.raises(_ArtifactPathError, match="not a regular file"):
+        _open_artifact(Path("/dev"), Path("/dev/.secrets-test"), "zero")
+
+
+def test_open_artifact_refuses_a_fifo_without_blocking(tmp_path):
+    scope, secrets = _scope(tmp_path)
+    os.mkfifo(scope / "pipe")
+
+    with pytest.raises(_ArtifactPathError, match="not a regular file"):
+        _within(10, _open_artifact, scope, secrets, "pipe")
+
+
+def test_open_artifact_reads_the_file_it_opened_when_the_path_is_swapped_afterwards(tmp_path):
+    scope, secrets = _scope(tmp_path)
+    (tmp_path / "other.txt").write_bytes(b"something else")
+    target = scope / "sub" / "f.txt"
+
+    handle = _open_artifact(scope, secrets, str(target))
+    target.unlink()
+    target.symlink_to(tmp_path / "other.txt")  # swapped after the open
+
+    with handle:
+        assert handle.read() == b"inside"
+
+
+def test_the_artifact_uploaded_is_the_file_that_was_opened_not_what_the_path_names_later(
+    relay_server, tmp_path, monkeypatch
+):
+    """The seam between opening and reading, closed: a process that outlived the task
+    replaces the file with a symlink at the worst moment -- here, right after the host
+    opened it. What is uploaded is what was opened."""
+    relay_server.script("PUT", PUT_PREFIX, _created("art_report"))
+    real = bundle_module._open_artifact
+
+    def open_then_swap(scope_dir, secrets_dir, raw):
+        handle = real(scope_dir, secrets_dir, raw)
+        os.unlink(raw)
+        os.symlink("/etc/passwd", raw)
+        return handle
+
+    monkeypatch.setattr(bundle_module, "_open_artifact", open_then_swap)
+
+    result, scope = _run_artifacts(["dump-path"], tmp_path, relay_server)
+
+    [task] = result.tasks
+    assert task.status == "ok", task.error
+    assert (scope / "out" / "report.txt").is_symlink()  # the swap did happen
+    [put] = relay_server.requests
+    assert put.body == b"registered in place\n"
+
+
+@pytest.mark.parametrize("task", ["fifo-in-dir", "fifo-registered"])
+def test_a_fifo_registered_as_an_artifact_fails_fast_and_does_not_wedge_the_host(
+    relay_server, tmp_path, task
+):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_never"))
+
+    result, _ = _within(20, _run_artifacts, [task], tmp_path, relay_server)
+
+    [outcome] = result.tasks
+    assert outcome.status == "failed"
+    assert outcome.error.startswith("E_ARTIFACT_PATH"), outcome.error
+    assert "not a regular file" in outcome.error
+    assert relay_server.requests == []
+
+
+def test_a_collected_file_is_closed_when_another_one_fails(tmp_path, monkeypatch):
+    scope, secrets = _scope(tmp_path)
+    opened: list = []
+    real = bundle_module._open_artifact
+
+    def remember(*args):
+        handle = real(*args)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(bundle_module, "_open_artifact", remember)
+    specs = {"a": {"contentType": "x"}, "b": {"contentType": "x"}}
+
+    files, errors = _collect_artifacts(
+        scope, secrets, specs, {"a": str(scope / "sub" / "f.txt"), "b": "missing.txt"}
+    )
+
+    assert files == {}
+    assert len(errors) == 1 and errors[0].startswith("E_ARTIFACT_PATH: artifact 'b'")
+    assert opened and all(handle.closed for handle in opened)
+
+
+def test_a_path_the_task_chose_is_cut_in_the_error_that_quotes_it(tmp_path):
+    scope, secrets = _scope(tmp_path)
+
+    _, errors = _collect_artifacts(
+        scope, secrets, {"dump": {"contentType": "x"}}, {"dump": "/" + "a" * 5000}
+    )
+
+    [error] = errors
+    assert error.startswith("E_ARTIFACT_PATH: artifact 'dump': /aaa")
+    assert len(error) == bundle_module.MAX_SCHEMA_ERROR_CHARS
+
+
+def test_a_long_relay_message_is_cut_in_the_upload_error(relay_server, tmp_path):
+    body = {"code": "E_ARTIFACT_QUOTA", "message": "x" * 5000}
+    relay_server.script("PUT", PUT_PREFIX, Response(422, json=body))
+
+    result, _ = _run_artifacts(["dump-path"], tmp_path, relay_server)
+
+    [task] = result.tasks
+    assert task.status == "failed"
+    [error] = task.errors
+    assert error.startswith("E_ARTIFACT_QUOTA: artifact 'report': ")
+    assert len(error) == bundle_module.MAX_SCHEMA_ERROR_CHARS
+
+
+# -- a directory of the user's own named artifacts/ ---------------------------------------
+
+
+def test_a_users_own_artifacts_directory_is_never_deleted(relay_server, tmp_path):
+    mine = tmp_path / "scope" / "artifacts"
+    mine.mkdir(parents=True)
+    (mine / "mine.txt").write_text("user data")
+
+    result, _ = _run_artifacts(["dump-dir"], tmp_path, relay_server)
+
+    assert result.setup.status == "failed"
+    assert "artifacts" in result.setup.error and "refusing to replace" in result.setup.error
+    assert result.tasks == []
+    assert (mine / "mine.txt").read_text() == "user data"
+    assert relay_server.requests == []
+
+
+def test_an_artifacts_directory_an_earlier_run_left_is_replaced(tmp_path):
+    first, scope = _run_artifacts(["dump-dir"], tmp_path)
+    assert first.tasks[0].status == "ok"
+    assert (scope / "artifacts" / "dump").is_file()
+
+    second, scope = _run_artifacts(["where"], tmp_path)  # same scope: `rwtask run --workdir`
+
+    assert second.tasks[0].status == "ok", second
+    assert not (scope / "artifacts" / "dump").exists()  # what the first run left is gone
+
+
+def test_an_empty_artifacts_directory_and_a_symlink_named_artifacts_are_replaced(tmp_path):
+    (tmp_path / "scope" / "artifacts").mkdir(parents=True)
+    result, scope = _run_artifacts(["where"], tmp_path)
+    assert result.tasks[0].status == "ok", result
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (scope / "artifacts").rename(scope / "artifacts-old")
+    (scope / "artifacts").symlink_to(outside, target_is_directory=True)
+    result, scope = _run_artifacts(["where"], tmp_path)
+    assert result.tasks[0].status == "ok", result
+    assert list(outside.iterdir()) == []  # the link was removed, not followed
+    assert not (scope / "artifacts").is_symlink()
+
+
+def test_a_task_that_replaces_the_artifacts_directory_does_not_stop_the_next_one(tmp_path):
+    # what a task leaves in a directory it replaced is this request's own, not a user's:
+    # the next task starts with a fresh one regardless of the marker
+    result, scope = _run_artifacts(["replace-dir", "where"], tmp_path)
+
+    assert [t.status for t in result.tasks] == ["ok", "ok"]
+    assert not (scope / "artifacts" / "junk").exists()
+
+
+# -- uploads are bounded -----------------------------------------------------------------
+
+
+def test_an_upload_to_a_relay_that_never_answers_ends_the_task_not_the_host(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(relay_module, "_SEND_TIMEOUT", 0.5)
+    relay_server.script("PUT", PUT_PREFIX, Response(201, json={"artifactRef": "x"}, delay=6))
+    started = time.monotonic()
+
+    result, _ = _within(30, _run_artifacts, ["dump-path"], tmp_path, relay_server)
+
+    [task] = result.tasks
+    assert task.status == "failed"
+    assert task.error.startswith("E_ARTIFACT_UPLOAD: artifact 'report': "), task.error
+    assert time.monotonic() - started < 5
+    assert task.outputs == {}
+
+
+def test_no_upload_starts_once_the_request_deadline_has_passed(relay_server, tmp_path, monkeypatch):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_never"))
+    real = bundle_module._collect_artifacts
+
+    def collect_slowly(*args):
+        collected = real(*args)
+        time.sleep(2.2)  # the task finished in time; collecting its files ran past the deadline
+        return collected
+
+    monkeypatch.setattr(bundle_module, "_collect_artifacts", collect_slowly)
+
+    result, _ = _run_artifacts(["dump-path"], tmp_path, relay_server, deadline=2)
+
+    [task] = result.tasks
+    assert task.status == "timeout"
+    assert task.error.startswith("E_TIMEOUT: "), task.error
+    assert "artifact 'report'" in task.error
+    assert relay_server.requests == []
+
+
+def test_a_spilled_output_is_not_uploaded_after_the_deadline_either(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_blob"))
+    args = dict(
+        capability="c",
+        operation="t",
+        scope_dir=tmp_path,
+        relay=RelayClient(relay_server.url, _token(tmp_path), "req-1", requests.Session()),
+        output_decls=[],
+        artifact_specs={},
+        files={},
+        spilled={"blob": b'"x"'},
+    )
+
+    refs, errors = _upload_artifacts(**args, deadline_at=time.monotonic() - 1)
+
+    assert refs == {}
+    [error] = errors
+    assert error.startswith("E_TIMEOUT: ") and "artifact 'blob'" in error
+    assert relay_server.requests == []
+
+    refs, errors = _upload_artifacts(**args, deadline_at=time.monotonic() + 60)
+    assert errors == [] and refs == {"blob": {"$artifact": "art_blob"}}
+
+
+def _token(tmp_path: Path) -> Path:
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    return token_file

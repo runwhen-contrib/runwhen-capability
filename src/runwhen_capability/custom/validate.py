@@ -365,8 +365,8 @@ def _check_names(raw, manifest: Manifest) -> list[Diagnostic]:
                         line=line_of((raw_outputs or {}).get(name)) or task_line,
                         path=f"tasks[{index}].outputs.{name}",
                         message=(
-                            f"artifact output name {name!r} must be a relative path: "
-                            "non-empty segments, none of them '.' or '..'"
+                            f"artifact output name {name!r} must be one segment of letters, "
+                            "digits, '_', '.' and '-', not starting with '.' or '-' (no '/')"
                         ),
                     )
                 )
@@ -989,13 +989,16 @@ def _check_source(
                 )
         for line, out_name in static_checks.bash_artifact_registrations(source):
             declared = outputs.get(out_name)
-            if declared is None or declared.artifact is None:
-                diagnostics.append(
-                    Diagnostic(
-                        code=E_OUTPUT_UNDECLARED,
-                        file=file_path,
-                        line=line,
-                        message=f"rw_artifact {out_name!r} is not a declared artifact output",
-                    )
+            if not is_valid_artifact_name(out_name):
+                message = (
+                    f"rw_artifact {out_name!r} is not a valid artifact name: one segment of "
+                    "letters, digits, '_', '.' and '-', not starting with '.' or '-' (no '/')"
                 )
+            elif declared is None or declared.artifact is None:
+                message = f"rw_artifact {out_name!r} is not a declared artifact output"
+            else:
+                continue
+            diagnostics.append(
+                Diagnostic(code=E_OUTPUT_UNDECLARED, file=file_path, line=line, message=message)
+            )
     return diagnostics

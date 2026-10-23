@@ -80,7 +80,8 @@ class InputSpec(BaseModel):
 
 # An artifact's `maxSize`: a plain non-negative integer, or an integer with a binary
 # suffix -- exactly the quantities the platform's parser accepts ("5GB" is not one).
-MAX_SIZE_RE = re.compile(r"[0-9]+(?:Ki|Mi|Gi|Ti)?")
+MAX_SIZE_PATTERN = r"^[0-9]+(?:Ki|Mi|Gi|Ti)?$"
+MAX_SIZE_RE = re.compile(MAX_SIZE_PATTERN)
 
 
 class ArtifactSpec(BaseModel):
@@ -89,12 +90,14 @@ class ArtifactSpec(BaseModel):
     "2Gi", or a plain byte count); unset, the platform's own cap applies."""
 
     contentType: str = "application/octet-stream"
-    maxSize: str | None = None
+    # The pattern is here for the served JSON Schema (editors); the validator
+    # runs first and gives the readable message.
+    maxSize: str | None = Field(default=None, pattern=MAX_SIZE_PATTERN)
 
-    @field_validator("maxSize")
+    @field_validator("maxSize", mode="before")
     @classmethod
-    def _max_size_is_a_quantity(cls, value: str | None) -> str | None:
-        if value is not None and MAX_SIZE_RE.fullmatch(value) is None:
+    def _max_size_is_a_quantity(cls, value: Any) -> Any:
+        if isinstance(value, str) and MAX_SIZE_RE.fullmatch(value) is None:
             raise ValueError(
                 f"maxSize {value!r} is not a quantity: use a whole number of bytes or one "
                 "with a Ki, Mi, Gi or Ti suffix (e.g. 512Mi, 2Gi)"
@@ -185,15 +188,17 @@ def is_allowed_path(path: str) -> bool:
     return any(path.startswith(prefix) for prefix in ALLOWED_DIR_PREFIXES)
 
 
+# A custom artifact output's name: ONE path segment, no "/" (only a wildcard output may
+# have one, and a custom bundle has none), nothing that needs quoting, and no leading
+# "." or "-". It is a file name under `$RW_ARTIFACTS_DIR`, a segment of the relay's URL,
+# and a bash argument, and one rule has to serve all three: validate() applies it to
+# the manifest and to every literal `rw_artifact` name, and `rw_artifact` itself (in
+# rw.sh, which cannot import this) refuses the same set.
+ARTIFACT_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
 def is_valid_artifact_name(name: str) -> bool:
-    """An artifact output's name is a relative path under the task's artifacts
-    directory (`$RW_ARTIFACTS_DIR/<name>`), so it has to stay there: non-empty
-    "/"-separated segments, none of them "." or "..", no control characters or
-    backslashes, not over MAX_PATH_CHARS. Also what the name is sent to the relay
-    as, where it must not be able to climb out of the artifact route."""
-    if not name or len(name) > MAX_PATH_CHARS or _BAD_PATH_CHARS_RE.search(name):
-        return False
-    return not any(segment in ("", ".", "..") for segment in name.split("/"))
+    return len(name) <= MAX_PATH_CHARS and ARTIFACT_NAME_RE.fullmatch(name) is not None
 
 
 # `name` (the capability) and every task name: a lowercase slug.

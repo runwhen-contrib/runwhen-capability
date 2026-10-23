@@ -38,6 +38,19 @@ tasks:
     effects: [Test fixture]
     outputs:
       dump: { artifact: {} }
+  - name: replace-dir
+    file: tasks/replace_dir.sh
+    effects: [Test fixture]
+  - name: fifo-in-dir
+    file: tasks/fifo_in_dir.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: fifo-registered
+    file: tasks/fifo_registered.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
   - name: path-outside
     file: tasks/path_outside.sh
     effects: [Test fixture]

@@ -47,10 +47,13 @@ from .errors import (
     ArtifactUndeclaredError,
 )
 
-# requests/urllib3 timeout tuples are (connect, read). An upload's read timeout
-# is None on purpose: its response only comes after the runner has taken the
-# whole body, however slow the producer is. The task's own deadline is what
-# ends a stalled upload.
+# requests/urllib3 timeout tuples are (connect, read). The read slot of an
+# upload applies only once the whole body has been sent, so a slow producer
+# never eats into it: it is how long the runner may take to answer after the
+# last byte (it has to finish storing the final part first). A runner that
+# takes the body and then never answers must not hang the caller -- and
+# `rwtask serve`, which runs one request at a time, with it -- so it is finite:
+# the same 150 s as below, more than the runner's 2-minute stall timeout.
 #
 # The connect slot is not only about connecting. urllib3 leaves the connect
 # timeout on the socket for the whole time it SENDS the request body (the read
@@ -140,7 +143,7 @@ class RelayClient:
                 "Content-Type": content_type,
                 "X-RW-Task": task,
             },
-            timeout=(_SEND_TIMEOUT, None),
+            timeout=(_SEND_TIMEOUT, _SEND_TIMEOUT),
         )
         with resp:
             if resp.status_code != 201:

@@ -23,12 +23,13 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 # descriptor the host opened for this task ($RW_OUTPUT_FD) -- never to
 # stdout/stderr, which are logs only and never parsed for output data.
 #
-# <name> must be a declared artifact output. The host uploads the file after the
+# <name> must be a declared artifact output (one segment of letters, digits, "_",
+# "." and "-", not starting with "." or "-"). The host uploads the file after the
 # task exits, and only if the task succeeded; a file written straight into
 # $RW_ARTIFACTS_DIR under a declared artifact output's name is uploaded too, with
 # or without rw_artifact. Nothing is copied for <path>: the file is read where it
-# is, so it must stay inside the task's working directory tree and not be a
-# symlink, or the task fails with E_ARTIFACT_PATH.
+# is, so it must be a regular file inside the task's working directory tree, reached
+# without crossing a symlink, or the task fails with E_ARTIFACT_PATH.
 #
 # The <json> argument must be exactly one JSON value; build it with jq (or
 # printf with values you control) rather than by pasting untrusted text
@@ -103,13 +104,16 @@ rw_skip() {
 
 rw_artifact() {
     local name="${1:-}" src="${2:-}" path
+    local word=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
     if [[ -z $name || -z $src ]]; then
         printf 'rw_artifact: usage: rw_artifact <name> <path|->\n' >&2
         return 2
     fi
-    # A name is a relative path under $RW_ARTIFACTS_DIR: no empty, "." or ".." part.
-    case "/$name/" in
-        *//*|*/./*|*/../*)
+    # One segment of letters, digits, "_", "." and "-", not starting with "." or "-"
+    # (the manifest's rule: custom.manifest.is_valid_artifact_name). The letters are
+    # spelled out: a range like A-Z means other things in some locales.
+    case "$name" in
+        [!"$word"_]*|*[!"$word"_.-]*)
             printf 'rw_artifact: invalid artifact name %s\n' "$name" >&2
             return 1
             ;;
@@ -120,7 +124,7 @@ rw_artifact() {
             return 1
         fi
         path="$RW_ARTIFACTS_DIR/$name"
-        mkdir -p "$RW_ARTIFACTS_DIR/$(dirname "$name")" || return 1
+        mkdir -p "$RW_ARTIFACTS_DIR" || return 1
         # Streamed by cat, never held in a shell variable.
         cat > "$path" || return 1
     else

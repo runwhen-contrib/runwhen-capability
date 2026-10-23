@@ -3,12 +3,19 @@ artifact's `maxSize` is a quantity the platform's parser accepts."""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from runwhen_capability.custom import validate
 from runwhen_capability.custom.diagnostics import E_MANIFEST_SCHEMA
-from runwhen_capability.custom.manifest import ArtifactSpec, Manifest, OutputSpec
+from runwhen_capability.custom.manifest import (
+    ArtifactSpec,
+    Manifest,
+    OutputSpec,
+    is_valid_artifact_name,
+)
 
 
 def test_output_needs_exactly_one_of_schema_or_artifact():
@@ -104,9 +111,41 @@ def test_manifest_model_round_trips_an_artifact_output():
     assert manifest.tasks[0].outputs["dump"].artifact is not None
 
 
-@pytest.mark.parametrize("name", ["../up", "/abs", "a/../b", "a//b", "a/./b", "a/", ".", "a\\b"])
-def test_validate_flags_an_artifact_output_name_that_could_leave_the_artifacts_dir(name):
-    files = {
+VALID_ARTIFACT_NAMES = ["dump", "report.txt", "a-b_c", "v2.tar.gz", "_x", "0day", "a" * 255]
+INVALID_ARTIFACT_NAMES = [
+    "my report.txt",
+    "dump:v2",
+    "-x",
+    "a/b",
+    ".hidden",
+    "..",
+    ".",
+    "../up",
+    "/abs",
+    "a/",
+    "a//b",
+    "a\\b",
+    "a\nb",
+    "a\x00b",
+    "caf\u00e9",
+    "",
+    "a" * 256,
+]
+
+
+@pytest.mark.parametrize("name", VALID_ARTIFACT_NAMES)
+def test_a_valid_artifact_name_is_one_plain_segment(name):
+    assert is_valid_artifact_name(name)
+
+
+@pytest.mark.parametrize("name", INVALID_ARTIFACT_NAMES)
+def test_an_invalid_artifact_name_is_refused(name):
+    assert not is_valid_artifact_name(name)
+
+
+def _named_output_manifest(name: str) -> dict[str, str]:
+    key = json.dumps(name)  # a JSON string is a valid YAML double-quoted scalar
+    return {
         "capability.yaml": (
             "apiVersion: runwhen.com/custom-capability/v1\n"
             "name: x\n"
@@ -115,28 +154,29 @@ def test_validate_flags_an_artifact_output_name_that_could_leave_the_artifacts_d
             "    file: tasks/t.sh\n"
             "    effects: [Test fixture]\n"
             "    outputs:\n"
-            f'      "{name.replace(chr(92), chr(92) * 2)}": {{ artifact: {{}} }}\n'
+            f"      {key}: {{ artifact: {{}} }}\n"
         ),
         "tasks/t.sh": "echo hi\n",
     }
-    (diag,) = [d for d in validate(files) if d.code == E_MANIFEST_SCHEMA]
-    assert "relative path" in diag.message
+
+
+@pytest.mark.parametrize("name", [n for n in INVALID_ARTIFACT_NAMES if n and "\x00" not in n])
+def test_validate_flags_an_artifact_output_name_that_is_not_one_plain_segment(name):
+    (diag,) = [d for d in validate(_named_output_manifest(name)) if d.code == E_MANIFEST_SCHEMA]
+    assert "one segment" in diag.message
     assert diag.line == 8
 
 
-def test_validate_accepts_dotted_and_nested_artifact_output_names():
-    for name in ("report.txt", "files/deep/a.bin", "a-b_c"):
-        files = {
-            "capability.yaml": (
-                "apiVersion: runwhen.com/custom-capability/v1\n"
-                "name: x\n"
-                "tasks:\n"
-                "  - name: t\n"
-                "    file: tasks/t.sh\n"
-                "    effects: [Test fixture]\n"
-                "    outputs:\n"
-                f'      "{name}": {{ artifact: {{}} }}\n'
-            ),
-            "tasks/t.sh": "echo hi\n",
-        }
-        assert [d for d in validate(files) if d.code == E_MANIFEST_SCHEMA] == []
+@pytest.mark.parametrize("name", VALID_ARTIFACT_NAMES)
+def test_validate_accepts_a_plain_artifact_output_name(name):
+    files = _named_output_manifest(name)
+    assert [d for d in validate(files) if d.code == E_MANIFEST_SCHEMA] == []
+
+
+def test_a_schema_output_may_still_have_any_name():
+    # the artifact name rule is about files; a value's name is not a path
+    files = _named_output_manifest("a/b").copy()
+    files["capability.yaml"] = files["capability.yaml"].replace(
+        "{ artifact: {} }", '{ schema: "string" }'
+    )
+    assert [d for d in validate(files) if d.code == E_MANIFEST_SCHEMA] == []

@@ -11,7 +11,11 @@ import subprocess
 import pytest
 
 from runwhen_capability._rw_sh import RW_SH
-from runwhen_capability.custom.manifest import input_env_name, legacy_input_env_name
+from runwhen_capability.custom.manifest import (
+    input_env_name,
+    is_valid_artifact_name,
+    legacy_input_env_name,
+)
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
@@ -134,11 +138,19 @@ def test_rw_artifact_pipe_writes_file_and_emits_event(tmp_path):
     assert events == [{"op": "artifact", "name": "dump", "path": str(target)}]
 
 
-def test_rw_artifact_pipe_creates_the_parent_directories_of_a_nested_name(tmp_path):
-    proc, events = _artifact_bash(tmp_path, "printf x | rw_artifact files/deep/a.txt -")
+def test_rw_artifact_pipe_accepts_a_name_with_dots_dashes_and_underscores(tmp_path):
+    proc, events = _artifact_bash(tmp_path, "printf x | rw_artifact v2_a-b.tar.gz -")
     assert proc.returncode == 0, proc.stderr
-    assert (tmp_path / "artifacts" / "files" / "deep" / "a.txt").read_bytes() == b"x"
-    assert events[0]["name"] == "files/deep/a.txt"
+    assert (tmp_path / "artifacts" / "v2_a-b.tar.gz").read_bytes() == b"x"
+    assert events[0]["name"] == "v2_a-b.tar.gz"
+
+
+def test_rw_artifact_pipe_recreates_a_missing_artifacts_dir(tmp_path):
+    proc, events = _artifact_bash(
+        tmp_path, 'rmdir "$RW_ARTIFACTS_DIR"; printf x | rw_artifact dump -'
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "artifacts" / "dump").read_bytes() == b"x"
 
 
 def test_rw_artifact_pipe_streams_binary_data_through_cat(tmp_path):
@@ -170,12 +182,12 @@ def test_rw_artifact_path_keeps_an_absolute_path_as_given(tmp_path):
     assert events[0]["path"] == str(target)
 
 
-def test_rw_artifact_escapes_a_name_and_path_with_quotes(tmp_path):
-    target = tmp_path / 'we"ird name.txt'
+def test_rw_artifact_escapes_a_path_with_quotes_and_backslashes(tmp_path):
+    target = tmp_path / 'we"ird \\ name.txt'
     target.write_text("data")
-    proc, events = _artifact_bash(tmp_path, f"rw_artifact 'a\"b' '{target}'")
+    proc, events = _artifact_bash(tmp_path, f"rw_artifact report '{target}'")
     assert proc.returncode == 0, proc.stderr
-    assert events == [{"op": "artifact", "name": 'a"b', "path": str(target)}]
+    assert events == [{"op": "artifact", "name": "report", "path": str(target)}]
 
 
 @pytest.mark.parametrize("script", ["rw_artifact", "rw_artifact dump", "rw_artifact '' -"])
@@ -200,13 +212,70 @@ def test_rw_artifact_refuses_a_directory(tmp_path):
     assert events == []
 
 
-@pytest.mark.parametrize("name", ["../up", "/abs", "a/../b", "a//b", "a/./b", "a/", "."])
-def test_rw_artifact_refuses_a_name_that_could_leave_the_directory(tmp_path, name):
-    proc, events = _artifact_bash(tmp_path, f"echo x | rw_artifact '{name}' -; echo \"rc=$?\"")
+@pytest.mark.parametrize(
+    "name",
+    ["../up", "/abs", "a/../b", "a//b", "a/b", "a/", ".", "..", ".hidden", "-x", "my report.txt"]
+    + ["dump:v2", "a'b", 'a"b', "a\nb", "$HOME"],
+)
+def test_rw_artifact_refuses_a_name_that_is_not_one_plain_segment(tmp_path, name):
+    rw_sh = tmp_path / "rw.sh"
+    rw_sh.write_text(RW_SH)
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{rw_sh}"\necho x | rw_artifact "$NAME" -; echo "rc=$?"'],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "NAME": name,
+            "RW_OUTPUT_FD": "2",
+            "RW_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     assert "rc=1" in proc.stdout
-    assert events == []
+    assert "invalid artifact name" in proc.stderr
+    assert not (tmp_path / "artifacts").exists() or list((tmp_path / "artifacts").iterdir()) == []
     assert not (tmp_path / "up").exists()
-    assert list((tmp_path / "artifacts").iterdir()) == []
+
+
+_NAME_CASES = ["dump", "report.txt", "a-b_c", "v2.tar.gz", "_x", "0day"] + [
+    "my report.txt",
+    "dump:v2",
+    "-x",
+    "a/b",
+    ".hidden",
+    "..",
+    "../up",
+    "/abs",
+    "a/",
+    "a//b",
+    "a\nb",
+    "a'b",
+    'a"b',
+    "$HOME",
+    "caf\u00e9",
+]
+
+
+@pytest.mark.parametrize("name", _NAME_CASES)
+def test_rw_artifact_accepts_exactly_the_names_the_manifest_does(tmp_path, name):
+    """One rule: custom.manifest.is_valid_artifact_name, written out again in bash."""
+    (tmp_path / "artifacts").mkdir(exist_ok=True)
+    rw_sh = tmp_path / "rw.sh"
+    rw_sh.write_text(RW_SH)
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{rw_sh}"\necho x | rw_artifact "$NAME" -'],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "NAME": name,
+            "RW_OUTPUT_FD": "2",
+            "RW_ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (proc.returncode == 0) == is_valid_artifact_name(name), proc.stderr
 
 
 def test_rw_artifact_without_an_artifacts_dir_fails_clearly(tmp_path):

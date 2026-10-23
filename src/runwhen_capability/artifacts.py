@@ -504,15 +504,24 @@ class ArtifactsClient:
                 )
                 writer.abort()
 
-    def add_file(self, path: str | Path, name: str, content_type: str | None = None) -> ArtifactRef:
-        """Uploads the file at `path` as artifact `name`. A busy runner (503)
-        is retried: three more attempts, BUSY_RETRY_DELAY seconds apart, the
-        file read again each time. Any other error is final."""
+    def add_file(
+        self, path: str | Path | BinaryIO, name: str, content_type: str | None = None
+    ) -> ArtifactRef:
+        """Uploads the file at `path` as artifact `name`. `path` may also be an
+        already-open binary file (seekable, positioned anywhere): it is read
+        from the start, left open for the caller to close, and is the way to
+        upload exactly the file that was checked rather than whatever a path
+        names by the time it is opened again. A busy runner (503) is retried:
+        three more attempts, BUSY_RETRY_DELAY seconds apart, the file read
+        again each time. Any other error is final."""
         attempt = 0
         while True:
             try:
-                with open(path, "rb") as fh:
-                    return self._put(name, content_type, _read_chunks(fh))
+                if isinstance(path, str | bytes | os.PathLike):
+                    with open(path, "rb") as fh:
+                        return self._put(name, content_type, _read_chunks(fh))
+                path.seek(0)
+                return self._put(name, content_type, _read_chunks(path))
             except ArtifactBusyError:
                 if attempt >= BUSY_RETRIES:
                     raise

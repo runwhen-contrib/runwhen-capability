@@ -25,6 +25,10 @@ What it does:
   `path_prefix`; they are used in order, and once a script is used up (or no
   script matches) the `default` response answers.
 
+A silent runner. A `Response` with `delay=S` reads the whole request body, then waits S
+seconds before it answers: a runner that takes the body and never replies (to a client
+whose read timeout is shorter than S).
+
 Early responses. The real runner answers `413` after reading only
 `maxBytes + 1` body bytes, and `503` before reading any. A `Response` with
 `read_limit=N` emulates that: the handler reads at most N body bytes, sends
@@ -107,6 +111,7 @@ class Response:
     read_limit: int | None = None
     stream: Iterable[bytes] | None = None
     content_length: int | None = None
+    delay: float = 0.0  # seconds to wait, after the request is read, before answering
 
 
 @dataclass
@@ -231,6 +236,8 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                 )
             )
 
+            if response.delay:
+                time.sleep(response.delay)
             payload = response.body
             if payload is None and response.json is not None:
                 payload = json.dumps(response.json).encode()

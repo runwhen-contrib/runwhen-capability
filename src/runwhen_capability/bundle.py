@@ -27,7 +27,7 @@ Inputs/outputs cross that boundary two ways:
 
 - Bash: inputs arrive as upper-cased env vars (manifest.input_env_name);
   outputs are written to a private pipe (`$RW_OUTPUT_FD`) via `rw_append`/
-  `rw_set`/`rw_skip`, sourced from `$RW_SDK/rw.sh` (_rw_sh.py).
+  `rw_set`/`rw_skip`/`rw_artifact`, sourced from `$RW_SDK/rw.sh` (_rw_sh.py).
 - Python: `_bundle_entrypoint.py` calls `main(ctx, **inputs)` with inputs as
   keyword arguments (snake_case, matching every other Python task in this
   SDK) and writes the returned dict onto the SAME private pipe, one `set`
@@ -39,9 +39,11 @@ bash code writes the file to `$RW_ARTIFACTS_DIR/<name>` (or `rw_artifact <name>
 <path|->`, which also registers a file elsewhere in the scope) and a Python
 task uses `ctx.artifacts`, which in the child writes into that same directory:
 the child never has the relay. Once the child has exited -- and only if the
-task otherwise succeeded -- THIS process uploads each file to the relay. Every
-file must be a regular file inside the scope, reached without crossing a
-symlink (`E_ARTIFACT_PATH` otherwise). Files are uploaded as written, not
+task otherwise succeeded -- THIS process uploads each file to the relay, and
+starts none after the request's deadline. Every file must be a regular file
+inside the scope, reached without crossing a symlink (`E_ARTIFACT_PATH`
+otherwise); it is opened once, safely, and uploaded from that handle. Files are
+uploaded as written, not
 redacted: that is the point of a dump. A schema output the platform has said
 may spill, and that outgrows MAX_OUTPUT_BYTES, goes the same way as an
 `application/json` artifact -- redacted first, since inline outputs are.
@@ -60,6 +62,7 @@ relay and its token (see _inherited_env).
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -76,7 +79,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import jsonschema
 import referencing
@@ -147,6 +150,10 @@ _DURATION_RE = re.compile(r"^\d+(\.\d+)?(ms|s|m|h|d)$")
 # Every artifact failure -- the relay's E_ARTIFACT_* codes, E_ARTIFACTS_DISABLED,
 # E_ARTIFACT_PATH, E_ARTIFACT_UPLOAD -- starts with this, and fails the task.
 _ARTIFACT_ERROR_PREFIX = "E_ARTIFACT"
+# Written into every artifacts directory this host creates. Like bundle/ and .rw-sdk/, a
+# non-empty `artifacts/` that lacks it (a user's own, in a reused `rwtask run --workdir`)
+# is never replaced.
+_ARTIFACTS_MARKER = ".rw-artifacts-dir"
 
 
 @dataclass
@@ -262,6 +269,7 @@ def run_bundle_request(
             scope_dir=scope_dir,
             rw_sdk_dir=rw_sdk_dir,
             deadline_seconds=deadline_at - time.monotonic(),
+            deadline_at=deadline_at,
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
             relay=relay,
@@ -303,6 +311,7 @@ def run_bundle_request(
             scope_dir=scope_dir,
             rw_sdk_dir=rw_sdk_dir,
             deadline_seconds=deadline_at - time.monotonic(),
+            deadline_at=deadline_at,
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
             relay=relay,
@@ -342,6 +351,7 @@ def _run_setup_or_task(
     scope_dir: Path,
     rw_sdk_dir: Path,
     deadline_seconds: float,
+    deadline_at: float,
     allow_anonymous: bool,
     redactor: Redactor,
     relay: RelayClient | None,
@@ -354,7 +364,8 @@ def _run_setup_or_task(
     (see _execute), and a spilled output, which is redacted before it is
     uploaded (see _apply_size_caps). Artifact files are uploaded here, after
     the child has exited and only when everything else about the task
-    succeeded (see _upload_artifacts)."""
+    succeeded (see _upload_artifacts); `deadline_at` (a time.monotonic()
+    value) is the request's deadline, after which no upload is started."""
     language = task_file_language(file_path)
     if language is None:
         return _RunOutcome(status="failed", error=f"{file_path}: unsupported file type")
@@ -398,8 +409,9 @@ def _run_setup_or_task(
 
         try:
             # Fresh for every invocation: what an earlier task left in it is never
-            # this task's artifact.
-            _fresh_dir(scope_dir / _ARTIFACTS_DIR)
+            # this task's artifact. (The request's first check, which refuses a
+            # directory that is not ours, is in _prepare_scope.)
+            _reset_artifacts_dir(scope_dir)
             exit_code, stream, log_tail, timed_out = _execute(
                 files_dir=files_dir,
                 file_path=file_path,
@@ -493,7 +505,7 @@ def _run_setup_or_task(
             # not pass as evidence. Every well-formed line still counts.
             errors.append(
                 f"{E_OUTPUT_MALFORMED}: {stream.malformed} output line(s) were not a "
-                "well-formed rw_set/rw_append/rw_skip event and were dropped; "
+                "well-formed rw_set/rw_append/rw_skip/rw_artifact event and were dropped; "
                 "an output was lost"
             )
 
@@ -517,6 +529,7 @@ def _run_setup_or_task(
             E_OUTPUT_MALFORMED,
             E_COMMAND_NOT_FOUND,
             E_SCHEMA_FEATURE,
+            E_TIMEOUT,  # only the deadline passing before an upload started gets here
             _ARTIFACT_ERROR_PREFIX,
         )
 
@@ -537,29 +550,36 @@ def _run_setup_or_task(
         # Nothing is uploaded unless the task succeeded in every other respect: a
         # half-written dump from a task that then failed must not be finalised as
         # a complete artifact.
+        upload_timed_out = False
         if not failed() and (artifact_specs or spilled):
             registered = {e["name"]: e["path"] for e in events if e["op"] == "artifact"}
             files, path_errors = _collect_artifacts(
                 scope_dir, secrets_dir, artifact_specs, registered
             )
-            errors.extend(path_errors)
-            if not path_errors and (files or spilled):
-                refs, upload_errors = _upload_artifacts(
-                    capability=capability,
-                    operation=operation,
-                    scope_dir=scope_dir,
-                    relay=relay,
-                    output_decls=output_decls,
-                    artifact_specs=artifact_specs,
-                    files=files,
-                    spilled=spilled,
-                )
-                errors.extend(upload_errors)
-                outputs.update(refs)
+            try:
+                errors.extend(path_errors)
+                if not path_errors and (files or spilled):
+                    refs, upload_errors = _upload_artifacts(
+                        capability=capability,
+                        operation=operation,
+                        scope_dir=scope_dir,
+                        relay=relay,
+                        output_decls=output_decls,
+                        artifact_specs=artifact_specs,
+                        files=files,
+                        spilled=spilled,
+                        deadline_at=deadline_at,
+                    )
+                    errors.extend(upload_errors)
+                    outputs.update(refs)
+                    upload_timed_out = any(e.startswith(E_TIMEOUT) for e in upload_errors)
+            finally:
+                for handle in files.values():
+                    handle.close()
 
         if failed():
             return _RunOutcome(
-                status="failed",
+                status="timeout" if upload_timed_out else "failed",
                 outputs=outputs,
                 error="; ".join(errors),
                 errors=errors,
@@ -777,17 +797,31 @@ class _ArtifactPathError(ValueError):
     """A file a task asked to upload is not one the host will read."""
 
 
-def _artifact_file(scope_dir: Path, secrets_dir: Path, raw: str) -> Path:
-    """`raw` -- an artifact path from the child, absolute (rw_artifact) or
-    relative to the scope -- as a regular file inside `scope_dir`, reached
-    without crossing a symlink. Raises _ArtifactPathError otherwise.
+def _clipped(message: str) -> str:
+    """`message` cut to MAX_SCHEMA_ERROR_CHARS, like a schema error: it quotes a
+    path or a library's text, which the task (or whatever it left on disk) chose."""
+    return message[:MAX_SCHEMA_ERROR_CHARS]
 
-    The path is normalised first and every component below the scope is then
-    examined with lstat, so what is returned (and later opened) is exactly
-    the path that was checked. Nothing above the scope matters, which is why
-    the scope is also accepted by its resolved name (the child's `$PWD`
-    is the kernel's idea of its working directory). The invocation's secrets
-    directory is off limits: a credential file is never an artifact."""
+
+def _open_artifact(scope_dir: Path, secrets_dir: Path, raw: str) -> BinaryIO:
+    """Opens `raw` -- an artifact path from the child, absolute (rw_artifact) or
+    relative to the scope -- for reading, and returns the open file. It is a
+    regular file inside `scope_dir` reached without crossing a symlink, or
+    this raises _ArtifactPathError.
+
+    The file is opened exactly once, and that handle is what gets uploaded: a
+    separate check followed by a second open by name could be raced by a
+    process that outlived the task (one that left its process group). So the
+    path is normalised, and then walked from the scope with O_NOFOLLOW at every
+    step -- each directory opened relative to the one before it, so a swap
+    higher up cannot redirect the walk -- and the leaf is opened non-blocking
+    (a FIFO must not wedge `rwtask serve`) and then required to be a regular
+    file by fstat on the descriptor itself (not /dev/zero, a socket, ...).
+
+    Nothing above the scope matters, which is why the scope is also accepted by
+    its resolved name (the child's `$PWD` is the kernel's idea of its working
+    directory). The invocation's secrets directory is off limits: a credential
+    file is never an artifact."""
     if not raw or "\x00" in raw:
         raise _ArtifactPathError("the path is empty or has a NUL byte")
     candidate = os.path.normpath(os.path.join(scope_dir, raw))
@@ -799,18 +833,32 @@ def _artifact_file(scope_dir: Path, secrets_dir: Path, raw: str) -> Path:
     parts = os.path.relpath(candidate, anchor).split(os.sep)
     if parts[0] == secrets_dir.name:
         raise _ArtifactPathError(f"{raw} is inside the credentials directory")
-    current = anchor
-    for part in parts:
-        current = os.path.join(current, part)
-        try:
-            mode = os.lstat(current).st_mode
-        except OSError as exc:
-            raise _ArtifactPathError(f"{raw} cannot be read ({exc.strerror or exc})") from None
-        if stat.S_ISLNK(mode):
-            raise _ArtifactPathError(f"{raw} goes through a symbolic link")
-    if not stat.S_ISREG(mode):
-        raise _ArtifactPathError(f"{raw} is not a regular file")
-    return Path(current)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0)
+    dir_fd = -1
+    try:
+        dir_fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
+        for part in parts[:-1]:
+            next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
+            os.close(dir_fd)
+            dir_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise _ArtifactPathError(
+                f"{raw} goes through a symbolic link (or a file that is not a directory)"
+            ) from None
+        raise _ArtifactPathError(f"{raw} cannot be opened ({exc.strerror or exc})") from None
+    finally:
+        if dir_fd >= 0:
+            os.close(dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise _ArtifactPathError(f"{raw} is not a regular file")
+        return os.fdopen(file_fd, "rb")
+    except BaseException:
+        os.close(file_fd)
+        raise
 
 
 def _collect_artifacts(
@@ -818,14 +866,15 @@ def _collect_artifacts(
     secrets_dir: Path,
     artifact_specs: dict[str, dict],
     registered: dict[str, str],
-) -> tuple[dict[str, Path], list[str]]:
-    """The file to upload for each declared artifact output, by name: the one
-    the task registered (rw_artifact), else a regular file sitting at
+) -> tuple[dict[str, BinaryIO], list[str]]:
+    """The open file to upload for each declared artifact output, by name: the
+    one the task registered (rw_artifact), else a regular file sitting at
     `$RW_ARTIFACTS_DIR/<name>`; none for an output the task never wrote.
     A registration for a name that is not a declared artifact output is
-    ignored, like any undeclared output. Any file that fails
-    _artifact_file() is an E_ARTIFACT_PATH error, and so no upload happens."""
-    files: dict[str, Path] = {}
+    ignored, like any undeclared output. Any file that fails _open_artifact()
+    is an E_ARTIFACT_PATH error, and so no upload happens: every file already
+    opened is closed again. The caller closes the files it is given."""
+    files: dict[str, BinaryIO] = {}
     errors: list[str] = []
     for name in sorted(artifact_specs):
         raw = registered.get(name)
@@ -839,9 +888,13 @@ def _collect_artifacts(
                 continue
             raw = default
         try:
-            files[name] = _artifact_file(scope_dir, secrets_dir, raw)
+            files[name] = _open_artifact(scope_dir, secrets_dir, raw)
         except _ArtifactPathError as exc:
-            errors.append(f"{E_ARTIFACT_PATH}: artifact {name!r}: {exc}")
+            errors.append(_clipped(f"{E_ARTIFACT_PATH}: artifact {name!r}: {exc}"))
+    if errors:
+        for handle in files.values():
+            handle.close()
+        files = {}
     return files, errors
 
 
@@ -853,15 +906,23 @@ def _upload_artifacts(
     relay: RelayClient | None,
     output_decls: Sequence[OutputDecl],
     artifact_specs: dict[str, dict],
-    files: dict[str, Path],
+    files: dict[str, BinaryIO],
     spilled: dict[str, bytes],
+    deadline_at: float,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Uploads the files and the spilled outputs through a Context of the
+    """Uploads the open files and the spilled outputs through a Context of the
     host's own -- the one that has the relay -- and returns `{name: {"$artifact":
     ref}}` for them. The first failure ends it: it returns no refs, and one
     error that starts with the error's code (E_ARTIFACT_TOO_LARGE, ...). With no
     relay (`rwtask run`) the same calls land in the local sink and yield
-    `local_...` refs."""
+    `local_...` refs.
+
+    The files are uploaded from the handles _open_artifact() returned, and the
+    spilled bytes from memory (they are bounded by MAX_EVENT_STREAM_BYTES): the
+    upload never opens anything by name. No upload is started once
+    `deadline_at` (a time.monotonic() value, the request's deadline) has passed:
+    that is E_TIMEOUT naming the artifact. One already running is left to the
+    relay client's own timeouts, or to the runner cancelling the request."""
     ctx = Context(
         capability=capability,
         operation=operation,
@@ -873,24 +934,29 @@ def _upload_artifacts(
     refs: dict[str, Any] = {}
     current = ""
     try:
-        for current, path in files.items():
+        for current, handle in files.items():
+            if time.monotonic() >= deadline_at:
+                return {}, [_deadline_error(current)]
             ref = ctx.artifacts.add_file(
-                path, current, content_type=artifact_specs[current]["contentType"]
+                handle, current, content_type=artifact_specs[current]["contentType"]
             )
             refs[current] = ref.model_dump(mode="json")
         for current, data in spilled.items():
-            # A file, not a stream, so a busy runner is retried like any other upload.
-            with tempfile.TemporaryDirectory(dir=scope_dir / _TMP_DIR) as tmp:
-                path = Path(tmp) / "spill.json"
-                path.write_bytes(data)
-                ref = ctx.artifacts.add_file(path, current, content_type="application/json")
-            refs[current] = ref.model_dump(mode="json")
+            if time.monotonic() >= deadline_at:
+                return {}, [_deadline_error(current)]
+            with ctx.artifacts.open(current, "application/json") as writer:
+                writer.write(data)
+            refs[current] = writer.ref.model_dump(mode="json")
     except ArtifactError as exc:
         code = exc.code if exc.code.startswith(_ARTIFACT_ERROR_PREFIX) else E_ARTIFACT_UPLOAD
-        return {}, [f"{code}: artifact {current!r}: {exc}"]
+        return {}, [_clipped(f"{code}: artifact {current!r}: {exc}")]
     except (OSError, requests.RequestException) as exc:
-        return {}, [f"{E_ARTIFACT_UPLOAD}: artifact {current!r}: {exc}"]
+        return {}, [_clipped(f"{E_ARTIFACT_UPLOAD}: artifact {current!r}: {exc}")]
     return refs, []
+
+
+def _deadline_error(name: str) -> str:
+    return f"{E_TIMEOUT}: the request's deadline passed before artifact {name!r} was uploaded"
 
 
 # -- redaction ------------------------------------------------------------------
@@ -1267,13 +1333,28 @@ def _prepare_scope(scope_dir: Path) -> None:
     """Gives the request a fresh, private HOME and TMPDIR inside its scope,
     so anything a task writes there -- dotfiles, tool config, caches, temp
     files -- is wiped with the scope rather than left for the next request
-    on this pod to pick up."""
+    on this pod to pick up; and an empty artifacts directory (see below)."""
     scope_dir.mkdir(parents=True, exist_ok=True)
     for name in (_HOME_DIR, _TMP_DIR):
         _fresh_dir(scope_dir / name)
+    # The one place a directory that is not ours can be in the way: `rwtask run
+    # --workdir` uses the user's own directory as the scope, and `artifacts/` is a
+    # likely name in it. Refused, with nothing deleted, unless it is empty or carries
+    # our marker (an earlier run of this host).
+    _fresh_dir(
+        scope_dir / _ARTIFACTS_DIR, marker=_ARTIFACTS_MARKER, what="an artifacts directory of ours"
+    )
+    _write_private_file(scope_dir / _ARTIFACTS_DIR, _ARTIFACTS_MARKER, "")
 
 
-def _fresh_dir(path: Path, marker: str | None = None) -> None:
+def _reset_artifacts_dir(scope_dir: Path) -> None:
+    """A fresh, empty `$RW_ARTIFACTS_DIR`, with the marker, for the next task:
+    whatever is there now is this request's own (a task may have replaced it)."""
+    _fresh_dir(scope_dir / _ARTIFACTS_DIR)
+    _write_private_file(scope_dir / _ARTIFACTS_DIR, _ARTIFACTS_MARKER, "")
+
+
+def _fresh_dir(path: Path, marker: str | None = None, what: str = "a bundle directory") -> None:
     """An empty 0700 directory at `path`, replacing whatever was there -- a
     reused `rwtask run --workdir` may hold an earlier run's tree, symlinks
     included (a symlink is removed, never followed). With `marker`, an
@@ -1284,7 +1365,7 @@ def _fresh_dir(path: Path, marker: str | None = None) -> None:
         path.unlink()
     elif path.exists():
         if marker is not None and any(path.iterdir()) and not (path / marker).is_file():
-            raise ValueError(f"refusing to replace {path}: it is not a bundle directory")
+            raise ValueError(f"refusing to replace {path}: it is not {what}")
         shutil.rmtree(path)
     path.mkdir(mode=0o700)
 

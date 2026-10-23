@@ -292,6 +292,7 @@ def test_a_malformed_event_line_fails_the_run_but_keeps_good_outputs(tmp_path, l
     [error] = task.errors
     assert error.startswith("E_OUTPUT_MALFORMED: 1 output line(s)")
     assert "an output was lost" in error
+    assert "rw_set/rw_append/rw_skip/rw_artifact" in error
     assert task.error == error
 
 

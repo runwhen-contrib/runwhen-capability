@@ -221,8 +221,13 @@ _VAR_REF_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_
 _RW_INPUT_RE = re.compile(r"\brw_input\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
 _RW_APPEND_RE = re.compile(r"\brw_append\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
 _RW_SET_RE = re.compile(r"\brw_set\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
-# An artifact name may also carry dots and slashes (`report.txt`, `files/a.bin`).
-_RW_ARTIFACT_RE = re.compile(r"\brw_artifact\s+[\"']?([A-Za-z_][A-Za-z0-9_./-]*)[\"']?")
+# The first argument of rw_artifact, as one shell word written out literally: bare,
+# "double-quoted" or 'single-quoted', with no expansion in it ("$name" is for the
+# runtime to check). It is taken whole and then judged by is_valid_artifact_name, so
+# `my report.txt`, `a/b` and `-x` are reported as bad names, not read as other names.
+_RW_ARTIFACT_RE = re.compile(
+    r"""\brw_artifact[ \t]+(?:"([^"$`\\\n]*)"|'([^'\n]*)'|([^\s"'$`\\;|&<>()]+))(?=[\s;|&<>)]|\Z)"""
+)
 
 # Special/positional shell variables ($1, $@, $#, $?, $$, $!, $-, $0) are
 # never a declared input; skip them rather than flag every task that reads
@@ -382,12 +387,16 @@ def bash_output_writes(text: str) -> list[tuple[int, str]]:
 
 
 def bash_artifact_registrations(text: str) -> list[tuple[int, str]]:
-    """(line, artifact name) for every `rw_artifact <name> ...` call whose name
-    is written out literally (`rw_artifact "$name" -` cannot be checked here).
+    """(line, name) for every `rw_artifact <name> ...` call whose name is written
+    out literally -- as written, so it may not be a valid artifact name
+    (is_valid_artifact_name). `rw_artifact "$name" -` cannot be checked here.
     Comments and heredoc bodies are never scanned."""
     text = _strip_comments_and_heredocs(text)
     starts = _line_starts(text)
-    return [(_line_of(starts, m.start()), m.group(1)) for m in _RW_ARTIFACT_RE.finditer(text)]
+    return [
+        (_line_of(starts, m.start()), next(g for g in m.groups() if g is not None))
+        for m in _RW_ARTIFACT_RE.finditer(text)
+    ]
 
 
 # -- readOnly: a mutating kubectl verb in a readOnly task ---------------------
