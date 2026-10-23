@@ -26,13 +26,22 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from .context import Context
 from .errors import CredentialNotFoundError, SkipTask, UnknownTaskError
 from .loader import LoadedCapability
-from .models import RequestEnvelope, ResultEnvelope, SetupResult, TaskResult
+from .models import (
+    InputArtifactDecl,
+    OutputDecl,
+    RequestEnvelope,
+    ResultEnvelope,
+    SetupResult,
+    TaskResult,
+)
+from .relay import RelayClient
 from .repo_fs import TreeNotMaterializedError
 
 _PLACEHOLDER_RE = re.compile(r"^\$\{setup\.(\w+)\}$")
@@ -159,7 +168,14 @@ def run_request(
     scope_dir: Path,
     log: logging.Logger | None = None,
     allow_anonymous_credentials: bool = False,
+    *,
+    relay: RelayClient | None = None,
+    outputs: Sequence[OutputDecl] = (),
+    input_artifacts: Sequence[InputArtifactDecl] = (),
 ) -> ResultEnvelope:
+    """`relay`, `outputs` and `input_artifacts` are the request's artifact
+    wiring (see serve.py): handed to every Context built here, so setup and
+    each task can reach `ctx.artifacts`. All unset for `rwtask run`."""
     log = log or logging.getLogger("runwhen_capability.host")
     result = ResultEnvelope()
     setup_outputs: dict[str, Any] = {}
@@ -188,14 +204,18 @@ def run_request(
                     credentials=credentials,
                     log=log.getChild(request.setup.task),
                     allow_anonymous_credentials=allow_anonymous_credentials,
+                    relay=relay,
+                    task=request.setup.task,
+                    outputs=outputs,
+                    input_artifacts=input_artifacts,
                 )
                 try:
                     kwargs = _kwargs_from_inputs(request.setup.inputs)
-                    outputs = setup_def.func(ctx, **kwargs) or {}
-                    setup_outputs = outputs
-                    result.setup = SetupResult(status="ok", outputs=_to_jsonable(outputs))
+                    returned = setup_def.func(ctx, **kwargs) or {}
+                    setup_outputs = returned
+                    result.setup = SetupResult(status="ok", outputs=_to_jsonable(returned))
                     _save_setup_cache(
-                        scope_dir, request.setup.task, request.setup.inputs, outputs, log
+                        scope_dir, request.setup.task, request.setup.inputs, returned, log
                     )
                 except CredentialNotFoundError as exc:
                     # Not cached, and can't materialise here without a
@@ -237,13 +257,17 @@ def run_request(
             credentials=credentials,
             log=log.getChild(task_spec.task),
             allow_anonymous_credentials=allow_anonymous_credentials,
+            relay=relay,
+            task=task_spec.task,
+            outputs=outputs,
+            input_artifacts=input_artifacts,
         )
         try:
             resolved_inputs = _resolve_placeholders(task_spec.inputs, setup_outputs)
             kwargs = _kwargs_from_inputs(resolved_inputs)
-            outputs = task_def.func(ctx, **kwargs) or {}
+            returned = task_def.func(ctx, **kwargs) or {}
             result.tasks.append(
-                TaskResult(task=task_spec.task, status="ok", outputs=_to_jsonable(outputs))
+                TaskResult(task=task_spec.task, status="ok", outputs=_to_jsonable(returned))
             )
         except SkipTask as exc:
             reason = str(exc.args[0]) if exc.args else ""

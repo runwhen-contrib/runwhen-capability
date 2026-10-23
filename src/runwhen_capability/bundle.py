@@ -59,6 +59,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -93,7 +94,15 @@ from .custom.manifest import (
 )
 from .custom.schema_features import regex_keyword_paths
 from .custom.yaml_lines import safe_load
-from .models import BundleRequestEnvelope, ResultEnvelope, SetupResult, TaskResult
+from .models import (
+    BundleRequestEnvelope,
+    InputArtifactDecl,
+    OutputDecl,
+    ResultEnvelope,
+    SetupResult,
+    TaskResult,
+)
+from .relay import RelayClient
 
 LOG_TAIL_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 256 * 1024
@@ -131,8 +140,19 @@ def run_bundle_request(
     log: logging.Logger | None = None,
     deadline_seconds: float = DEFAULT_REQUEST_DEADLINE,
     allow_anonymous_credentials: bool = False,
+    *,
+    relay: RelayClient | None = None,
+    outputs: Sequence[OutputDecl] = (),
+    input_artifacts: Sequence[InputArtifactDecl] = (),
 ) -> ResultEnvelope:
     """Runs `request`'s bundle: setup, then each requested task.
+
+    `relay`, `outputs` and `input_artifacts` are the request's artifact
+    wiring (see serve.py). They stay in this host process: the bundle's
+    child process is never given the relay -- no environment variable, file
+    descriptor or argument carries it, and `_inherited_env` still strips the
+    host's own variables -- so the host alone talks to the runner, uploading
+    artifacts on the task's behalf once the child has exited.
 
     `deadline_seconds` is ONE budget for the whole request, not a fresh
     allowance per task: setup and the tasks share it, each running with

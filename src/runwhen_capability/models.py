@@ -324,18 +324,54 @@ class BundleRequestEnvelope(BaseModel):
 # --- runner <-> executor: the relay HTTP contract ----------------------------
 
 
+class OutputDecl(BaseModel):
+    """One artifact or spill output a task may write through the relay,
+    declared by the platform for this request. `artifact` is a `kind:
+    artifact` output; `spill` an output that overflows into an artifact
+    (never both). `maxBytes` is the cap on the one artifact (artifact) or
+    on each spilled artifact (spill); `wildcard` means `name` is a prefix and
+    `<name>/<suffix>` is accepted. Unset numbers/strings read as 0 / None --
+    the wire is a protobuf-derived JSON that may omit empty fields."""
+
+    task: str
+    name: str
+    artifact: bool = False
+    spill: bool = False
+    maxBytes: int = 0
+    contentType: str | None = None
+    wildcard: bool = False
+
+
+class InputArtifactDecl(BaseModel):
+    """One artifact the platform bound to a task input for this request. The
+    bytes are fetched through the relay by `input` name; `artifactRef` is
+    deliberately not on the wire to the executor."""
+
+    input: str
+    sizeBytes: int = 0
+    sha256: str = ""
+
+
 class TaskHostRequest(BaseModel):
     """The 200 response body of `POST {relay}/v1/tasks/next`. `request` is a
     BundleRequestEnvelope when the body carries a `bundle` key, else the
     packaged-capability RequestEnvelope -- pydantic's smart-mode union picks
     the one that actually matches (BundleRequestEnvelope requires `bundle`,
-    which RequestEnvelope does not have)."""
+    which RequestEnvelope does not have).
+
+    `maxResultBytes`, `outputs` and `inputArtifacts` are the artifact fields:
+    the cap on the inline result (None, or 0 or less, = unset; no cap is
+    applied here), and the lease's declared artifact/spill outputs and input
+    artifacts. An older runner omits all three."""
 
     requestId: str
     request: RequestEnvelope | BundleRequestEnvelope
     credentials: dict[str, str] = Field(default_factory=dict)
     scopeId: str
     deadlineMs: int
+    maxResultBytes: int | None = None
+    outputs: list[OutputDecl] = Field(default_factory=list)
+    inputArtifacts: list[InputArtifactDecl] = Field(default_factory=list)
 
 
 class TaskHostResult(BaseModel):
