@@ -430,6 +430,73 @@ def test_serve_refuses_a_scope_id_that_is_not_a_single_path_segment(
 
 
 @responses.activate
+def test_serve_refuses_the_scope_id_that_names_the_artifact_cache(tmp_path, monkeypatch, caplog):
+    """The input-artifact cache is a directory of `workdir`, next to the
+    scopes. A scope called the same would be wiped after its request, and
+    take every cached artifact with it."""
+    from runwhen_capability.artifacts import ARTIFACT_CACHE_DIR
+
+    monkeypatch.setattr("runwhen_capability.serve.time.sleep", lambda _seconds: None)
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json={**_next_body("req-cache"), "scopeId": ARTIFACT_CACHE_DIR},
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-cache/result", json={}, status=200)
+    workdir = tmp_path / "work"
+    entry = workdir / ARTIFACT_CACHE_DIR / ("ab" * 32)
+    entry.parent.mkdir(parents=True)
+    entry.write_bytes(b"a cached input artifact")
+
+    with caplog.at_level(logging.ERROR):
+        serve(
+            relay=RELAY,
+            pool_id="pool-1",
+            workdir=workdir,
+            capability_dir=FIXTURES / "echo",
+            token_file=_token_file(tmp_path),
+            max_iterations=1,
+        )
+
+    assert entry.read_bytes() == b"a cached input artifact"
+    assert "refusing scopeId" in caplog.text
+    posted = json.loads(responses.calls[1].request.body)
+    assert posted["status"] == "failed"
+    assert "invalid scopeId" in posted["error"]
+
+
+@responses.activate
+def test_serve_hands_run_request_the_cache_dir_above_the_scopes(tmp_path, monkeypatch):
+    import runwhen_capability.serve as serve_mod
+    from runwhen_capability.artifacts import ARTIFACT_CACHE_DIR
+
+    seen: dict = {}
+
+    def capture(*args, **kwargs):
+        seen.update(kwargs)
+        return ResultEnvelope()
+
+    monkeypatch.setattr(serve_mod, "run_request", capture)
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json=_next_body(
+            "req-1", inputArtifacts=[{"input": "prior", "sizeBytes": 12, "sha256": "ab" * 32}]
+        ),
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "echo")
+
+    # The workdir itself, not the request's scope inside it (which a stateless
+    # capability wipes after the request).
+    assert seen["artifact_cache_dir"] == tmp_path / "work" / ARTIFACT_CACHE_DIR
+    assert [d.input for d in seen["input_artifacts"]] == ["prior"]
+
+
+@responses.activate
 def test_serve_rereads_the_token_immediately_before_posting_the_result(tmp_path, monkeypatch):
     """A request can run up to requestTimeoutSeconds (600s for rw-checks)
     between the poll and the result POST -- long enough for the token to

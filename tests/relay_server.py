@@ -62,6 +62,14 @@ Memory-bound tests. `PieceStream` produces a large body lazily, one piece at
 a time, and keeps only its length and sha256 -- so a test can upload tens of
 MiB, compare `RecordedRequest.body_length`/`body_sha256` against the stream's,
 and measure (tracemalloc) that the code under test never held the whole body.
+
+A streamed download. A `Response` with `stream=` sends the pieces of an
+iterable as its body, pulling each from the iterator only when it is about to
+write it (so the fixture, like the client under test, never holds the whole
+body). The declared Content-Length is `content_length`, else the stream's
+`total` (`PieceStream` has one). A `content_length` larger than what the
+stream yields makes the connection end short of its length -- an interrupted
+download.
 """
 
 from __future__ import annotations
@@ -71,6 +79,7 @@ import json
 import socket
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -88,13 +97,16 @@ class Response:
     `read_limit` makes this an early response -- see the module docstring: the
     request body is read for at most that many bytes, then the response goes
     out. None (the default) reads the whole body first, like an ordinary
-    handler."""
+    handler. `stream` (with `content_length`) sends a lazily produced body
+    instead of `json`/`body` -- see "A streamed download"."""
 
     status: int = 200
     json: object = None
     body: bytes | None = None
     headers: dict[str, str] = field(default_factory=dict)
     read_limit: int | None = None
+    stream: Iterable[bytes] | None = None
+    content_length: int | None = None
 
 
 @dataclass
@@ -223,6 +235,11 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
             if payload is None and response.json is not None:
                 payload = json.dumps(response.json).encode()
             payload = payload or b""
+            length = len(payload)
+            if response.stream is not None:
+                length = response.content_length
+                if length is None:
+                    length = response.stream.total  # type: ignore[attr-defined]
             self.close_connection = True
             try:
                 self.send_response(response.status)
@@ -230,10 +247,14 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                     self.send_header("Content-Type", "application/json")
                 for name, value in response.headers.items():
                     self.send_header(name, value)
-                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Content-Length", str(length))
                 self.send_header("Connection", "close")
                 self.end_headers()
-                self.wfile.write(payload)
+                if response.stream is not None:
+                    for piece in response.stream:
+                        self.wfile.write(piece)
+                else:
+                    self.wfile.write(payload)
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 return  # the client is gone (an aborted upload); the request is recorded

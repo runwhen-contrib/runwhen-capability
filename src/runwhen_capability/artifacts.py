@@ -42,9 +42,26 @@ Two rules keep that from going wrong:
 `from_process` consume a stream that cannot be replayed, so they raise
 `ArtifactBusyError` instead.
 
+Reading goes the other way, from the artifacts the platform bound to the
+task's inputs (`ctx.input_artifacts`, from the lease):
+
+    with ctx.artifacts.input("prior-report") as fh:    # a stream; the caller closes it
+        for line in fh: ...
+    path = ctx.artifacts.input_path("prior-report")    # a local file, for tools that want one
+
+`input` is the relay's response body, undecoded, never buffered. `input_path`
+spools the artifact to a file in a sha256-keyed cache that outlives the
+request, so the same artifact is downloaded once however many requests use it,
+and verifies the digest while it streams (`E_ARTIFACT_CORRUPT` on a mismatch).
+The cache's design -- keys, locking, eviction -- is in `_artifact_cache.py`.
+A name the request did not bind is `ArtifactUndeclaredError`, raised before
+any HTTP.
+
 With no relay (`rwtask run`, `ctx.relay is None`) the same API writes files
 under `<workdir>/.rw-artifacts/<name>` through `LocalArtifactSink`, so a task
-runs the same way on a laptop. This module does not import `requests` (the
+runs the same way on a laptop, and reads inputs from
+`<workdir>/.rw-artifacts/inputs/<name>` (`input_path` returns that path itself:
+there is nothing to cache). This module does not import `requests` (the
 relay client is only duck-typed here): a bundle's child process imports it
 through `context`, and must not pay for that.
 """
@@ -60,14 +77,21 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, BinaryIO, NamedTuple
 
 from pydantic import BaseModel, model_serializer
 
-from .errors import ArtifactBusyError, ArtifactError
+from ._artifact_cache import (
+    ARTIFACT_CACHE_DIR,
+    ArtifactCache,
+    max_bytes_from_env,
+    normalize_sha256,
+)
+from .errors import ArtifactBusyError, ArtifactError, ArtifactUndeclaredError
 
 if TYPE_CHECKING:
     from .context import Context
+    from .models import InputArtifactDecl
     from .relay import RelayClient
 
 # The largest piece `write` hands to the upload, and the size `from_process`
@@ -90,6 +114,8 @@ DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
 # `LocalArtifactSink`'s directory, under the Context's workdir.
 LOCAL_ARTIFACT_DIR = ".rw-artifacts"
+# Where, under that directory, a local run (no relay) keeps its input artifacts.
+LOCAL_INPUT_DIR = "inputs"
 
 # What `from_process` keeps of the child's stderr, same budget as `ctx.run`'s.
 STDERR_BYTE_BUDGET = 1024 * 1024
@@ -300,6 +326,18 @@ class ArtifactWriter:
                 return
 
 
+def _local_path(root: Path, name: str) -> Path:
+    """`root/name`, for a name that stays inside `root` (`E_ARTIFACT_PATH`
+    otherwise): relative, with no empty, '.' or '..' parts."""
+    parts = name.split("/")
+    if not name or name.startswith("/") or any(p in ("", ".", "..") for p in parts):
+        raise ArtifactError(
+            "E_ARTIFACT_PATH",
+            f"artifact name {name!r} must be a relative path with no empty, '.' or '..' parts",
+        )
+    return root.joinpath(*parts)
+
+
 class LocalArtifactSink:
     """Stands in for the relay when there is none: stores each artifact as the
     file `<root>/<name>` and answers like the relay's 201. The ref is
@@ -312,13 +350,7 @@ class LocalArtifactSink:
         self.root = Path(root)
 
     def path_for(self, name: str) -> Path:
-        parts = name.split("/")
-        if not name or name.startswith("/") or any(p in ("", ".", "..") for p in parts):
-            raise ArtifactError(
-                "E_ARTIFACT_PATH",
-                f"artifact name {name!r} must be a relative path with no empty, '.' or '..' parts",
-            )
-        return self.root.joinpath(*parts)
+        return _local_path(self.root, name)
 
     def put_artifact(
         self, *, task: str, name: str, content_type: str, body: Iterable[bytes]
@@ -395,14 +427,16 @@ def _drain_stderr(stream, kept: bytearray) -> None:
 
 class ArtifactsClient:
     """`ctx.artifacts` -- writing artifacts through the runner's relay, or into
-    `LocalArtifactSink` when the Context has no relay. It holds the Context it
-    reads the relay, the task name and the declared outputs from.
+    `LocalArtifactSink` when the Context has no relay, and reading the
+    request's input artifacts. It holds the Context it reads the relay, the
+    task name, the declared outputs and the input artifacts from.
     `local_sink` replaces the default sink (`<workdir>/.rw-artifacts`)."""
 
     def __init__(self, ctx: Context, local_sink: LocalArtifactSink | None = None) -> None:
         self._ctx = ctx
         self._local = local_sink
         self._writers: list[tuple[str, ArtifactWriter]] = []  # opened here, see abort_unclosed
+        self._cache: ArtifactCache | None = None  # made on the first input_path
 
     def open(self, name: str, content_type: str | None = None) -> ArtifactWriter:
         """Starts the upload of artifact `name` and returns its writer (use
@@ -417,6 +451,42 @@ class ArtifactsClient:
         self._writers = [(n, w) for n, w in self._writers if not w.closed]
         self._writers.append((name, writer))
         return writer
+
+    def input(self, name: str) -> BinaryIO:
+        """The bytes of input artifact `name`, as a stream the relay is still
+        sending: read it in pieces and close it (it is a context manager). The
+        body is exactly the stored bytes -- any `Content-Encoding` is left
+        alone. `name` must be one of the request's input artifacts, else
+        `ArtifactUndeclaredError` (before any HTTP). With no relay it is the
+        file `<workdir>/.rw-artifacts/inputs/<name>`, opened for reading."""
+        if self._ctx.relay is None:
+            return open(self._local_input(name), "rb")
+        self._declared_input(name)
+        raw = self._ctx.relay.open_input(name).raw
+        raw.decode_content = False
+        return raw
+
+    def input_path(self, name: str) -> Path:
+        """Input artifact `name` as a local file, for code that wants a path.
+        The first use downloads it into a cache that is shared with every
+        other request this executor serves and bounded by
+        `RW_ARTIFACT_CACHE_MAX_BYTES` (default 1 GiB, least recently used
+        entries go first); a later use finds it there with no request at all.
+        The file is the lease's sha256-verified bytes (`E_ARTIFACT_CORRUPT` if
+        they do not hash to it), and read-only (mode 0444): copy it to edit
+        it, the original is shared with every later request. It is yours for the
+        rest of the task; do not hold on to the path past it. With no relay
+        it is `<workdir>/.rw-artifacts/inputs/<name>` itself."""
+        if self._ctx.relay is None:
+            return self._local_input(name)
+        decl = self._declared_input(name)
+        expected = (
+            normalize_sha256(decl.sha256, f"the declared sha256 of input artifact {name!r}")
+            if decl.sha256
+            else None
+        )
+        relay = self._ctx.relay
+        return self._input_cache().fetch(name, expected, lambda: relay.open_input(name))
 
     def abort_unclosed(self) -> None:
         """Aborts every writer opened through this client that was neither
@@ -560,6 +630,32 @@ class ArtifactsClient:
             body=body,
         )
         return _ref_from(created)
+
+    def _declared_input(self, name: str) -> InputArtifactDecl:
+        for decl in self._ctx.input_artifacts:
+            if decl.input == name:
+                return decl
+        declared = ", ".join(repr(d.input) for d in self._ctx.input_artifacts) or "none"
+        raise ArtifactUndeclaredError(
+            "E_ARTIFACT_UNDECLARED",
+            f"{name!r} is not one of this request's input artifacts (declared: {declared})",
+        )
+
+    def _local_input(self, name: str) -> Path:
+        """The file a local run (no relay) reads input `name` from."""
+        path = _local_path(self._ctx.workdir / LOCAL_ARTIFACT_DIR / LOCAL_INPUT_DIR, name)
+        if not path.is_file():
+            raise ArtifactUndeclaredError(
+                "E_ARTIFACT_UNDECLARED",
+                f"no input artifact {name!r}: a local run reads it from {path}, not a file",
+            )
+        return path
+
+    def _input_cache(self) -> ArtifactCache:
+        if self._cache is None:
+            root = self._ctx.artifact_cache_dir or self._ctx.workdir / ARTIFACT_CACHE_DIR
+            self._cache = ArtifactCache(root, max_bytes_from_env(), self._ctx.log)
+        return self._cache
 
     def _store(self) -> RelayClient | LocalArtifactSink:
         if self._ctx.relay is not None:

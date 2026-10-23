@@ -134,7 +134,11 @@ class Context:
     (`rwtask run` has no relay): `relay` is the client for the runner's
     relay; `task` is the name of the task (or setup task) this Context runs;
     `outputs` and `input_artifacts` are the request's declared artifact
-    outputs and bound input artifacts."""
+    outputs and bound input artifacts; `artifact_cache_dir` is where
+    `ctx.artifacts.input_path` keeps downloaded inputs -- the host passes a
+    directory that outlives the request's scope (a stateless scope is wiped
+    after every request, which would empty the cache), and when unset it is
+    `.rw-artifact-cache` under `workdir`."""
 
     def __init__(
         self,
@@ -149,6 +153,7 @@ class Context:
         task: str | None = None,
         outputs: Sequence[OutputDecl] = (),
         input_artifacts: Sequence[InputArtifactDecl] = (),
+        artifact_cache_dir: Path | None = None,
     ) -> None:
         self.capability = capability
         self.operation = operation
@@ -164,6 +169,7 @@ class Context:
         self.task = task
         self.outputs = list(outputs)
         self.input_artifacts = list(input_artifacts)
+        self.artifact_cache_dir = Path(artifact_cache_dir) if artifact_cache_dir else None
 
         self.git = GitClient(self)
         self.sarif = SarifClient(self)
