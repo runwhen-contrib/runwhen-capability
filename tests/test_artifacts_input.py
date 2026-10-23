@@ -570,6 +570,37 @@ def test_a_lock_left_by_a_dead_process_is_broken(relay_server, tmp_path):
     assert not lock.exists()
 
 
+def test_a_lock_stays_valid_longer_than_a_download_may_sit_silent():
+    """A live owner waiting on a paused relay touches nothing for up to the
+    input GET's read timeout; a lock judged stale sooner would be broken under
+    it and the artifact downloaded twice."""
+    assert cache_module._LOCK_STALE_SECONDS > relay_module._READ_TIMEOUT
+
+
+def test_a_live_owners_quiet_lock_is_waited_for_past_a_minute(relay_server, tmp_path):
+    data = b"the relay is slow, the owner is alive"
+    relay_server.script("GET", IN_PREFIX, _served(data))
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    lock = _lock_path(cache, data)
+    lock.write_text(str(os.getpid()))  # a live owner
+    _age(lock, 100)  # silent for 100 s: within what a paused relay can cause
+    ctx = _ctx(relay_server, tmp_path, [_decl("report", data)], cache_dir=cache)
+    outcome: list = []
+    thread = threading.Thread(
+        target=lambda: outcome.append(ctx.artifacts.input_path("report")), daemon=True
+    )
+
+    thread.start()
+    time.sleep(0.4)
+    assert thread.is_alive()
+    assert relay_server.requests == []  # the lock was respected, not broken
+
+    lock.unlink()
+    thread.join(10)
+    assert outcome == [cache / _sha(data)]
+
+
 def test_an_unreadable_old_lock_is_broken(relay_server, tmp_path):
     data = b"the lock file is empty"
     relay_server.script("GET", IN_PREFIX, _served(data))

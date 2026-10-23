@@ -29,8 +29,9 @@ that is:
 - owned by a pid that is gone;
 - unreadable or empty and a few seconds old (an owner that died between
   creating the file and writing its pid);
-- untouched for a minute. A downloading owner touches its lock as it reads, so
-  this is the owner stopping; it is also what catches a pid that looks alive
+- untouched for three minutes (longer than the 150 s a download waits on a
+  silent relay). A downloading owner touches its lock as it reads, so this is
+  the owner stopping; it is also what catches a pid that looks alive
   because the restarted container reused it (the first process of a container
   is always pid 1).
 
@@ -79,7 +80,12 @@ _LOCK_POLL_SECONDS = 0.05
 # How often a downloading owner touches its lock.
 _LOCK_HEARTBEAT_SECONDS = 5
 # An owner that has not touched its lock for this long is gone, whatever its pid says.
-_LOCK_STALE_SECONDS = 60
+# It must exceed the input GET's read timeout (relay._READ_TIMEOUT, 150 s): a live
+# owner waiting on a paused relay touches its lock only between reads, so it can
+# be silent that long and must not be mistaken for a dead one -- its lock would be
+# broken under it and the artifact downloaded twice. A dead owner's lock is still
+# broken at once, by the pid check; this only bounds the wait on a reused pid.
+_LOCK_STALE_SECONDS = 180
 # An unreadable or empty lock is given this long before it counts as abandoned.
 _LOCK_EMPTY_GRACE_SECONDS = 5
 # A part file nothing has written to for this long was abandoned by a dead host.
