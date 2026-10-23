@@ -62,9 +62,21 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
 
 A result travels inline and has a size cap. Large or binary output goes out as an **artifact**
 instead: its own upload to the runner, streamed, so memory stays bounded however big it is. The
-task declares the output as an artifact (`outputs={"dump": "artifact"}`) and returns the
-`ArtifactRef`, which serialises as `{"$artifact": "<ref>"}` -- the marker the platform replaces with
-the stored artifact.
+task returns the `ArtifactRef`, which serialises as `{"$artifact": "<ref>"}` -- a reference the
+platform resolves to the stored artifact.
+
+A packaged capability also declares the output in its `manifest.yaml`, under the task's `outputs`;
+that is what the platform reads (the kind in `@task(outputs={"dump": "artifact"})` is informational
+to the SDK):
+
+```yaml
+# manifest.yaml, under the task
+outputs:
+  dump: { kind: artifact, contentType: text/plain, maxSize: 5Gi }
+```
+
+`preview: auto|none` is optional, and `wildcard: true` lets the task write `dump/<anything>`. A
+schema output can opt into spill (see "Size limits" below) with `spill: auto`.
 
 ```python
 @task(outputs={"report": "artifact", "dump": "artifact"})
