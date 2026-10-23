@@ -9,6 +9,7 @@ host that runs them, in a pod (`rwtask serve`) or locally (`rwtask run`).
 # (setuptools dynamic version) and `rwtask --version` prints it.
 __version__ = "0.3.0"
 
+from .artifacts import ArtifactRef, ProcessArtifact
 from .context import Context
 from .decorators import setup, task
 from .errors import SkipTask
@@ -34,6 +35,8 @@ from .models import (
 )
 
 __all__ = [
+    "ArtifactRef",
+    "ProcessArtifact",
     "Context",
     "setup",
     "task",

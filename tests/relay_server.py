@@ -41,6 +41,23 @@ body is at most `keep_limit` (1 MiB by default); a bigger body leaves
 A test that wants the bytes of a bigger body sets `relay_server.keep_limit`
 before sending.
 
+Slow reader. `relay_server.read_delay = 0.001` makes the handler sleep that
+long after every read it makes (64 KiB at most; the discarding drain of an
+early response included), so a producer that is faster than the "network"
+backs up deterministically -- what a bounded-queue test needs. Zero (the
+default) is full speed.
+
+A stall. `relay_server.stall_after = N` with `relay_server.stall_seconds = S`
+makes each request's handler stop reading for S seconds once, right after the
+body bytes read so far reach N -- a runner that pauses reading (to flush a
+part to storage, say). A client sending more than the socket buffers hold
+blocks in send for the whole pause.
+
+An aborted upload. A client that drops the connection mid-body leaves the
+handler a body that never reached its terminating chunk (`body_complete`
+False); the answer it then tries to send has nobody to read it, and that
+write failing is swallowed rather than printed as a server traceback.
+
 Memory-bound tests. `PieceStream` produces a large body lazily, one piece at
 a time, and keeps only its length and sha256 -- so a test can upload tens of
 MiB, compare `RecordedRequest.body_length`/`body_sha256` against the stream's,
@@ -102,13 +119,18 @@ class RelayServer:
     def __init__(self) -> None:
         self.requests: list[RecordedRequest] = []
         self.keep_limit = 1 << 20
+        self.read_delay = 0.0  # seconds slept after each body read; see "Slow reader"
+        self.stall_after: int | None = None  # see "A stall"
+        self.stall_seconds = 0.0
         self.default = Response(404, json={"code": "E_UNSCRIPTED"})
         self._scripts: list[tuple[str, str, list[Response]]] = []
         self._lock = threading.Lock()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self._httpd.daemon_threads = True
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
 
     @property
     def url(self) -> str:
@@ -145,6 +167,18 @@ class RelayServer:
                 if queue and script_method == method and path.startswith(prefix):
                     return queue.pop(0)
         return self.default
+
+    def _pace(self, sink: _BodySink | None = None) -> None:
+        if (
+            sink is not None
+            and self.stall_after is not None
+            and not sink.stalled
+            and sink.length >= self.stall_after
+        ):
+            sink.stalled = True
+            time.sleep(self.stall_seconds)
+        if self.read_delay:
+            time.sleep(self.read_delay)
 
     def _record(self, request: RecordedRequest) -> None:
         with self._lock:
@@ -189,17 +223,20 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
             if payload is None and response.json is not None:
                 payload = json.dumps(response.json).encode()
             payload = payload or b""
-            self.send_response(response.status)
-            if response.json is not None and response.body is None:
-                self.send_header("Content-Type", "application/json")
-            for name, value in response.headers.items():
-                self.send_header(name, value)
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(payload)
-            self.wfile.flush()
             self.close_connection = True
+            try:
+                self.send_response(response.status)
+                if response.json is not None and response.body is None:
+                    self.send_header("Content-Type", "application/json")
+                for name, value in response.headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return  # the client is gone (an aborted upload); the request is recorded
 
             if not complete:
                 self._linger()
@@ -216,6 +253,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                 while time.monotonic() < deadline:
                     if not conn.recv(_READ_CHUNK):
                         break
+                    server._pace()
             except OSError:
                 pass  # reset or timed out: the response was already delivered
 
@@ -232,6 +270,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                     return False
                 sink.add(data)
                 remaining -= len(data)
+                server._pace(sink)
             return True
 
         def _read_chunked(self, sink: _BodySink, limit: int | None) -> bool:
@@ -261,6 +300,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                         return False
                     sink.add(data)
                     remaining -= len(data)
+                    server._pace(sink)
                 self.rfile.readline(8)  # the CRLF after the chunk data
 
         do_GET = do_PUT = do_POST = do_DELETE = do_HEAD = _handle
@@ -311,6 +351,7 @@ class _BodySink:
         self._buf: bytearray | None = bytearray()
         self.length = 0
         self.digest = hashlib.sha256()
+        self.stalled = False  # the one stall (RelayServer.stall_after) already happened
 
     def add(self, data: bytes) -> None:
         self.length += len(data)
