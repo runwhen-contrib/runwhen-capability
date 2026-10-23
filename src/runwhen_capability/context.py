@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .artifacts import ArtifactsClient
 from .errors import CredentialNotFoundError, OutputTooLargeError, SkipTask
 from .findings import FindingsClient
 from .git import GitClient
@@ -119,16 +120,6 @@ class StorageClient:
 
     def put(self, name: str, data: bytes):
         raise NotImplementedError("use ctx.artifacts")
-
-
-class ArtifactsClient:
-    """`ctx.artifacts` -- writing and reading artifacts through the runner's
-    relay. A stub for now: the write and read methods arrive in a later
-    change. It already holds the Context it will read the relay, the task
-    name and the declared outputs/inputs from."""
-
-    def __init__(self, ctx: Context) -> None:
-        self._ctx = ctx
 
 
 class Context:

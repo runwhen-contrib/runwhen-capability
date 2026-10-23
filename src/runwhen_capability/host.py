@@ -30,6 +30,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from .artifacts import SPILL_THRESHOLD_BYTES
 from .context import Context
 from .errors import CredentialNotFoundError, SkipTask, UnknownTaskError
 from .loader import LoadedCapability
@@ -88,6 +89,40 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_jsonable(v) for v in value]
     return value
+
+
+def _spill_large_outputs(ctx: Context, returned: Any) -> Any:
+    """Moves a task's large `spill: auto` outputs into artifacts: for each
+    declared spill output of this task that the task returned, the value is
+    converted with `_to_jsonable` and serialised exactly as the result would
+    carry it; when that is more than SPILL_THRESHOLD_BYTES it is uploaded as
+    an `application/json` artifact and the output becomes its ArtifactRef
+    (which `_to_jsonable` later turns into `{"$artifact": ...}`). Smaller
+    values stay inline. A copy is returned when anything spilled; the task's
+    own dict is never modified. An upload error propagates and fails the task
+    like any other task error."""
+    if not isinstance(returned, dict):
+        return returned
+    spilled: dict[str, Any] | None = None
+    for decl in ctx.outputs:
+        if not decl.spill or decl.task != ctx.task or decl.name not in returned:
+            continue
+        try:
+            data = json.dumps(
+                _to_jsonable(returned[decl.name]), separators=(",", ":"), allow_nan=False
+            ).encode()
+        except (TypeError, ValueError):
+            # Not JSON: left in place, to fail where it always has (the
+            # result's own encoding) rather than as a spill error.
+            continue
+        if len(data) <= SPILL_THRESHOLD_BYTES:
+            continue
+        with ctx.artifacts.open(decl.name, "application/json") as writer:
+            writer.write(data)
+        if spilled is None:
+            spilled = dict(returned)
+        spilled[decl.name] = writer.ref
+    return returned if spilled is None else spilled
 
 
 def _setup_cache_path(scope_dir: Path) -> Path:
@@ -265,7 +300,7 @@ def run_request(
         try:
             resolved_inputs = _resolve_placeholders(task_spec.inputs, setup_outputs)
             kwargs = _kwargs_from_inputs(resolved_inputs)
-            returned = task_def.func(ctx, **kwargs) or {}
+            returned = _spill_large_outputs(ctx, task_def.func(ctx, **kwargs) or {})
             result.tasks.append(
                 TaskResult(task=task_spec.task, status="ok", outputs=_to_jsonable(returned))
             )
