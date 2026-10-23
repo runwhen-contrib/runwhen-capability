@@ -207,10 +207,13 @@ def run_request(
     relay: RelayClient | None = None,
     outputs: Sequence[OutputDecl] = (),
     input_artifacts: Sequence[InputArtifactDecl] = (),
+    artifact_cache_dir: Path | None = None,
 ) -> ResultEnvelope:
     """`relay`, `outputs` and `input_artifacts` are the request's artifact
     wiring (see serve.py): handed to every Context built here, so setup and
-    each task can reach `ctx.artifacts`. All unset for `rwtask run`."""
+    each task can reach `ctx.artifacts`. `artifact_cache_dir` is where input
+    artifacts are cached across requests (outside `scope_dir`, which may be
+    wiped). All unset for `rwtask run`."""
     log = log or logging.getLogger("runwhen_capability.host")
     result = ResultEnvelope()
     setup_outputs: dict[str, Any] = {}
@@ -243,6 +246,7 @@ def run_request(
                     task=request.setup.task,
                     outputs=outputs,
                     input_artifacts=input_artifacts,
+                    artifact_cache_dir=artifact_cache_dir,
                 )
                 try:
                     kwargs = _kwargs_from_inputs(request.setup.inputs)
@@ -298,6 +302,7 @@ def run_request(
             task=task_spec.task,
             outputs=outputs,
             input_artifacts=input_artifacts,
+            artifact_cache_dir=artifact_cache_dir,
         )
         try:
             resolved_inputs = _resolve_placeholders(task_spec.inputs, setup_outputs)

@@ -47,7 +47,11 @@ failed result. Packaged-capability images never set it.
 `scopeId` must be a single path segment (see _is_safe_scope_id): the loop
 creates and later deletes <workdir>/<scopeId>/, so anything else -- empty,
 absolute, containing "/" or ".." -- is refused as a failed request before
-the filesystem is touched.
+the filesystem is touched. So is ".rw-artifact-cache", the one directory of
+<workdir> that is not a scope: the cache of input artifacts that
+`ctx.artifacts.input_path` fills (see _artifact_cache.py). It sits beside the
+scopes, not in one, so that a stateless scope's wipe does not empty it, and
+every request is told where it is.
 
 Per request: create <workdir>/<scopeId>/, chdir there, run setup then each
 task in request.tasks order (host.run_request), aggregate into the result
@@ -80,6 +84,7 @@ from pathlib import Path
 
 import requests
 
+from .artifacts import ARTIFACT_CACHE_DIR
 from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
@@ -202,8 +207,12 @@ def _is_safe_scope_id(scope_id: str) -> bool:
     so a malformed scopeId would delete something that is not a scope. The
     relay is authenticated, so this is not the security boundary; it is the
     guard that keeps a bug on the other side of the wire from costing this
-    pod its whole workdir."""
-    return scope_id not in ("", ".", "..") and scope_id == Path(scope_id).name
+    pod its whole workdir.
+
+    The name of the input-artifact cache, a directory of `workdir` too, is
+    refused as well: a scope called that would be wiped after its request and
+    take every cached artifact with it."""
+    return scope_id not in ("", ".", "..", ARTIFACT_CACHE_DIR) and scope_id == Path(scope_id).name
 
 
 def _encode_result(payload: dict, log, max_result_bytes: int | None = None) -> bytes:
@@ -397,7 +406,7 @@ def _poll_once(
         # Reported as a failed request rather than swallowed: the runner must
         # learn why nothing ran. Nothing has touched the filesystem yet.
         log.error(
-            "request %s: refusing scopeId %r -- not a single path segment",
+            "request %s: refusing scopeId %r -- not a single path segment, or a reserved name",
             task_request.requestId,
             task_request.scopeId,
         )
@@ -469,6 +478,7 @@ def _poll_once(
                 relay=relay_client,
                 outputs=task_request.outputs,
                 input_artifacts=task_request.inputArtifacts,
+                artifact_cache_dir=workdir / ARTIFACT_CACHE_DIR,
             )
         payload = {"status": "ok", "result": result.model_dump(mode="json")}
     except Exception as exc:  # noqa: BLE001 -- one request must never take down the loop
