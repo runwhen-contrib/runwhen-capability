@@ -11,7 +11,9 @@ a part file while being hashed, and only a body whose digest equals the key is
 moved (`os.replace`, atomic) to `<root>/<sha256>`. A file under that name is
 therefore always complete and always the right bytes, however many downloaders
 raced or died. A body that does not hash to the key is deleted and reported
-(`E_ARTIFACT_CORRUPT`, naming both digests).
+(`E_ARTIFACT_CORRUPT`, naming both digests). Entries are published read-only
+(0444): a task that edited its input in place would poison the entry for every
+later request that finds it by hash.
 
 Where the key comes from: the digest the lease declared for the input; if it
 declared none, the `X-RW-Sha256` header of the answer; if there is neither,
@@ -36,9 +38,13 @@ Eviction keeps the completed entries under `RW_ARTIFACT_CACHE_MAX_BYTES`
 (default 1 GiB), least recently used first. "Used" is the entry's atime, which
 we set ourselves with `os.utime` on every hit (the kernel's own atime updates
 are off or lazy on most mounts). Never evicted: an entry this cache object has
-handed out (the task that got the path may not have opened it yet), and the
-entry just added, even if it alone is over budget. So the cache can sit over
-budget while a task holds a lot; it is trimmed by the next request.
+pinned -- one it handed out (the task that got the path may not have opened it
+yet) or is fetching, pinned before it is touched or published so that a
+concurrent trim by the same task cannot take it -- and so never the entry just
+added, even if it alone is over budget. So the cache can sit over budget while
+a task holds a lot; it is trimmed by the next request. The same pass removes
+part files and locks abandoned by dead hosts. Housekeeping never fails the
+download it follows: an OS error in it is logged as a warning.
 
 This module does not import `requests`: the response is duck-typed (`.raw`,
 `.headers`, `.close()`), like the relay client in artifacts.py.
@@ -107,13 +113,16 @@ def normalize_sha256(value: str, what: str) -> str:
 
 class ArtifactCache:
     """The cache in directory `root`, for ONE task: it remembers which entries
-    it handed out (they are not evicted while this object lives)."""
+    the task holds or is fetching (they are not evicted while this object
+    lives). An entry is pinned BEFORE it is touched or published, never
+    after: the task may have other threads, and one finishing a download in
+    that gap would otherwise trim the entry the first was about to return."""
 
     def __init__(self, root: Path, max_bytes: int, log: logging.Logger) -> None:
         self.root = Path(root)
         self.max_bytes = max_bytes
         self.log = log
-        self._handed_out: set[str] = set()
+        self._pinned: set[str] = set()
 
     def fetch(
         self,
@@ -142,7 +151,9 @@ class ArtifactCache:
             raise
         if key is not None:
             return self._fetch_keyed(label, key, open_response, resp)
-        return self._finish(self._store_unkeyed(resp))
+        path = self._store_unkeyed(resp)
+        self._evict()
+        return path
 
     # -- keyed ----------------------------------------------------------------
 
@@ -151,14 +162,15 @@ class ArtifactCache:
     ) -> Path:
         """`resp` is a response already open (its header gave the key), or
         None; either way it is closed here."""
+        self._pinned.add(key)
         try:
             hit = self._touch(key)
             if hit is not None:
-                return self._hand_out(hit)
+                return hit
             with _Lock(self.root / f"{key}.lock") as lock:
                 hit = self._touch(key)
                 if hit is not None:
-                    return self._hand_out(hit)
+                    return hit
                 if resp is not None and lock.waited:
                     resp.close()  # it sat idle while we queued; ask again
                     resp = None
@@ -166,7 +178,8 @@ class ArtifactCache:
                     resp = open_response()
                 path = self._store(resp, key, label, lock)
                 resp = None  # _store closed it
-            return self._finish(path)
+            self._evict()
+            return path
         finally:
             if resp is not None:
                 resp.close()
@@ -198,6 +211,7 @@ class ArtifactCache:
 
     def _store_unkeyed(self, resp: Any) -> Path:
         part, actual = self._download(resp, "unkeyed", None)
+        self._pinned.add(actual)  # before it exists under that name
         try:
             return self._publish(part, actual)  # replacing an identical entry is harmless
         except BaseException:
@@ -230,26 +244,32 @@ class ArtifactCache:
         return part, digest.hexdigest()
 
     def _publish(self, part: Path, key: str) -> Path:
+        """Moves the finished, verified part file to its name. Read-only
+        first, so the entry is never visible writable: a task that edited its
+        input in place would poison the entry for every later request that
+        finds it by hash. (Removing it needs the directory's permission, not
+        the file's, so eviction is unaffected.)"""
         final = self.root / key
+        os.chmod(part, 0o444)
         os.replace(part, final)
         os.utime(final)
         return final
 
-    def _hand_out(self, path: Path) -> Path:
-        self._handed_out.add(path.name)
-        return path
-
-    def _finish(self, added: Path) -> Path:
-        """Hands out a freshly added entry, then trims the cache. Handing out
-        first is what spares the entry just added from its own trim."""
-        self._hand_out(added)
-        self._evict()
-        return added
-
     def _evict(self) -> None:
+        """Housekeeping after an entry was added. Whatever goes wrong here --
+        a directory that cannot be listed, a file that cannot be removed -- is
+        logged and ends the pass: the download it follows was good, and must
+        not fail over a cache that could not be tidied."""
+        try:
+            self._trim()
+        except OSError as exc:
+            self.log.warning("input artifact cache housekeeping in %s failed: %s", self.root, exc)
+
+    def _trim(self) -> None:
         """Brings the completed entries under the budget, least recently used
-        first, sparing every entry this task holds (which includes the one
-        just added); also removes part files abandoned by dead hosts."""
+        first, sparing every entry this task has pinned (which includes the
+        one just added). In the same pass it removes part files abandoned by
+        dead hosts and locks whose owner is gone (see the module docstring)."""
         entries: list[tuple[int, str, int]] = []  # (atime_ns, name, size)
         total = 0
         now = time.time()
@@ -259,18 +279,22 @@ class ArtifactCache:
                     st = child.stat()
                 except FileNotFoundError:
                     continue
-                if _SHA256.fullmatch(child.name):
-                    entries.append((st.st_atime_ns, child.name, st.st_size))
+                name = child.name
+                if _SHA256.fullmatch(name):
+                    entries.append((st.st_atime_ns, name, st.st_size))
                     total += st.st_size
-                elif ".part-" in child.name and now - st.st_mtime > _PART_STALE_SECONDS:
-                    self.log.info("removing abandoned download %s", child.name)
-                    Path(child.path).unlink(missing_ok=True)
+                elif ".part-" in name and now - st.st_mtime > _PART_STALE_SECONDS:
+                    self.log.info("removing abandoned download %s", name)
+                    self._remove(Path(child.path))
+                elif name.endswith(".lock") and _SHA256.fullmatch(name[: -len(".lock")]):
+                    if _break_if_stale(Path(child.path)):
+                        self.log.info("removed lock %s: its owner is gone", name)
         if total <= self.max_bytes:
             return
         for _atime, name, size in sorted(entries):
             if total <= self.max_bytes:
                 break
-            if name in self._handed_out:
+            if name in self._pinned:
                 continue
             self.log.info(
                 "input artifact cache over budget (%d > %d bytes): evicting %s",
@@ -278,8 +302,17 @@ class ArtifactCache:
                 self.max_bytes,
                 name,
             )
-            (self.root / name).unlink(missing_ok=True)
-            total -= size
+            if self._remove(self.root / name):
+                total -= size
+
+    def _remove(self, path: Path) -> bool:
+        """Unlinks `path`; False, with a warning, if the system refuses."""
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.warning("input artifact cache: could not remove %s: %s", path, exc)
+            return False
+        return True
 
 
 def _pid_alive(pid: int) -> bool:

@@ -47,10 +47,10 @@ from .errors import (
     ArtifactUndeclaredError,
 )
 
-# requests/urllib3 timeout tuples are (connect, read). The read timeout is None
-# on purpose: an upload's response only comes after the runner has taken the
-# whole body, however slow the producer is, and a download's reads are paced
-# by the caller. The task's own deadline is what ends a stalled transfer.
+# requests/urllib3 timeout tuples are (connect, read). An upload's read timeout
+# is None on purpose: its response only comes after the runner has taken the
+# whole body, however slow the producer is. The task's own deadline is what
+# ends a stalled upload.
 #
 # The connect slot is not only about connecting. urllib3 leaves the connect
 # timeout on the socket for the whole time it SENDS the request body (the read
@@ -65,6 +65,14 @@ from .errors import (
 # its connect slot stays short.
 _SEND_TIMEOUT = 150
 _CONNECT_TIMEOUT = 10
+# A download does have a read timeout: a relay connection that goes half-open
+# would otherwise hang the task for ever -- and `rwtask serve`, which runs one
+# request at a time, with it. requests applies it to each socket read of a
+# streamed body, not to the transfer as a whole, so a slow transfer that keeps
+# moving is never cut; only a connection that stays silent this long is. More
+# than the runner's 2-minute stall timeout, for the same reason as
+# _SEND_TIMEOUT: a runner that merely pauses must not be cut off.
+_READ_TIMEOUT = 150
 
 _BY_CODE: dict[str, type[ArtifactError]] = {
     "E_ARTIFACT_TOO_LARGE": ArtifactTooLargeError,
@@ -142,12 +150,13 @@ class RelayClient:
     def open_input(self, input: str) -> requests.Response:  # noqa: A002 -- the relay's name
         """Opens input artifact `input` for streaming: a `stream=True`
         response whose body the caller reads (`iter_content`, `raw`) and must
-        close. A non-200 raises the matching ArtifactError instead."""
+        close. A non-200 raises the matching ArtifactError instead. Each read
+        of the body waits at most `_READ_TIMEOUT` seconds for data."""
         resp = self.session.get(
             self._url(f"artifacts/in/{quote(input, safe='')}"),
             headers=self._auth(),
             stream=True,
-            timeout=(_CONNECT_TIMEOUT, None),
+            timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
         )
         if resp.status_code != 200:
             with resp:

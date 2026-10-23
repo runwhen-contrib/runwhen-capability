@@ -106,6 +106,13 @@ def test_send_timeout_outlasts_the_runners_stall_timeout():
     assert relay_module._SEND_TIMEOUT >= 120
 
 
+def test_input_read_timeout_outlasts_the_runners_stall_timeout():
+    """A download has a per-read timeout (a stalled connection must fail, not
+    hang the task), and it must be longer than the runner's 2-minute stall
+    timeout, or a runner that merely pauses would be cut off."""
+    assert relay_module._READ_TIMEOUT >= 120
+
+
 @pytest.mark.parametrize(("pause", "completes"), [(0.3, True), (2.0, False)])
 def test_put_artifact_survives_a_relay_pause_shorter_than_the_send_timeout(
     relay_server, tmp_path, monkeypatch, pause, completes

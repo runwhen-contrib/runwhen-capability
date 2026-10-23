@@ -473,7 +473,8 @@ class ArtifactsClient:
         `RW_ARTIFACT_CACHE_MAX_BYTES` (default 1 GiB, least recently used
         entries go first); a later use finds it there with no request at all.
         The file is the lease's sha256-verified bytes (`E_ARTIFACT_CORRUPT` if
-        they do not hash to it): treat it as read-only. It is yours for the
+        they do not hash to it), and read-only (mode 0444): copy it to edit
+        it, the original is shared with every later request. It is yours for the
         rest of the task; do not hold on to the path past it. With no relay
         it is `<workdir>/.rw-artifacts/inputs/<name>` itself."""
         if self._ctx.relay is None:

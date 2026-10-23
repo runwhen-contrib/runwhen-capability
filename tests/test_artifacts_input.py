@@ -28,6 +28,7 @@ from relay_server import PieceStream, Response
 
 from runwhen_capability import Context, artifacts
 from runwhen_capability import _artifact_cache as cache_module
+from runwhen_capability import relay as relay_module
 from runwhen_capability.errors import ArtifactError, ArtifactUndeclaredError
 from runwhen_capability.host import run_request
 from runwhen_capability.loader import load_capability
@@ -140,6 +141,13 @@ def _wait_for_requests(relay_server, count: int, timeout: float = 10.0) -> None:
     while len(relay_server.requests) < count and time.monotonic() < deadline:
         time.sleep(0.01)
     assert len(relay_server.requests) >= count, f"server saw {len(relay_server.requests)} requests"
+
+
+def _wait_for(condition, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert condition(), f"not true after {timeout}s"
 
 
 def _dead_pid() -> int:
@@ -634,7 +642,10 @@ def test_a_waiter_that_queued_with_an_open_response_asks_again_if_the_owner_fail
 
     owner = threading.Thread(target=run, args=("first", first), daemon=True)
     owner.start()
-    _wait_for_requests(relay_server, 1)  # it holds the lock now, mid-download
+    # With no declared sha the owner sends its GET before it takes the lock, so
+    # a request on the wire proves nothing: wait for the lock itself, which it
+    # holds from there until its download ends (gated here).
+    _wait_for(lambda: _lock_path(cache, good).exists())
     waiter = threading.Thread(target=run, args=("second", second), daemon=True)
     waiter.start()
     _wait_for_requests(relay_server, 2)
@@ -662,6 +673,218 @@ def test_a_declared_sha_in_capitals_names_the_same_entry(relay_server, tmp_path)
 
     assert path.name == _sha(data)
     assert path.read_bytes() == data
+
+
+# -- fix round 1 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("pause", "completes"), [(0.3, True), (2.0, False)])
+def test_a_relay_that_goes_quiet_mid_body_fails_the_read_instead_of_hanging(
+    relay_server, tmp_path, monkeypatch, pause, completes
+):
+    """The input GET has a per-read timeout, so a half-open relay connection
+    cannot hang a task (and serve's sequential loop with it) for ever. With it
+    at 1 s, a 0.3 s pause mid-body is fine and a 2 s one fails the read -- with
+    no entry published and no lock left behind."""
+    monkeypatch.setattr(relay_module, "_READ_TIMEOUT", 1)
+    data = b"q" * (2 * MIB)
+
+    def pausing():
+        yield data[:MIB]
+        time.sleep(pause)
+        yield data[MIB:]
+
+    relay_server.script(
+        "GET",
+        IN_PREFIX,
+        Response(
+            200, stream=pausing(), content_length=len(data), headers={"X-RW-Sha256": _sha(data)}
+        ),
+    )
+    ctx = _ctx(relay_server, tmp_path, [_decl("report", data)])
+    cache = ctx.workdir / ".rw-artifact-cache"
+
+    if completes:
+        assert ctx.artifacts.input_path("report").read_bytes() == data
+    else:
+        with pytest.raises(urllib3.exceptions.HTTPError):
+            ctx.artifacts.input_path("report")
+        assert _names(cache) == []
+
+
+def _evict_after(monkeypatch, method: str) -> None:
+    """Makes ArtifactCache.`method` run the cache's trim right after it
+    returns -- what another thread of the same task, finishing its own
+    download in that gap, would do."""
+    original = getattr(cache_module.ArtifactCache, method)
+
+    def with_a_trim(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        self._evict()
+        return result
+
+    monkeypatch.setattr(cache_module.ArtifactCache, method, with_a_trim)
+
+
+def test_an_entry_just_published_cannot_be_trimmed_before_it_is_handed_out(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RW_ARTIFACT_CACHE_MAX_BYTES", "10")  # every entry is over budget
+    _evict_after(monkeypatch, "_publish")
+    cache = tmp_path / "cache"
+
+    path = _fetch(relay_server, tmp_path, cache, "a", b"a" * 1000)
+
+    assert path.read_bytes() == b"a" * 1000
+
+
+def test_an_entry_just_published_without_a_declared_sha_is_pinned_too(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RW_ARTIFACT_CACHE_MAX_BYTES", "10")
+    _evict_after(monkeypatch, "_publish")
+    data = b"keyed by what arrived"
+    relay_server.script("GET", IN_PREFIX, Response(200, body=data))
+    ctx = _ctx(relay_server, tmp_path, [InputArtifactDecl(input="report")])
+
+    assert ctx.artifacts.input_path("report").read_bytes() == data
+
+
+def test_an_entry_just_touched_cannot_be_trimmed_before_it_is_handed_out(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RW_ARTIFACT_CACHE_MAX_BYTES", "10")
+    cache = tmp_path / "cache"
+    first = _fetch(relay_server, tmp_path, cache, "a", b"a" * 1000)
+    _evict_after(monkeypatch, "_touch")
+
+    again = _fetch(relay_server, tmp_path, cache, "a", b"a" * 1000, serve=False)
+
+    assert again == first
+    assert again.read_bytes() == b"a" * 1000
+
+
+def test_the_lock_is_touched_while_a_download_goes_on(relay_server, tmp_path, monkeypatch):
+    """Waiters judge a lock alive by its mtime (see the module docstring), so
+    the downloader must keep it fresh. The first MiB is sent only after the
+    lock has been aged; the rest is held back until the test has seen the
+    lock touched."""
+    monkeypatch.setattr(cache_module, "_LOCK_HEARTBEAT_SECONDS", 0)
+    data = b"h" * (2 * MIB)
+    first_mib, rest = threading.Event(), threading.Event()
+
+    def gated():
+        assert first_mib.wait(20)
+        yield data[:MIB]
+        assert rest.wait(20)
+        yield data[MIB:]
+
+    relay_server.script(
+        "GET",
+        IN_PREFIX,
+        Response(
+            200, stream=gated(), content_length=len(data), headers={"X-RW-Sha256": _sha(data)}
+        ),
+    )
+    cache = tmp_path / "cache"
+    ctx = _ctx(relay_server, tmp_path, [_decl("report", data)], cache_dir=cache)
+    lock = _lock_path(cache, data)
+    outcome: list = []
+    thread = threading.Thread(
+        target=lambda: outcome.append(ctx.artifacts.input_path("report")), daemon=True
+    )
+
+    thread.start()
+    _wait_for(lock.exists)
+    _age(lock, 30)
+    first_mib.set()
+    _wait_for(lambda: time.time() - lock.stat().st_mtime < 5)  # touched, mid-download
+    assert thread.is_alive()
+
+    rest.set()
+    thread.join(20)
+    assert outcome == [cache / _sha(data)]
+
+
+def test_housekeeping_failures_do_not_fail_a_good_download(
+    relay_server, tmp_path, monkeypatch, caplog
+):
+    monkeypatch.setenv("RW_ARTIFACT_CACHE_MAX_BYTES", "1500")
+    cache = tmp_path / "cache"
+    old = _fetch(relay_server, tmp_path, cache, "a", b"a" * 1000)
+    _age(old, 1000)
+    real_unlink = Path.unlink
+
+    def refuse_the_old_entry(self, *args, **kwargs):
+        if self == old:
+            raise PermissionError(13, "Operation not permitted", str(self))
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse_the_old_entry)
+
+    with caplog.at_level("WARNING"):
+        new = _fetch(relay_server, tmp_path, cache, "b", b"b" * 1000)  # over budget: evicts `old`
+
+    assert new.read_bytes() == b"b" * 1000
+    assert old.exists()  # it could not be removed, and that was only noted
+    assert "Operation not permitted" in caplog.text
+
+
+def test_a_cache_directory_that_cannot_be_listed_does_not_fail_a_good_download(
+    relay_server, tmp_path, monkeypatch, caplog
+):
+    def refuse(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(cache_module.os, "scandir", refuse)
+    cache = tmp_path / "cache"
+
+    with caplog.at_level("WARNING"):
+        path = _fetch(relay_server, tmp_path, cache, "a", b"a" * 1000)
+
+    assert path.read_bytes() == b"a" * 1000
+    assert "Permission denied" in caplog.text
+
+
+def test_housekeeping_removes_locks_whose_owner_is_gone_and_keeps_live_ones(relay_server, tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    dead = cache / ("c" * 64 + ".lock")
+    dead.write_text(str(_dead_pid()))
+    live = cache / ("d" * 64 + ".lock")
+    live.write_text(str(os.getpid()))
+
+    _fetch(relay_server, tmp_path, cache, "a", b"a" * 1000)
+
+    assert not dead.exists()
+    assert live.exists()
+
+
+def test_published_entries_are_read_only(relay_server, tmp_path):
+    """A task that edits its input in place would poison the entry for every
+    later request that finds it by hash; the mode keeps it from doing so by
+    accident. (Eviction needs the directory's permission, not the file's.)"""
+    data = b"do not edit me"
+    relay_server.script("GET", IN_PREFIX, _served(data))
+    ctx = _ctx(relay_server, tmp_path, [_decl("report", data)])
+
+    path = ctx.artifacts.input_path("report")
+
+    assert path.stat().st_mode & 0o222 == 0
+    assert path.read_bytes() == data
+    assert ctx.artifacts.input_path("report").stat().st_mode & 0o222 == 0  # and on a hit
+
+
+def test_a_read_only_entry_can_still_be_evicted(relay_server, tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_ARTIFACT_CACHE_MAX_BYTES", "1500")
+    cache = tmp_path / "cache"
+    old = _fetch(relay_server, tmp_path, cache, "a", b"a" * 1000)
+    _age(old, 1000)
+
+    new = _fetch(relay_server, tmp_path, cache, "b", b"b" * 1000)
+
+    assert not old.exists()
+    assert new.exists()
 
 
 # -- memory -------------------------------------------------------------------
