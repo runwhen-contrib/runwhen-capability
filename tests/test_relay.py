@@ -5,6 +5,7 @@ responses onto the artifact exceptions."""
 from __future__ import annotations
 
 import hashlib
+import time
 import tracemalloc
 from pathlib import Path
 
@@ -106,6 +107,14 @@ def test_send_timeout_outlasts_the_runners_stall_timeout():
     assert relay_module._SEND_TIMEOUT >= 120
 
 
+def test_response_timeout_outlasts_the_runners_whole_finalisation():
+    """After the last body byte the runner finishes its final parts and completes the
+    upload: three attempts of two minutes each, plus backoff, with its stall watchdog
+    already stopped. The wait for its answer must outlast all of that."""
+    assert relay_module._RESPONSE_TIMEOUT >= 420
+    assert relay_module._RESPONSE_TIMEOUT > relay_module._SEND_TIMEOUT
+
+
 def test_input_read_timeout_outlasts_the_runners_stall_timeout():
     """A download has a per-read timeout (a stalled connection must fail, not
     hang the task), and it must be longer than the runner's 2-minute stall
@@ -137,6 +146,49 @@ def test_put_artifact_survives_a_relay_pause_shorter_than_the_send_timeout(
     else:
         with pytest.raises(requests.ConnectionError):
             _put(client, stream)
+
+
+def test_put_artifact_gives_up_on_a_relay_that_takes_the_body_and_never_answers(
+    relay_server, tmp_path, monkeypatch
+):
+    """The read slot starts when the body is sent. It is finite, or a relay that
+    goes silent at that point would hang the caller for ever."""
+    monkeypatch.setattr(relay_module, "_RESPONSE_TIMEOUT", 0.5)
+    relay_server.script("PUT", "/", Response(201, json=CREATED, delay=6))
+    started = time.monotonic()
+
+    with pytest.raises(requests.Timeout):
+        _put(_client(relay_server, tmp_path), [b"all", b"the body"])
+
+    assert time.monotonic() - started < 4
+    (seen,) = relay_server.requests
+    assert seen.body == b"allthe body" and seen.body_complete  # it did take all of it
+
+
+def test_put_artifact_waits_for_a_runner_that_is_slow_to_finalise_after_the_body(
+    relay_server, tmp_path, monkeypatch
+):
+    """The response wait is its own, longer limit: a runner that takes longer than the
+    per-send limit to finish the upload after the last byte is still waited for."""
+    monkeypatch.setattr(relay_module, "_SEND_TIMEOUT", 0.5)
+    monkeypatch.setattr(relay_module, "_RESPONSE_TIMEOUT", 8)
+    relay_server.script("PUT", "/", Response(201, json=CREATED, delay=2))
+
+    assert _put(_client(relay_server, tmp_path), [b"body"]) == CREATED
+
+
+def test_put_artifact_does_not_count_a_slow_producer_against_the_read_timeout(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(relay_module, "_SEND_TIMEOUT", 1.5)
+    relay_server.script("PUT", "/", Response(201, json=CREATED))
+
+    def slow():
+        for piece in (b"a", b"b", b"c"):
+            time.sleep(0.8)  # 2.4 s in all: more than the timeout, in pieces less than it
+            yield piece
+
+    assert _put(_client(relay_server, tmp_path), slow()) == CREATED
 
 
 def test_put_artifact_accepts_a_list_of_chunks(relay_server, tmp_path):

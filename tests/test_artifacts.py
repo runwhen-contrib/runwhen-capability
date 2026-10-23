@@ -519,6 +519,39 @@ def test_add_file_does_not_retry_other_errors(relay_server, tmp_path, monkeypatc
     assert len(relay_server.requests) == 1
 
 
+def test_add_file_uploads_an_open_file_from_its_start_and_leaves_it_open(relay_server, tmp_path):
+    path, digest = _file(tmp_path, 3 * MIB + 5)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_handle", size=3 * MIB + 5, sha256=digest))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with open(path, "rb") as fh:
+        fh.seek(1000)  # wherever it was left
+        ref = ctx.artifacts.add_file(fh, "data.bin", "application/x-test")
+        assert not fh.closed
+
+    assert ref.ref == "art_handle"
+    (seen,) = relay_server.requests
+    assert (seen.body_length, seen.body_sha256) == (3 * MIB + 5, digest)
+
+
+def test_add_file_rereads_an_open_file_from_the_start_on_each_busy_retry(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(artifacts, "BUSY_RETRY_DELAY", 0)
+    path, digest = _file(tmp_path, 2 * MIB)
+    busy = Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    relay_server.script("PUT", PUT_PREFIX, busy, busy, _created("art_third", size=2 * MIB))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with open(path, "rb") as fh:
+        ref = ctx.artifacts.add_file(fh, "data.bin")
+
+    assert ref.ref == "art_third"
+    seen = relay_server.requests
+    assert len(seen) == 3
+    assert (seen[2].body_length, seen[2].body_sha256) == (2 * MIB, digest)
+
+
 def test_add_file_missing_file_fails_before_any_request(relay_server, tmp_path):
     ctx = _ctx(relay_server, tmp_path)
 

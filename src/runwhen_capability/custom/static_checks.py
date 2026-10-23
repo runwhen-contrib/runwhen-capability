@@ -221,6 +221,13 @@ _VAR_REF_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_
 _RW_INPUT_RE = re.compile(r"\brw_input\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
 _RW_APPEND_RE = re.compile(r"\brw_append\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
 _RW_SET_RE = re.compile(r"\brw_set\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
+# The first argument of rw_artifact, as one shell word written out literally: bare,
+# "double-quoted" or 'single-quoted', with no expansion in it ("$name" is for the
+# runtime to check). It is taken whole and then judged by is_valid_artifact_name, so
+# `my report.txt`, `a/b` and `-x` are reported as bad names, not read as other names.
+_RW_ARTIFACT_RE = re.compile(
+    r"""\brw_artifact[ \t]+(?:"([^"$`\\\n]*)"|'([^'\n]*)'|([^\s"'$`\\;|&<>()]+))(?=[\s;|&<>)]|\Z)"""
+)
 
 # Special/positional shell variables ($1, $@, $#, $?, $$, $!, $-, $0) are
 # never a declared input; skip them rather than flag every task that reads
@@ -377,6 +384,19 @@ def bash_output_writes(text: str) -> list[tuple[int, str]]:
     hits = [(_line_of(starts, m.start()), m.group(1)) for m in _RW_APPEND_RE.finditer(text)]
     hits += [(_line_of(starts, m.start()), m.group(1)) for m in _RW_SET_RE.finditer(text)]
     return hits
+
+
+def bash_artifact_registrations(text: str) -> list[tuple[int, str]]:
+    """(line, name) for every `rw_artifact <name> ...` call whose name is written
+    out literally -- as written, so it may not be a valid artifact name
+    (is_valid_artifact_name). `rw_artifact "$name" -` cannot be checked here.
+    Comments and heredoc bodies are never scanned."""
+    text = _strip_comments_and_heredocs(text)
+    starts = _line_starts(text)
+    return [
+        (_line_of(starts, m.start()), next(g for g in m.groups() if g is not None))
+        for m in _RW_ARTIFACT_RE.finditer(text)
+    ]
 
 
 # -- readOnly: a mutating kubectl verb in a readOnly task ---------------------
@@ -558,7 +578,7 @@ def python_data_as_code(source: str) -> list[tuple[int, str]]:
 
 #: The public helpers rw.sh defines; any other `rw_*` command is a typo or an
 #: invented helper that bash reports as "command not found" and carries on.
-RW_SH_HELPERS = ("rw_input", "rw_append", "rw_set", "rw_skip")
+RW_SH_HELPERS = ("rw_input", "rw_append", "rw_set", "rw_skip", "rw_artifact")
 
 # An rw_* word in command position: _COMMAND_START, plus a backtick
 # substitution. Not followed by `=`/`+=` (an assignment to a variable that

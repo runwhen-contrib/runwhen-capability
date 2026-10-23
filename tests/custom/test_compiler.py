@@ -139,3 +139,31 @@ def test_raises_compile_error_when_validate_has_errors():
         compile_manifest(files)
     assert exc_info.value.diagnostics
     assert "E_MANIFEST_SCHEMA" in str(exc_info.value)
+
+
+_ARTIFACT_MANIFEST = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: { contentType: text/plain, maxSize: 2Gi } }
+      plain: { artifact: {} }
+      count: { schema: "integer" }
+"""
+
+
+def test_compile_artifact_output():
+    compiled = compile_manifest({"capability.yaml": _ARTIFACT_MANIFEST, "tasks/t.sh": "echo hi\n"})
+    [task] = compiled["tasks"]
+    assert task["outputs"]["dump"] == {"artifact": {"contentType": "text/plain", "maxSize": "2Gi"}}
+    # maxSize is left out, not null, when the author set none; the platform
+    # applies its own cap.
+    assert task["outputs"]["plain"] == {"artifact": {"contentType": "application/octet-stream"}}
+    # A schema output compiles as before: the platform decides to spill it.
+    assert task["outputs"]["count"] == {"schema": {"type": "integer"}}
+    for output in task["outputs"].values():
+        assert "kind" not in output
+        assert "spill" not in output

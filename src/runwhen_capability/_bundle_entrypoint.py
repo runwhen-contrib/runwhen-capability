@@ -12,10 +12,16 @@ same private-fd wire format through -- one JSON line per event:
     {"op": "append", "name": <output>, "value": <json>}
     {"op": "skip",   "reason": <string>}
 
-A successful `main()` return value is emitted as one "set" event per key. Any
-other exception is left to propagate: this process's non-zero exit code (and
-its stderr, captured by bundle.py as part of the task's log) is how bundle.py
-learns the task failed -- there is no separate error channel.
+(bash's `rw_artifact` also writes {"op": "artifact", "name": <output>, "path":
+<file>}; this entry point never does -- `ctx.artifacts` writes into
+RW_ARTIFACTS_DIR instead.)
+
+A successful `main()` return value is emitted as one "set" event per key (a
+value with a `model_dump`, such as the ArtifactRef `ctx.artifacts` returns, is
+written as its JSON form). Any other exception is left to propagate: this
+process's non-zero exit code (and its stderr, captured by bundle.py as part of
+the task's log) is how bundle.py learns the task failed -- there is no
+separate error channel.
 
 Everything this process needs arrives by environment variable -- see
 bundle.py's _execute() for exactly what it sets:
@@ -27,6 +33,8 @@ bundle.py's _execute() for exactly what it sets:
     RW_WORKDIR           Context.workdir
     RW_CAPABILITY        Context.capability
     RW_OPERATION         Context.operation
+    RW_ARTIFACTS_DIR     the directory the host uploads artifacts from; here
+                         `ctx.artifacts` writes into it (see main())
     RW_CREDENTIALS_FILE  a 0600 file holding Context credentials as JSON;
                          read and deleted before the task's code runs
     RW_ALLOW_ANONYMOUS   "1" to degrade unresolved credentials (rwtask
@@ -46,12 +54,20 @@ import sys
 import uuid
 from pathlib import Path
 
+from .artifacts import ArtifactsClient, LocalArtifactSink
 from .context import Context
 from .errors import SkipTask
 
 
+def _json_default(value):
+    """Pydantic models (an ArtifactRef) travel as their JSON form."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _write_event(fd: int, event: dict) -> None:
-    os.write(fd, (json.dumps(event) + "\n").encode("utf-8"))
+    os.write(fd, (json.dumps(event, default=_json_default) + "\n").encode("utf-8"))
 
 
 _WRAPPER_ONLY_ENV = (
@@ -90,6 +106,13 @@ def main() -> int:
         credentials=credentials,
         allow_anonymous_credentials=allow_anonymous,
     )
+    # This process never has the relay. The host uploads what is in
+    # RW_ARTIFACTS_DIR once the task has exited, so `ctx.artifacts` writes there:
+    # a file named for a declared artifact output is that output, and the ref it
+    # returns is replaced by the relay's.
+    artifacts_dir = os.environ.get("RW_ARTIFACTS_DIR")
+    if artifacts_dir:
+        ctx.artifacts = ArtifactsClient(ctx, local_sink=LocalArtifactSink(Path(artifacts_dir)))
 
     module_name = f"runwhen_capability_bundle_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, task_file)

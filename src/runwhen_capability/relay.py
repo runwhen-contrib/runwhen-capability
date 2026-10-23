@@ -47,23 +47,32 @@ from .errors import (
     ArtifactUndeclaredError,
 )
 
-# requests/urllib3 timeout tuples are (connect, read). An upload's read timeout
-# is None on purpose: its response only comes after the runner has taken the
-# whole body, however slow the producer is. The task's own deadline is what
-# ends a stalled upload.
+# requests/urllib3 timeout tuples are (connect, read), and an upload uses two
+# different limits for them:
 #
-# The connect slot is not only about connecting. urllib3 leaves the connect
-# timeout on the socket for the whole time it SENDS the request body (the read
-# timeout applies only once it starts reading the response), and Python's
-# sendall treats that timeout as a limit on the whole call. So for an upload
-# the first number is the longest the runner may stop reading mid-body before
-# the chunk in flight fails with a raw requests.ConnectionError. The runner
-# legitimately stops reading for up to its stall timeout (2 minutes) while it
-# waits for an upload slot or flushes a part to object storage, so the upload
-# gets 150 s, more than that. A refused or reset connection still fails at
-# once; only a blackholed one waits this long. A download sends no body, so
-# its connect slot stays short.
+# - The connect slot, _SEND_TIMEOUT, bounds each send of the body. It is not only
+#   about connecting: urllib3 leaves the connect timeout on the socket for the
+#   whole time it SENDS the request body (the read timeout applies only once it
+#   starts reading the response), and Python's sendall treats that timeout as a
+#   limit on the whole call. So it is the longest the runner may stop reading
+#   mid-body before the chunk in flight fails with a raw requests.ConnectionError.
+#   The runner legitimately stops reading for up to its stall timeout (2 minutes)
+#   while it waits for an upload slot or flushes a part to object storage, so
+#   the upload gets 150 s, more than that. A refused or reset connection still
+#   fails at once; only a blackholed one waits this long. A download sends no
+#   body, so its connect slot stays short.
+#
+# - The read slot, _RESPONSE_TIMEOUT, only starts after the last body byte, so a
+#   slow producer never eats into it. By then the runner still has to finish its
+#   final parts and finalise the upload: up to three attempts of two minutes each
+#   with a second or two of backoff between them, and its stall watchdog (which
+#   counts progress while the body flows, not elapsed time) is already stopped.
+#   The 150 s above does not cover that, so the slot is ten minutes: the whole
+#   finalisation, with margin. It is finite all the same: a runner that takes the
+#   body and then never answers must not hang the caller -- and `rwtask serve`,
+#   which runs one request at a time, with it.
 _SEND_TIMEOUT = 150
+_RESPONSE_TIMEOUT = 600
 _CONNECT_TIMEOUT = 10
 # A download does have a read timeout: a relay connection that goes half-open
 # would otherwise hang the task for ever -- and `rwtask serve`, which runs one
@@ -140,7 +149,7 @@ class RelayClient:
                 "Content-Type": content_type,
                 "X-RW-Task": task,
             },
-            timeout=(_SEND_TIMEOUT, None),
+            timeout=(_SEND_TIMEOUT, _RESPONSE_TIMEOUT),
         )
         with resp:
             if resp.status_code != 201:

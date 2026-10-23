@@ -48,6 +48,7 @@ from .manifest import (
     input_env_name,
     is_allowed_path,
     is_reserved_env_name,
+    is_valid_artifact_name,
     legacy_input_env_name,
     python_kwarg_name,
     task_file_language,
@@ -75,6 +76,7 @@ _STANDARD_BASH_ENV = frozenset(
         "HOSTNAME",
         "RW_SDK",
         "RW_OUTPUT_FD",
+        "RW_ARTIFACTS_DIR",
         "RW_WORKDIR",
         "RW_CAPABILITY",
         "RW_OPERATION",
@@ -353,6 +355,21 @@ def _check_names(raw, manifest: Manifest) -> list[Diagnostic]:
         diagnostics += _check_input_collisions(
             {**manifest.inputs, **task.inputs}, f"tasks[{index}].inputs", inputs_line
         )
+        raw_outputs = raw_task.get("outputs") if isinstance(raw_task, dict) else None
+        for name, output in task.outputs.items():
+            if output.artifact is not None and not is_valid_artifact_name(name):
+                diagnostics.append(
+                    Diagnostic(
+                        code=E_MANIFEST_SCHEMA,
+                        file="capability.yaml",
+                        line=line_of((raw_outputs or {}).get(name)) or task_line,
+                        path=f"tasks[{index}].outputs.{name}",
+                        message=(
+                            f"artifact output name {name!r} must be one segment of letters, "
+                            "digits, '_', '.' and '-', not starting with '.' or '-' (no '/')"
+                        ),
+                    )
+                )
     return diagnostics
 
 
@@ -588,6 +605,8 @@ def _check_tasks(files: dict[str, str], raw, manifest: Manifest) -> list[Diagnos
 
         raw_outputs = (raw_task or {}).get("outputs") or {}
         for name, output in task.outputs.items():
+            if output.schema_ is None:
+                continue  # an artifact output has no schema to check
             diagnostics += _check_output_schema(
                 files,
                 name,
@@ -968,4 +987,18 @@ def _check_source(
                         message=f"output {out_name!r} is not declared",
                     )
                 )
+        for line, out_name in static_checks.bash_artifact_registrations(source):
+            declared = outputs.get(out_name)
+            if not is_valid_artifact_name(out_name):
+                message = (
+                    f"rw_artifact {out_name!r} is not a valid artifact name: one segment of "
+                    "letters, digits, '_', '.' and '-', not starting with '.' or '-' (no '/')"
+                )
+            elif declared is None or declared.artifact is None:
+                message = f"rw_artifact {out_name!r} is not a declared artifact output"
+            else:
+                continue
+            diagnostics.append(
+                Diagnostic(code=E_OUTPUT_UNDECLARED, file=file_path, line=line, message=message)
+            )
     return diagnostics

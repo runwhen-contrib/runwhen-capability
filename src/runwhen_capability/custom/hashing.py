@@ -54,7 +54,7 @@ def task_files(files: dict[str, str], task: str) -> list[str]:
     paths.update(
         output.schema_[2:]
         for output in task_spec.outputs.values()
-        if output.schema_.startswith("./")
+        if output.schema_ is not None and output.schema_.startswith("./")
     )
     return sorted(paths)
 
