@@ -35,6 +35,8 @@ def test_it_states_the_max_size_rule_for_editors():
     max_size = manifest_json_schema()["$defs"]["ArtifactSpec"]["properties"]["maxSize"]
     (string_type,) = [branch for branch in max_size["anyOf"] if branch.get("type") == "string"]
     pattern = re.compile(string_type["pattern"])
+    # a bare YAML integer is a byte count too
+    assert {"type": "integer", "minimum": 0} in max_size["anyOf"]
     for good in ("0", "1024", "512Mi", "2Gi", "1Ti", "3Ki"):
         assert pattern.search(good), good
     for bad in ("5GB", "1.5Gi", "-1", "1gi", "Gi", "1Pi", ""):

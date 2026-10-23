@@ -239,6 +239,9 @@ def run_bundle_request(
     rw_sdk_dir = scope_dir / ".rw-sdk"
     try:
         _prepare_scope(scope_dir)
+        # What an artifact's path is walked from must still be THIS directory when the
+        # task has finished (see _open_artifact).
+        scope_id = _dir_identity(scope_dir)
         _materialize(files_dir, files)
         _fresh_dir(rw_sdk_dir, marker="rw.sh")
         _write_private_file(rw_sdk_dir, "rw.sh", RW_SH)
@@ -270,6 +273,7 @@ def run_bundle_request(
             rw_sdk_dir=rw_sdk_dir,
             deadline_seconds=deadline_at - time.monotonic(),
             deadline_at=deadline_at,
+            scope_id=scope_id,
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
             relay=relay,
@@ -312,6 +316,7 @@ def run_bundle_request(
             rw_sdk_dir=rw_sdk_dir,
             deadline_seconds=deadline_at - time.monotonic(),
             deadline_at=deadline_at,
+            scope_id=scope_id,
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
             relay=relay,
@@ -336,7 +341,18 @@ def run_bundle_request(
 # -- one setup/task invocation -------------------------------------------------
 
 
-def _run_setup_or_task(
+def _run_setup_or_task(**invocation: Any) -> _RunOutcome:
+    """_run_invocation(), then makes sure the artifacts directory carries its marker.
+    A task may have removed `$RW_ARTIFACTS_DIR` and `rw_artifact` (or the task)
+    recreated it, unmarked; left like that, the next `rwtask run --workdir` on this
+    scope would take it for a directory of the user's and refuse to start."""
+    try:
+        return _run_invocation(**invocation)
+    finally:
+        _stamp_artifacts_dir(invocation["scope_dir"])
+
+
+def _run_invocation(
     *,
     files_dir: Path,
     file_path: str,
@@ -352,6 +368,7 @@ def _run_setup_or_task(
     rw_sdk_dir: Path,
     deadline_seconds: float,
     deadline_at: float,
+    scope_id: tuple[int, int],
     allow_anonymous: bool,
     redactor: Redactor,
     relay: RelayClient | None,
@@ -554,7 +571,7 @@ def _run_setup_or_task(
         if not failed() and (artifact_specs or spilled):
             registered = {e["name"]: e["path"] for e in events if e["op"] == "artifact"}
             files, path_errors = _collect_artifacts(
-                scope_dir, secrets_dir, artifact_specs, registered
+                scope_dir, secrets_dir, artifact_specs, registered, scope_id
             )
             try:
                 errors.extend(path_errors)
@@ -803,7 +820,18 @@ def _clipped(message: str) -> str:
     return message[:MAX_SCHEMA_ERROR_CHARS]
 
 
-def _open_artifact(scope_dir: Path, secrets_dir: Path, raw: str) -> BinaryIO:
+def _dir_identity(path: Path | int) -> tuple[int, int]:
+    """(device, inode) of a directory, by path (following links) or open descriptor."""
+    info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+    return info.st_dev, info.st_ino
+
+
+def _open_artifact(
+    scope_dir: Path,
+    secrets_dir: Path,
+    raw: str,
+    scope_id: tuple[int, int] | None = None,
+) -> BinaryIO:
     """Opens `raw` -- an artifact path from the child, absolute (rw_artifact) or
     relative to the scope -- for reading, and returns the open file. It is a
     regular file inside `scope_dir` reached without crossing a symlink, or
@@ -820,8 +848,13 @@ def _open_artifact(scope_dir: Path, secrets_dir: Path, raw: str) -> BinaryIO:
 
     Nothing above the scope matters, which is why the scope is also accepted by
     its resolved name (the child's `$PWD` is the kernel's idea of its working
-    directory). The invocation's secrets directory is off limits: a credential
-    file is never an artifact."""
+    directory) and the walk starts from that resolved name. But the walk's
+    starting point is itself found by name, so it is opened with O_NOFOLLOW and
+    checked against `scope_id`, the (device, inode) recorded when the scope was
+    prepared: a scope renamed away and replaced (by a symlink, or another
+    directory) by a process that outlived the task is `E_ARTIFACT_PATH`, not
+    a walk through someone else's tree. The invocation's secrets directory is
+    off limits: a credential file is never an artifact."""
     if not raw or "\x00" in raw:
         raise _ArtifactPathError("the path is empty or has a NUL byte")
     candidate = os.path.normpath(os.path.join(scope_dir, raw))
@@ -835,9 +868,17 @@ def _open_artifact(scope_dir: Path, secrets_dir: Path, raw: str) -> BinaryIO:
         raise _ArtifactPathError(f"{raw} is inside the credentials directory")
     dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0)
-    dir_fd = -1
     try:
-        dir_fd = os.open(anchor, os.O_RDONLY | os.O_DIRECTORY)
+        dir_fd = os.open(os.path.realpath(scope_dir), dir_flags)
+    except OSError as exc:
+        raise _ArtifactPathError(
+            f"the task's scope directory cannot be opened ({exc.strerror or exc})"
+        ) from None
+    try:
+        if scope_id is not None and _dir_identity(dir_fd) != scope_id:
+            raise _ArtifactPathError(
+                "the task's scope directory is not the one that was prepared for it"
+            )
         for part in parts[:-1]:
             next_fd = os.open(part, dir_flags, dir_fd=dir_fd)
             os.close(dir_fd)
@@ -850,8 +891,7 @@ def _open_artifact(scope_dir: Path, secrets_dir: Path, raw: str) -> BinaryIO:
             ) from None
         raise _ArtifactPathError(f"{raw} cannot be opened ({exc.strerror or exc})") from None
     finally:
-        if dir_fd >= 0:
-            os.close(dir_fd)
+        os.close(dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(file_fd).st_mode):
             raise _ArtifactPathError(f"{raw} is not a regular file")
@@ -866,6 +906,7 @@ def _collect_artifacts(
     secrets_dir: Path,
     artifact_specs: dict[str, dict],
     registered: dict[str, str],
+    scope_id: tuple[int, int] | None = None,
 ) -> tuple[dict[str, BinaryIO], list[str]]:
     """The open file to upload for each declared artifact output, by name: the
     one the task registered (rw_artifact), else a regular file sitting at
@@ -888,7 +929,7 @@ def _collect_artifacts(
                 continue
             raw = default
         try:
-            files[name] = _open_artifact(scope_dir, secrets_dir, raw)
+            files[name] = _open_artifact(scope_dir, secrets_dir, raw, scope_id)
         except _ArtifactPathError as exc:
             errors.append(_clipped(f"{E_ARTIFACT_PATH}: artifact {name!r}: {exc}"))
     if errors:
@@ -1345,6 +1386,23 @@ def _prepare_scope(scope_dir: Path) -> None:
         scope_dir / _ARTIFACTS_DIR, marker=_ARTIFACTS_MARKER, what="an artifacts directory of ours"
     )
     _write_private_file(scope_dir / _ARTIFACTS_DIR, _ARTIFACTS_MARKER, "")
+
+
+def _stamp_artifacts_dir(scope_dir: Path) -> None:
+    """Writes the marker into `<scope>/artifacts` if it is a directory without it.
+    Never through a symlink (a task can make `artifacts` one) and never an error:
+    a missing directory has nothing to protect."""
+    try:
+        dir_fd = os.open(scope_dir / _ARTIFACTS_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        os.close(os.open(_ARTIFACTS_MARKER, flags, 0o600, dir_fd=dir_fd))
+    except OSError:
+        pass  # already there
+    finally:
+        os.close(dir_fd)
 
 
 def _reset_artifacts_dir(scope_dir: Path) -> None:

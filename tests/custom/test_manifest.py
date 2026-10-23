@@ -8,7 +8,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from runwhen_capability.custom import validate
+from runwhen_capability.custom import compile_manifest, validate
 from runwhen_capability.custom.diagnostics import E_MANIFEST_SCHEMA
 from runwhen_capability.custom.manifest import (
     ArtifactSpec,
@@ -57,9 +57,40 @@ def test_max_size_rejects_anything_else(size):
         ArtifactSpec(maxSize=size)
 
 
-def test_max_size_must_be_a_string():
-    with pytest.raises(ValidationError):
-        ArtifactSpec(maxSize=1024)
+@pytest.mark.parametrize(("given", "held"), [(1024, "1024"), (0, "0"), (10**12, "1000000000000")])
+def test_max_size_accepts_a_plain_byte_count_written_as_a_number(given, held):
+    # `maxSize: 1024`, unquoted in YAML, is an integer; it is held (and compiled) as a string
+    assert ArtifactSpec(maxSize=given).maxSize == held
+
+
+@pytest.mark.parametrize("given", [-1, True, False, 1.5, 1024.0, ["1Gi"], {"a": 1}])
+def test_max_size_refuses_other_non_strings(given):
+    with pytest.raises(ValidationError, match="maxSize"):
+        ArtifactSpec(maxSize=given)
+
+
+def test_a_bare_integer_max_size_in_yaml_validates_and_compiles_as_a_string():
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\n"
+            "name: x\n"
+            "tasks:\n"
+            "  - name: t\n"
+            "    file: tasks/t.sh\n"
+            "    effects: [Test fixture]\n"
+            "    outputs:\n"
+            "      dump: { artifact: { maxSize: 1048576 } }\n"
+        ),
+        "tasks/t.sh": "echo hi\n",
+    }
+    assert [d for d in validate(files) if d.severity == "error"] == []
+    [task] = compile_manifest(files)["tasks"]
+    assert task["outputs"]["dump"] == {
+        "artifact": {"contentType": "application/octet-stream", "maxSize": "1048576"}
+    }
+    files["capability.yaml"] = files["capability.yaml"].replace("1048576", "-5")
+    (diag,) = [d for d in validate(files) if d.code == E_MANIFEST_SCHEMA]
+    assert "not a quantity" in diag.message
 
 
 _MANIFEST = """\

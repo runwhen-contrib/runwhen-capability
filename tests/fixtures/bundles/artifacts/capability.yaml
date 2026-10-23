@@ -138,3 +138,8 @@ tasks:
     effects: [Test fixture]
     outputs:
       blob: { schema: "string" }
+  - name: remove-then-pipe
+    file: tasks/remove_then_pipe.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }

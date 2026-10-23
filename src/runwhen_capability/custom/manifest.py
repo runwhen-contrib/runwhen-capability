@@ -84,20 +84,34 @@ MAX_SIZE_PATTERN = r"^[0-9]+(?:Ki|Mi|Gi|Ti)?$"
 MAX_SIZE_RE = re.compile(MAX_SIZE_PATTERN)
 
 
+def _max_size_schema(schema: dict[str, Any]) -> None:
+    """A bare YAML integer is a byte count too (see ArtifactSpec): the served JSON
+    Schema says so, beside the string form."""
+    schema["anyOf"].insert(1, {"type": "integer", "minimum": 0})
+
+
 class ArtifactSpec(BaseModel):
     """`outputs.<name>.artifact`: the output is a file, uploaded as an artifact,
     not a value checked against a schema. `maxSize` is a quantity ("512Mi",
-    "2Gi", or a plain byte count); unset, the platform's own cap applies."""
+    "2Gi", or a plain byte count, which may be a bare YAML integer); unset, the
+    platform's own cap applies. It is always held, and compiled, as a string."""
 
     contentType: str = "application/octet-stream"
-    # The pattern is here for the served JSON Schema (editors); the validator
-    # runs first and gives the readable message.
-    maxSize: str | None = Field(default=None, pattern=MAX_SIZE_PATTERN)
+    # The pattern and the extra schema are here for the served JSON Schema
+    # (editors); the validator runs first and gives the readable message.
+    maxSize: str | None = Field(
+        default=None, pattern=MAX_SIZE_PATTERN, json_schema_extra=_max_size_schema
+    )
 
     @field_validator("maxSize", mode="before")
     @classmethod
     def _max_size_is_a_quantity(cls, value: Any) -> Any:
-        if isinstance(value, str) and MAX_SIZE_RE.fullmatch(value) is None:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return str(value)  # `maxSize: 1024`, unquoted in YAML, is 1024 bytes
+        # what is left of the ints is a negative one, or a bool (an int in Python, no byte count)
+        if isinstance(value, int) or (
+            isinstance(value, str) and MAX_SIZE_RE.fullmatch(value) is None
+        ):
             raise ValueError(
                 f"maxSize {value!r} is not a quantity: use a whole number of bytes or one "
                 "with a Ki, Mi, Gi or Ti suffix (e.g. 512Mi, 2Gi)"

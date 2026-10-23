@@ -22,9 +22,11 @@ from runwhen_capability import relay as relay_module
 from runwhen_capability.bundle import (
     _ArtifactPathError,
     _collect_artifacts,
+    _dir_identity,
     _EventStream,
     _open_artifact,
     _parse_event,
+    _stamp_artifacts_dir,
     _upload_artifacts,
     run_bundle_request,
 )
@@ -894,6 +896,78 @@ def test_open_artifact_reads_the_file_it_opened_when_the_path_is_swapped_afterwa
         assert handle.read() == b"inside"
 
 
+def test_open_artifact_checks_the_scope_is_the_directory_that_was_prepared(tmp_path):
+    scope, secrets = _scope(tmp_path)
+    prepared = _dir_identity(scope)
+
+    with _open_artifact(scope, secrets, "sub/f.txt", prepared) as handle:
+        assert handle.read() == b"inside"
+    with pytest.raises(_ArtifactPathError, match="not the one that was prepared"):
+        _open_artifact(scope, secrets, "sub/f.txt", (prepared[0], prepared[1] + 1))
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+def test_a_scope_renamed_away_and_replaced_is_refused_not_walked(tmp_path, replacement):
+    scope, secrets = _scope(tmp_path)
+    prepared = _dir_identity(scope)
+    other = tmp_path / "other"
+    (other / "sub").mkdir(parents=True)
+    (other / "sub" / "f.txt").write_bytes(b"someone else's")
+
+    scope.rename(tmp_path / "moved")
+    if replacement == "symlink":
+        scope.symlink_to(other, target_is_directory=True)
+    else:
+        (scope / "sub").mkdir(parents=True)
+        (scope / "sub" / "f.txt").write_bytes(b"planted")
+
+    with pytest.raises(_ArtifactPathError, match="not the one that was prepared"):
+        _open_artifact(scope, secrets, str(scope / "sub" / "f.txt"), prepared)
+
+
+def test_a_scope_symlink_is_not_followed_by_the_walk_itself(tmp_path):
+    # even with no recorded identity the starting point is opened with O_NOFOLLOW, on
+    # the resolved name -- which cannot be a link unless it was swapped just now
+    scope, secrets = _scope(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(scope, target_is_directory=True)
+
+    with _open_artifact(link, secrets, str(scope / "sub" / "f.txt")) as handle:
+        assert handle.read() == b"inside"
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+def test_a_scope_replaced_after_the_task_uploads_nothing(
+    relay_server, tmp_path, monkeypatch, replacement
+):
+    """A process that outlived the task renames the scope away and puts something else in
+    its place before the host collects the artifacts. Nothing of it is uploaded."""
+    relay_server.script("PUT", PUT_PREFIX, _created("art_never"))
+    other = tmp_path / "other"
+    (other / "artifacts").mkdir(parents=True)
+    (other / "artifacts" / "dump").write_bytes(b"not the task's")
+    real = bundle_module._collect_artifacts
+
+    def replace_scope_then_collect(scope_dir, *rest):
+        scope_dir.rename(tmp_path / "moved")
+        if replacement == "symlink":
+            scope_dir.symlink_to(other, target_is_directory=True)
+        else:
+            (scope_dir / "artifacts").mkdir(parents=True)
+            (scope_dir / "artifacts" / "dump").write_bytes(b"planted")
+        return real(scope_dir, *rest)
+
+    monkeypatch.setattr(bundle_module, "_collect_artifacts", replace_scope_then_collect)
+
+    result, _ = _run_artifacts(["dump-dir"], tmp_path, relay_server)
+
+    [task] = result.tasks
+    assert task.status == "failed"
+    assert task.error.startswith("E_ARTIFACT_PATH"), task.error
+    assert "not the one that was prepared" in task.error
+    assert relay_server.requests == []
+
+
 def test_the_artifact_uploaded_is_the_file_that_was_opened_not_what_the_path_names_later(
     relay_server, tmp_path, monkeypatch
 ):
@@ -903,8 +977,8 @@ def test_the_artifact_uploaded_is_the_file_that_was_opened_not_what_the_path_nam
     relay_server.script("PUT", PUT_PREFIX, _created("art_report"))
     real = bundle_module._open_artifact
 
-    def open_then_swap(scope_dir, secrets_dir, raw):
-        handle = real(scope_dir, secrets_dir, raw)
+    def open_then_swap(scope_dir, secrets_dir, raw, *rest):
+        handle = real(scope_dir, secrets_dir, raw, *rest)
         os.unlink(raw)
         os.symlink("/etc/passwd", raw)
         return handle
@@ -1025,6 +1099,37 @@ def test_an_empty_artifacts_directory_and_a_symlink_named_artifacts_are_replaced
     assert not (scope / "artifacts").is_symlink()
 
 
+@pytest.mark.parametrize("task", ["remove-then-pipe", "replace-dir"])
+def test_the_artifacts_directory_carries_its_marker_when_the_request_ends(tmp_path, task):
+    """A task that removes `$RW_ARTIFACTS_DIR` and has it made again (rw_artifact does)
+    would leave one that is not marked as ours; the next `rwtask run --workdir` on the
+    same scope must not take it for the user's."""
+    result, scope = _run_artifacts([task], tmp_path)
+    assert result.tasks[0].status == "ok", result
+    assert (scope / "artifacts" / ".rw-artifacts-dir").is_file()
+
+    again, _ = _run_artifacts(["where"], tmp_path)
+
+    assert again.setup is None or again.setup.status != "failed", again.setup
+    assert again.tasks[0].status == "ok", again
+
+
+def test_stamping_the_artifacts_directory_never_writes_through_a_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "artifacts").symlink_to(outside, target_is_directory=True)
+
+    _stamp_artifacts_dir(tmp_path)
+
+    assert list(outside.iterdir()) == []
+    (tmp_path / "artifacts").unlink()
+    _stamp_artifacts_dir(tmp_path)  # nothing there: nothing to do
+    (tmp_path / "artifacts").mkdir()
+    _stamp_artifacts_dir(tmp_path)
+    _stamp_artifacts_dir(tmp_path)  # idempotent
+    assert [p.name for p in (tmp_path / "artifacts").iterdir()] == [".rw-artifacts-dir"]
+
+
 def test_a_task_that_replaces_the_artifacts_directory_does_not_stop_the_next_one(tmp_path):
     # what a task leaves in a directory it replaced is this request's own, not a user's:
     # the next task starts with a fresh one regardless of the marker
@@ -1040,7 +1145,7 @@ def test_a_task_that_replaces_the_artifacts_directory_does_not_stop_the_next_one
 def test_an_upload_to_a_relay_that_never_answers_ends_the_task_not_the_host(
     relay_server, tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(relay_module, "_SEND_TIMEOUT", 0.5)
+    monkeypatch.setattr(relay_module, "_RESPONSE_TIMEOUT", 0.5)
     relay_server.script("PUT", PUT_PREFIX, Response(201, json={"artifactRef": "x"}, delay=6))
     started = time.monotonic()
 
