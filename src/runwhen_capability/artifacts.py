@@ -82,6 +82,7 @@ through `context`, and must not pay for that.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import queue
 import subprocess
@@ -90,7 +91,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, NamedTuple
+from typing import TYPE_CHECKING, Any, BinaryIO, NamedTuple
 
 from pydantic import BaseModel, model_serializer
 
@@ -118,8 +119,8 @@ QUEUE_DEPTH = 4
 # is less than a chunk. Far below the runner's two-minute no-byte limit.
 FLUSH_AFTER_SECONDS = 5
 
-# A task output declared `spill: auto` whose JSON is larger than this goes to
-# an artifact instead of the result (host.py).
+# A task output declared `spill: auto` whose JSON (`spill_json`) is larger than
+# this goes to an artifact instead of the result (host.py, bundle.py).
 SPILL_THRESHOLD_BYTES = 256 * 1024
 
 # `add_file` retries a busy runner (503) this many times, waiting this many
@@ -151,6 +152,14 @@ _sleep = time.sleep  # indirection so a test can observe the busy backoff
 
 _END = object()  # queue sentinel: the body is complete
 _ABORT = object()  # queue sentinel: abandon the upload
+
+
+def spill_json(value: Any) -> bytes:
+    """`value` as a spilled output is uploaded, and as both task hosts measure
+    it against SPILL_THRESHOLD_BYTES: compact JSON (what the result itself
+    carries), UTF-8. Raises TypeError/ValueError for a value that is not
+    JSON (NaN included)."""
+    return json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
 
 class _UploadAborted(Exception):

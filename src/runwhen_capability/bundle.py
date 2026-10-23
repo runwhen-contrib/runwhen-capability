@@ -46,7 +46,9 @@ otherwise); it is opened once, safely, and uploaded from that handle. Files are
 uploaded as written, not
 redacted: that is the point of a dump. A schema output the platform has said
 may spill, and that outgrows MAX_OUTPUT_BYTES, goes the same way as an
-`application/json` artifact -- redacted first, since inline outputs are.
+`application/json` artifact -- redacted first, since inline outputs are. Where
+artifacts are switched off or unsupported, a spill falls back to the caps it
+would have had without one; a declared artifact output fails the task.
 
 A `resource`-typed input's value is the run's target resource (dict, JSON
 over the wire); a `secret`/`credential`-typed input's value is always a file
@@ -63,6 +65,7 @@ relay and its token (see _inherited_env).
 from __future__ import annotations
 
 import errno
+import io
 import json
 import logging
 import os
@@ -87,7 +90,7 @@ import requests
 
 from ._redaction import Redactor
 from ._rw_sh import BASH_ENV_SH, RW_SH
-from .artifacts import SPILL_THRESHOLD_BYTES
+from .artifacts import SPILL_THRESHOLD_BYTES, spill_json
 from .context import Context
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import (
@@ -115,7 +118,7 @@ from .custom.manifest import (
 )
 from .custom.schema_features import regex_keyword_paths
 from .custom.yaml_lines import safe_load
-from .errors import ArtifactError
+from .errors import ArtifactError, ArtifactsUnavailableError
 from .models import (
     BundleRequestEnvelope,
     InputArtifactDecl,
@@ -559,9 +562,10 @@ def _run_invocation(
         spillable = frozenset(
             decl.name for decl in output_decls if decl.spill and decl.task == operation
         )
-        outputs, size_errors, spilled = _apply_size_caps(
-            outputs, frozenset() if failed() or is_setup else spillable, redactor
-        )
+        spill = frozenset() if failed() or is_setup else spillable
+        uncapped = outputs
+        outputs, size_errors, spilled = _apply_size_caps(uncapped, spill, redactor)
+        caps_at = len(errors)
         errors.extend(size_errors)
 
         # Nothing is uploaded unless the task succeeded in every other respect: a
@@ -576,7 +580,7 @@ def _run_invocation(
             try:
                 errors.extend(path_errors)
                 if not path_errors and (files or spilled):
-                    refs, upload_errors = _upload_artifacts(
+                    refs, upload_errors, unavailable = _upload_artifacts(
                         capability=capability,
                         operation=operation,
                         scope_dir=scope_dir,
@@ -587,6 +591,19 @@ def _run_invocation(
                         spilled=spilled,
                         deadline_at=deadline_at,
                     )
+                    if unavailable is not None:
+                        # Artifacts are off, or this runner has none: what could not
+                        # spill is capped as it was before spill existed.
+                        unspilled = frozenset(spilled) - refs.keys()
+                        log.warning(
+                            "spill unavailable (%s): output(s) %s capped inline instead",
+                            unavailable,
+                            ", ".join(repr(name) for name in sorted(unspilled)),
+                        )
+                        outputs, recapped, _ = _apply_size_caps(
+                            uncapped, spill - unspilled, redactor
+                        )
+                        errors[caps_at : caps_at + len(size_errors)] = recapped
                     errors.extend(upload_errors)
                     outputs.update(refs)
                     upload_timed_out = any(e.startswith(E_TIMEOUT) for e in upload_errors)
@@ -733,21 +750,23 @@ def _validate_output_schema(name: str, value: Any, schema: dict) -> list[str]:
 
 
 def _json_size(value: Any) -> int:
-    return len(json.dumps(value).encode("utf-8"))
+    """The size the caps measure: `spill_json`'s, compact JSON -- what the
+    result carries, and how the packaged host measures a spill (host.py)."""
+    return len(spill_json(value))
 
 
 def _truncate_list_to_budget(value: list, budget: int) -> list:
-    """The largest prefix of `value` whose JSON encoding fits `budget`
-    bytes, computed in one O(n) pass -- each element is encoded exactly
-    once, not the whole (shrinking) list once per dropped element. Exact,
-    not approximate: `json.dumps` with its default separators renders a
-    list as "[" + ", ".join(dumps(item) for item in list) + "]", so summing
-    each item's own encoded length plus its ", " separator reproduces the
-    real total byte-for-byte."""
+    """The largest prefix of `value` whose JSON encoding (`_json_size`) fits
+    `budget` bytes, computed in one O(n) pass -- each element is encoded
+    exactly once, not the whole (shrinking) list once per dropped element.
+    Exact, not approximate: compact JSON renders a list as
+    "[" + ",".join(dumps(item) for item in list) + "]", so summing each
+    item's own encoded length plus its "," separator reproduces the real
+    total byte-for-byte."""
     kept: list = []
     total = 2  # the array's own "[" + "]"
     for item in value:
-        extra = len(json.dumps(item).encode("utf-8")) + (2 if kept else 0)  # ", " between items
+        extra = _json_size(item) + (1 if kept else 0)  # "," between items
         if total + extra > budget:
             break
         total += extra
@@ -760,14 +779,14 @@ def _apply_size_caps(
     spill: frozenset[str] = frozenset(),
     redactor: Redactor | None = None,
 ) -> tuple[dict[str, Any], list[str], dict[str, bytes]]:
-    """Applies the per-output and per-result caps. Returns the outputs that stay
-    inline, the error messages, and -- for each output named in `spill` that
-    outgrew MAX_OUTPUT_BYTES -- the bytes to upload for it: its value
-    REDACTED (the inline ones are redacted by the caller, after this) and
-    serialised compactly as JSON. A spilled output is neither truncated nor
-    counted against the per-result cap, which applies to what stays inline;
-    nothing is uploaded here, and if the result is dropped for being over the
-    cap so are the spilled bytes."""
+    """Applies the per-output and per-result caps, measured as compact JSON
+    (`_json_size`). Returns the outputs that stay inline, the error messages,
+    and -- for each output named in `spill` that outgrew MAX_OUTPUT_BYTES --
+    the bytes to upload for it: its value REDACTED (the inline ones are
+    redacted by the caller, after this) and serialised compactly as JSON. A
+    spilled output is neither truncated nor counted against the per-result
+    cap, which applies to what stays inline; nothing is uploaded here, and if
+    the result is dropped for being over the cap so are the spilled bytes."""
     errors: list[str] = []
     capped: dict[str, Any] = {}
     spilled: dict[str, bytes] = {}
@@ -779,7 +798,7 @@ def _apply_size_caps(
         if name in spill:
             if redactor:
                 value = redactor.value(value)
-            spilled[name] = json.dumps(value, separators=(",", ":"), allow_nan=False).encode()
+            spilled[name] = spill_json(value)
             continue
         if isinstance(value, list):
             truncated = _truncate_list_to_budget(value, MAX_OUTPUT_BYTES)
@@ -950,20 +969,28 @@ def _upload_artifacts(
     files: dict[str, BinaryIO],
     spilled: dict[str, bytes],
     deadline_at: float,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], list[str], ArtifactsUnavailableError | None]:
     """Uploads the open files and the spilled outputs through a Context of the
     host's own -- the one that has the relay -- and returns `{name: {"$artifact":
-    ref}}` for them. The first failure ends it: it returns no refs, and one
-    error that starts with the error's code (E_ARTIFACT_TOO_LARGE, ...). With no
-    relay (`rwtask run`) the same calls land in the local sink and yield
-    `local_...` refs.
+    ref}}` for them, the errors, and the ArtifactsUnavailableError a spill met,
+    if one did. The first failure ends it: it returns no refs, and one error
+    that starts with the error's code (E_ARTIFACT_TOO_LARGE, ...). With no relay
+    (`rwtask run`) the same calls land in the local sink and yield `local_...`
+    refs.
+
+    A spill the relay cannot take because artifacts are off or unsupported is
+    not a failure: the spills from that one on are not uploaded, no error is
+    returned, and the caller caps those outputs inline instead (the refs of what
+    was uploaded are kept). A file -- an artifact output the task declared --
+    is never treated that way: it fails like any other upload error.
 
     The files are uploaded from the handles _open_artifact() returned, and the
     spilled bytes from memory (they are bounded by MAX_EVENT_STREAM_BYTES): the
-    upload never opens anything by name. No upload is started once
-    `deadline_at` (a time.monotonic() value, the request's deadline) has passed:
-    that is E_TIMEOUT naming the artifact. One already running is left to the
-    relay client's own timeouts, or to the runner cancelling the request."""
+    upload never opens anything by name. Both go through `add_file`, so a busy
+    runner (503) is retried. No upload is started once `deadline_at` (a
+    time.monotonic() value, the request's deadline) has passed: that is
+    E_TIMEOUT naming the artifact. One already running is left to the relay
+    client's own timeouts, or to the runner cancelling the request."""
     ctx = Context(
         capability=capability,
         operation=operation,
@@ -977,23 +1004,25 @@ def _upload_artifacts(
     try:
         for current, handle in files.items():
             if time.monotonic() >= deadline_at:
-                return {}, [_deadline_error(current)]
+                return {}, [_deadline_error(current)], None
             ref = ctx.artifacts.add_file(
                 handle, current, content_type=artifact_specs[current]["contentType"]
             )
             refs[current] = ref.model_dump(mode="json")
         for current, data in spilled.items():
             if time.monotonic() >= deadline_at:
-                return {}, [_deadline_error(current)]
-            with ctx.artifacts.open(current, "application/json") as writer:
-                writer.write(data)
-            refs[current] = writer.ref.model_dump(mode="json")
+                return {}, [_deadline_error(current)], None
+            try:
+                ref = ctx.artifacts.add_file(io.BytesIO(data), current, "application/json")
+            except ArtifactsUnavailableError as exc:
+                return refs, [], exc
+            refs[current] = ref.model_dump(mode="json")
     except ArtifactError as exc:
         code = exc.code if exc.code.startswith(_ARTIFACT_ERROR_PREFIX) else E_ARTIFACT_UPLOAD
-        return {}, [_clipped(f"{code}: artifact {current!r}: {exc}")]
+        return {}, [_clipped(f"{code}: artifact {current!r}: {exc}")], None
     except (OSError, requests.RequestException) as exc:
-        return {}, [_clipped(f"{E_ARTIFACT_UPLOAD}: artifact {current!r}: {exc}")]
-    return refs, []
+        return {}, [_clipped(f"{E_ARTIFACT_UPLOAD}: artifact {current!r}: {exc}")], None
+    return refs, [], None
 
 
 def _deadline_error(name: str) -> str:

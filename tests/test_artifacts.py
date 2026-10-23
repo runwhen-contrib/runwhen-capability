@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -891,6 +892,11 @@ def sized(ctx, length):
     return {"blob": "x" * length, "note": "hi"}
 
 
+@task(outputs={"a": "text", "b": "text"})
+def two_big(ctx, length):
+    return {"a": "a" * length, "b": "b" * length}
+
+
 @task(outputs={"files": "json"})
 def paths(ctx, count):
     return {"files": [Path(f"/srv/data/{i:06d}") for i in range(count)]}
@@ -1051,6 +1057,73 @@ def test_a_failed_spill_upload_fails_the_task(relay_server, tmp_path):
 
     assert result.tasks[0].status == "failed"
     assert "E_ARTIFACT_EXISTS" in result.tasks[0].error
+
+
+@pytest.mark.parametrize("code", ["E_ARTIFACTS_DISABLED", "E_ARTIFACTS_UNSUPPORTED"])
+def test_spill_keeps_the_value_inline_when_artifacts_are_unavailable(
+    relay_server, tmp_path, caplog, code
+):
+    """The platform declares spill outputs even while artifacts are switched
+    off (the default), and a runner may have no artifact storage at all. A
+    spill then does what it did before spill existed: the value stays in the
+    result (serve's result cap still applies to it). One line in the log
+    says why, and the relay is not asked again for the task's other spill
+    outputs."""
+    relay_server.default = Response(422, json={"code": code, "message": "artifacts are off"})
+    length = 300 * 1024
+    decls = [OutputDecl(task="two_big", name=n, spill=True) for n in ("a", "b")]
+
+    with caplog.at_level(logging.WARNING):
+        result = _run(relay_server, tmp_path, _request("two_big", length=length), decls)
+
+    (task_result,) = result.tasks
+    assert task_result.status == "ok", task_result.error
+    assert task_result.outputs == {"a": "a" * length, "b": "b" * length}
+    assert len(relay_server.requests) == 1
+    (line,) = [r.getMessage() for r in caplog.records if "spill" in r.getMessage()]
+    assert code in line and "'a'" in line and "'b'" in line
+
+
+def test_spill_retries_a_busy_relay(relay_server, tmp_path, monkeypatch):
+    """A spill's bytes are in memory, so a busy runner (503) is retried, like
+    add_file's, instead of failing the task."""
+    monkeypatch.setattr(artifacts, "_sleep", lambda seconds: None)
+    busy = Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    relay_server.script("PUT", PUT_PREFIX, busy, _created("art_spilled"))
+    length = 300 * 1024
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("sized", length=length),
+        [OutputDecl(task="sized", name="blob", spill=True)],
+    )
+
+    (task_result,) = result.tasks
+    assert task_result.status == "ok", task_result.error
+    assert task_result.outputs["blob"] == {"$artifact": "art_spilled"}
+    first, second = relay_server.requests
+    assert first.body_length == 0
+    assert second.body == json.dumps("x" * length, separators=(",", ":")).encode()
+    assert second.body_complete
+
+
+def test_an_artifact_the_task_asked_for_still_fails_when_artifacts_are_unavailable(
+    relay_server, tmp_path
+):
+    relay_server.script(
+        "PUT", PUT_PREFIX, Response(422, json={"code": "E_ARTIFACTS_DISABLED", "message": "off"})
+    )
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("publish"),
+        [OutputDecl(task="publish", name="report", artifact=True)],
+    )
+
+    assert result.tasks[0].status == "failed"
+    assert "E_ARTIFACTS_DISABLED" in result.tasks[0].error
 
 
 def _upload_threads() -> list[threading.Thread]:
