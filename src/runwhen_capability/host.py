@@ -27,6 +27,7 @@ import io
 import json
 import logging
 import re
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -228,15 +229,20 @@ def run_request(
     outputs: Sequence[OutputDecl] = (),
     input_artifacts: Sequence[InputArtifactDecl] = (),
     artifact_cache_dir: Path | None = None,
+    deadline_seconds: float | None = None,
 ) -> ResultEnvelope:
     """`relay`, `outputs` and `input_artifacts` are the request's artifact
     wiring (see serve.py): handed to every Context built here, so setup and
     each task can reach `ctx.artifacts`. `artifact_cache_dir` is where input
     artifacts are cached across requests (outside `scope_dir`, which may be
-    wiped). All unset for `rwtask run`."""
+    wiped). `deadline_seconds` is the request's deadline, counted from this
+    call: every Context records it (`Context.deadline_at`), and what a task
+    runs through `ctx.artifacts.from_process` stops there. All unset for
+    `rwtask run`."""
     log = log or logging.getLogger("runwhen_capability.host")
     result = ResultEnvelope()
     setup_outputs: dict[str, Any] = {}
+    deadline_at = None if deadline_seconds is None else time.monotonic() + deadline_seconds
 
     if request.setup is not None:
         setup_def = capability.registry.setups.get(request.setup.task)
@@ -267,6 +273,7 @@ def run_request(
                     outputs=outputs,
                     input_artifacts=input_artifacts,
                     artifact_cache_dir=artifact_cache_dir,
+                    deadline_at=deadline_at,
                 )
                 try:
                     kwargs = _kwargs_from_inputs(request.setup.inputs)
@@ -323,6 +330,7 @@ def run_request(
             outputs=outputs,
             input_artifacts=input_artifacts,
             artifact_cache_dir=artifact_cache_dir,
+            deadline_at=deadline_at,
         )
         try:
             resolved_inputs = _resolve_placeholders(task_spec.inputs, setup_outputs)

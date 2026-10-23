@@ -614,9 +614,11 @@ class ArtifactsClient:
         `timeout` (seconds): when it passes, the child's whole process group
         is killed, the upload is abandoned (no artifact) and
         `subprocess.TimeoutExpired` is raised. Unlike `ctx.run`, unset (None)
-        means no limit here, not `DEFAULT_RUN_TIMEOUT`: this is for long dumps,
-        and the request's own deadline already bounds the run, so a silent cut
-        would only truncate a legitimate artifact.
+        is not `DEFAULT_RUN_TIMEOUT`: this is for long dumps, so it means
+        "until the request's deadline" (`ctx.deadline_at`, which `rwtask
+        serve` sets), and no limit at all only when there is none (`rwtask
+        run`). An explicit `timeout` is cut to what is left of that deadline,
+        and once it has passed no child is started.
         If the upload fails first -- the relay refused it, the connection
         broke -- the group is killed and that error raised. The child is
         always reaped. A busy runner is an `ArtifactBusyError`, not retried.
@@ -628,6 +630,12 @@ class ArtifactsClient:
         abandons an upload that receives no byte for 2 minutes: for a child
         that may stay silent that long mid-output, write its output to a file
         under the workdir and `add_file` it."""
+        limit = timeout
+        if self._ctx.deadline_at is not None:
+            left = max(0.0, self._ctx.deadline_at - time.monotonic())
+            limit = left if limit is None else min(limit, left)
+            if left <= 0:
+                raise subprocess.TimeoutExpired(argv, limit)
         run_env = {**os.environ, **env} if env else None
         proc = subprocess.Popen(  # noqa: S603 -- argv is capability-controlled, by design
             argv,
@@ -649,7 +657,7 @@ class ArtifactsClient:
             writer = self.open(name, content_type)
             pump = threading.Thread(target=_pump_stdout, args=(proc, writer, failure), daemon=True)
             pump.start()
-            self._await_exit(proc, pump, writer, failure, argv, timeout)
+            self._await_exit(proc, pump, writer, failure, argv, limit)
             ref = writer.close()
         except BaseException:
             _kill_if_unreaped(proc)

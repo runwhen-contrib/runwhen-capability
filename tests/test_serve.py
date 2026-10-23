@@ -497,6 +497,32 @@ def test_serve_hands_run_request_the_cache_dir_above_the_scopes(tmp_path, monkey
 
 
 @responses.activate
+def test_serve_hands_run_request_the_request_deadline(tmp_path, monkeypatch):
+    """So that what a packaged task starts (`from_process`) is bounded by the
+    deadline the runner gave the request."""
+    import runwhen_capability.serve as serve_mod
+
+    seen: dict = {}
+
+    def capture(*args, **kwargs):
+        seen.update(kwargs)
+        return ResultEnvelope()
+
+    monkeypatch.setattr(serve_mod, "run_request", capture)
+    responses.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json={**_next_body("req-1"), "deadlineMs": 42500},
+        status=200,
+    )
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={}, status=200)
+
+    _serve_one(tmp_path, "echo")
+
+    assert seen["deadline_seconds"] == 42.5
+
+
+@responses.activate
 def test_serve_rereads_the_token_immediately_before_posting_the_result(tmp_path, monkeypatch):
     """A request can run up to requestTimeoutSeconds (600s for rw-checks)
     between the poll and the result POST -- long enough for the token to

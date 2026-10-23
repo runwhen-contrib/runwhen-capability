@@ -837,6 +837,65 @@ def test_from_process_sends_a_trickling_childs_bytes_before_it_exits(
     assert seen.body == b"first\nsecond\nlast\n" and seen.body_complete
 
 
+_QUIET_CHILD = "import time; time.sleep(60)"
+
+
+def test_from_process_without_a_timeout_stops_at_the_request_deadline(tmp_path):
+    """A packaged task's quiet, hung child must not wedge `rwtask serve`: with
+    no timeout, from_process runs until the request's deadline, which serve
+    hands run_request, and no longer."""
+    scope = tmp_path / "scope"
+    scope.mkdir()
+
+    def run():
+        return run_request(
+            _capability(tmp_path),
+            _request("hang"),
+            credentials={},
+            scope_dir=scope,
+            deadline_seconds=1,
+        )
+
+    started = time.monotonic()
+    result, error = _run_with_deadline(run, seconds=20)
+
+    assert error is None
+    (task_result,) = result.tasks
+    assert task_result.status == "failed"
+    assert "timed out" in task_result.error
+    assert time.monotonic() - started < 15
+    assert not (scope / ".rw-artifacts" / "out").exists()  # an abandoned upload
+
+
+def test_from_process_cuts_an_explicit_timeout_to_what_is_left_of_the_deadline(tmp_path):
+    ctx = _local_ctx(tmp_path)
+    ctx.deadline_at = time.monotonic() + 1
+
+    def run():
+        return ctx.artifacts.from_process(
+            [sys.executable, "-c", _QUIET_CHILD], "out.txt", timeout=60
+        )
+
+    _, error = _run_with_deadline(run, seconds=20)
+
+    assert isinstance(error, subprocess.TimeoutExpired)
+    assert error.timeout <= 1
+
+
+def test_from_process_does_not_start_a_child_once_the_deadline_has_passed(tmp_path):
+    ctx = _local_ctx(tmp_path)
+    ctx.deadline_at = time.monotonic() - 1
+    marker = tmp_path / "started"
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        ctx.artifacts.from_process(
+            [sys.executable, "-c", f"open({str(marker)!r}, 'w')"], "out.txt", timeout=60
+        )
+
+    time.sleep(0.5)
+    assert not marker.exists()
+
+
 def test_from_process_busy_relay_raises_busy_kills_the_child_and_does_not_retry(
     relay_server, tmp_path, monkeypatch
 ):
@@ -882,6 +941,7 @@ def test_from_process_missing_program_raises_and_uploads_nothing(relay_server, t
 # -- spill ------------------------------------------------------------------
 
 _TASKS = """
+import sys
 from pathlib import Path
 
 from runwhen_capability import setup, task
@@ -895,6 +955,12 @@ def sized(ctx, length):
 @task(outputs={"a": "text", "b": "text"})
 def two_big(ctx, length):
     return {"a": "a" * length, "b": "b" * length}
+
+
+@task(outputs={"out": "artifact"})
+def hang(ctx):
+    run = ctx.artifacts.from_process([sys.executable, "-c", "import time; time.sleep(60)"], "out")
+    return {"out": run.ref}
 
 
 @task(outputs={"files": "json"})

@@ -452,11 +452,9 @@ def _poll_once(
     try:
         if is_bundle:
             # A bundle's code travels with the request, not baked into this
-            # pod's image -- see bundle.py's module docstring. deadlineMs is
-            # otherwise unused by this loop (host.run_request() has no
-            # per-request deadline of its own); bundle mode is the first
-            # thing that actually enforces it, as one budget shared by the
-            # request's setup and all of its tasks.
+            # pod's image -- see bundle.py's module docstring. Bundle mode
+            # enforces deadlineMs as one budget shared by the request's setup
+            # and all of its tasks, killing a child that runs past it.
             os.chmod(scope_dir, 0o700)
             result = run_bundle_request(
                 task_request.request,
@@ -469,6 +467,8 @@ def _poll_once(
                 input_artifacts=task_request.inputArtifacts,
             )
         else:
+            # A packaged task is an in-process call that cannot be killed, so
+            # the deadline only bounds what it starts through ctx.artifacts.
             result = run_request(
                 capability,
                 task_request.request,
@@ -479,6 +479,7 @@ def _poll_once(
                 outputs=task_request.outputs,
                 input_artifacts=task_request.inputArtifacts,
                 artifact_cache_dir=workdir / ARTIFACT_CACHE_DIR,
+                deadline_seconds=task_request.deadlineMs / 1000,
             )
         payload = {"status": "ok", "result": result.model_dump(mode="json")}
     except Exception as exc:  # noqa: BLE001 -- one request must never take down the loop

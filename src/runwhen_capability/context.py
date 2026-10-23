@@ -138,7 +138,9 @@ class Context:
     `ctx.artifacts.input_path` keeps downloaded inputs -- the host passes a
     directory that outlives the request's scope (a stateless scope is wiped
     after every request, which would empty the cache), and when unset it is
-    `.rw-artifact-cache` under `workdir`."""
+    `.rw-artifact-cache` under `workdir`. `deadline_at` is the request's
+    deadline as a time.monotonic() value (None: no deadline is known, as
+    under `rwtask run`); `ctx.artifacts.from_process` runs no longer."""
 
     def __init__(
         self,
@@ -154,6 +156,7 @@ class Context:
         outputs: Sequence[OutputDecl] = (),
         input_artifacts: Sequence[InputArtifactDecl] = (),
         artifact_cache_dir: Path | None = None,
+        deadline_at: float | None = None,
     ) -> None:
         self.capability = capability
         self.operation = operation
@@ -170,6 +173,7 @@ class Context:
         self.outputs = list(outputs)
         self.input_artifacts = list(input_artifacts)
         self.artifact_cache_dir = Path(artifact_cache_dir) if artifact_cache_dir else None
+        self.deadline_at = deadline_at
 
         self.git = GitClient(self)
         self.sarif = SarifClient(self)

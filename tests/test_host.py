@@ -7,6 +7,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import pytest
+
 from runwhen_capability.host import run_request
 from runwhen_capability.loader import load_capability
 from runwhen_capability.models import InputArtifactDecl, OutputDecl, RequestEnvelope
@@ -512,6 +514,57 @@ def test_each_context_gets_its_own_task_name_and_the_artifact_wiring(tmp_path):
     wiring = {"relay": id(relay), "outputs": ["report.txt"], "inputs": ["prior"]}
     assert result.setup.outputs["seen"] == {"task": "prep", "operation": "prep", **wiring}
     assert result.tasks[0].outputs["seen"] == {"task": "probe", "operation": "probe", **wiring}
+
+
+_DEADLINE_TASKS = """
+import time
+
+from runwhen_capability import setup, task
+
+
+def _left(ctx):
+    return None if ctx.deadline_at is None else ctx.deadline_at - time.monotonic()
+
+
+@setup(outputs=["left"])
+def prep(ctx):
+    return {"left": _left(ctx)}
+
+
+@task(outputs={"left": "json"})
+def probe(ctx):
+    return {"left": _left(ctx)}
+"""
+
+
+@pytest.mark.parametrize("deadline", [30.0, None])
+def test_the_request_deadline_is_recorded_on_every_context(tmp_path, deadline):
+    """`rwtask serve` hands run_request the request's deadline; each Context
+    carries it as an absolute time.monotonic() value. `rwtask run` has none."""
+    cap_dir = tmp_path / "deadline"
+    cap_dir.mkdir()
+    (cap_dir / "manifest.yaml").write_text(
+        'capability: rw-deadline-fixture\nversion: "0.0.0"\nsetup:\n  task: prep\n'
+        "tasks:\n  - name: probe\n"
+    )
+    (cap_dir / "tasks.py").write_text(_DEADLINE_TASKS)
+    request = RequestEnvelope.model_validate(
+        {"version": 1, "setup": {"task": "prep"}, "tasks": [{"task": "probe"}]}
+    )
+
+    result = run_request(
+        load_capability(cap_dir),
+        request,
+        credentials={},
+        scope_dir=tmp_path / "scope",
+        deadline_seconds=deadline,
+    )
+
+    for left in (result.setup.outputs["left"], result.tasks[0].outputs["left"]):
+        if deadline is None:
+            assert left is None
+        else:
+            assert 0 < left <= deadline
 
 
 def test_contexts_have_no_artifact_wiring_when_none_is_passed(tmp_path):
