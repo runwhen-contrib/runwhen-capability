@@ -22,7 +22,16 @@ queue. The producer is therefore held back by the upload (a full queue blocks
 `write`), and memory is about six chunks (four queued, one being sent, one
 being filled) plus whatever the HTTP layer holds, whatever the artifact's size.
 
-Two rules keep that from going wrong:
+The runner abandons an upload that receives no body byte for two minutes
+(and answers it with a bare 502), and every open upload holds one of its
+upload slots. So the request is not sent when the writer is opened: the
+upload thread starts with the first chunk (or at `close()`, for an empty
+artifact), and an abort before then sends nothing at all. Small writes are
+coalesced into a chunk, but never held longer than FLUSH_AFTER_SECONDS: the
+first `write` after that sends what is pending. A producer that pauses for
+minutes between writes still stalls the upload -- see `ArtifactsClient.open`.
+
+Three rules keep that from going wrong:
 
 - A writer must never hang. The runner answers an upload early when it can
   (413 after `maxBytes + 1` bytes, 503 before any), and then the upload
@@ -37,6 +46,10 @@ Two rules keep that from going wrong:
   half-written artifact. Raising drops the connection without the
   terminator, which the runner reads as an abandoned upload. The writer
   swallows its own abort; the caller's original exception is what propagates.
+- An abort must never race a start. `from_process` writes from one thread
+  and aborts from another; the upload is started, and the abort recorded,
+  under one lock, so an aborted writer can never start an upload that nothing
+  would end.
 
 `add_file` re-reads its file, so a busy runner (503) is retried; `open` and
 `from_process` consume a stream that cannot be replayed, so they raise
@@ -100,6 +113,10 @@ CHUNK_BYTES = 1 << 20
 # Chunks the queue holds: with the one being sent and the one being filled,
 # a writer holds about six chunks.
 QUEUE_DEPTH = 4
+# The longest `write` keeps bytes back to coalesce them: once the oldest
+# pending byte is this old, the next `write` sends what is pending, even if it
+# is less than a chunk. Far below the runner's two-minute no-byte limit.
+FLUSH_AFTER_SECONDS = 5
 
 # A task output declared `spill: auto` whose JSON is larger than this goes to
 # an artifact instead of the result (host.py).
@@ -186,15 +203,18 @@ class ArtifactWriter:
 
     def __init__(self, upload: Callable[[Iterator[bytes]], ArtifactRef]) -> None:
         """`upload` consumes the body iterator and returns the ArtifactRef;
-        it runs on the writer's own thread, which starts here."""
+        it runs on the writer's own thread, which starts with the first
+        chunk (see the module docstring), not here."""
         self._upload = upload
         self._queue = self._new_queue(QUEUE_DEPTH)
         self._pending = bytearray()  # small writes, coalesced up to one chunk
+        self._pending_since = 0.0  # time.monotonic() of the oldest pending byte
         self._ref: ArtifactRef | None = None
         self._error: BaseException | None = None
         self._closed = False
-        self._thread = threading.Thread(target=self._run, name="rw-artifact-upload", daemon=True)
-        self._thread.start()
+        self._thread: threading.Thread | None = None
+        self._aborted = False
+        self._start_lock = threading.Lock()
 
     @property
     def ref(self) -> ArtifactRef | None:
@@ -214,25 +234,33 @@ class ArtifactWriter:
 
     def write(self, b: bytes) -> None:
         """Queues `b` for upload, in chunks of at most 1 MiB; blocks while
-        the queue is full. Raises the upload's error as soon as it has
-        failed (the relay refused the artifact, the connection broke), and
-        keeps raising it. Writing nothing does nothing."""
+        the queue is full. Bytes short of a chunk are held back to be sent
+        with the next ones, but only until they are FLUSH_AFTER_SECONDS old.
+        Raises the upload's error as soon as it has failed (the relay
+        refused the artifact, the connection broke), and keeps raising it.
+        Writing nothing does nothing."""
         if self._error is not None:
             raise self._error
         if self._closed:
             raise ValueError("write to a closed artifact writer")
         view = memoryview(b).cast("B")
         size, pos = len(view), 0
+        if not size:
+            return
         while pos < size:
             if not self._pending and size - pos >= CHUNK_BYTES:
                 self._put(bytes(view[pos : pos + CHUNK_BYTES]))
                 pos += CHUNK_BYTES
                 continue
             take = min(CHUNK_BYTES - len(self._pending), size - pos)
+            if not self._pending:
+                self._pending_since = time.monotonic()
             self._pending += view[pos : pos + take]
             pos += take
             if len(self._pending) >= CHUNK_BYTES:
                 self._flush()
+        if self._pending and time.monotonic() - self._pending_since >= FLUSH_AFTER_SECONDS:
+            self._flush()
 
     def close(self) -> ArtifactRef:
         """Ends the body, waits for the relay's answer and returns the
@@ -242,11 +270,12 @@ class ArtifactWriter:
             self._closed = True
             try:
                 self._flush()
-                self._put(_END)
+                self._put(_END)  # starts the upload of an empty artifact, too
             except BaseException:
                 self.abort()
                 raise
-        self._thread.join()
+        if self._thread is not None:
+            self._thread.join()
         if self._error is not None:
             raise self._error
         if self._ref is None:
@@ -255,18 +284,24 @@ class ArtifactWriter:
 
     def abort(self) -> None:
         """Abandons the upload: the connection is dropped mid-body, so the
-        runner stores nothing. Queued data is discarded. Idempotent, and a
-        no-op once the artifact is stored."""
+        runner stores nothing; before the upload started, nothing is sent at
+        all. Queued data is discarded. Idempotent, and a no-op once the
+        artifact is stored."""
         self._closed = True
         self._pending.clear()
-        while self._thread.is_alive():
+        with self._start_lock:
+            self._aborted = True
+            thread = self._thread
+        if thread is None:
+            return
+        while thread.is_alive():
             self._discard_queued()
             try:
                 self._queue.put(_ABORT, timeout=_POLL_SECONDS)
                 break
             except queue.Full:
                 continue  # the producer raced a chunk in after the discard; clear it again
-        self._thread.join()
+        thread.join()
 
     def __enter__(self) -> ArtifactWriter:
         return self
@@ -302,7 +337,23 @@ class ArtifactWriter:
             self._pending.clear()
             self._put(data)
 
+    def _start(self) -> None:
+        """Starts the upload thread, once. Raises instead if the writer was
+        aborted meanwhile (from another thread): the upload must not start."""
+        with self._start_lock:
+            if self._aborted:
+                raise ArtifactError(
+                    "E_ARTIFACT_ABORTED", "the upload was aborted; nothing was stored"
+                )
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run, name="rw-artifact-upload", daemon=True
+                )
+                self._thread.start()
+
     def _put(self, item) -> None:
+        if self._thread is None:
+            self._start()
         while True:
             self._check_upload()
             try:
@@ -399,12 +450,15 @@ def _kill_if_unreaped(proc: subprocess.Popen) -> None:
 
 
 def _pump_stdout(proc: subprocess.Popen, writer: ArtifactWriter, failure: list) -> None:
-    """Copies the child's stdout into `writer` in 1 MiB reads. If anything
-    fails -- chiefly the upload -- records it and kills the child, which would
-    otherwise sit blocked on a pipe nobody reads."""
+    """Copies the child's stdout into `writer` as it arrives: each read takes
+    what the pipe has (at most 1 MiB) rather than waiting for a full MiB, so a
+    child that writes a little at a time is not held back until it exits (the
+    writer coalesces the pieces). If anything fails -- chiefly the upload --
+    records it and kills the child, which would otherwise sit blocked on a
+    pipe nobody reads."""
     try:
         while True:
-            data = proc.stdout.read(CHUNK_BYTES)
+            data = proc.stdout.read1(CHUNK_BYTES)
             if not data:
                 return
             writer.write(data)
@@ -439,11 +493,16 @@ class ArtifactsClient:
         self._cache: ArtifactCache | None = None  # made on the first input_path
 
     def open(self, name: str, content_type: str | None = None) -> ArtifactWriter:
-        """Starts the upload of artifact `name` and returns its writer (use
-        it as a context manager). `content_type` defaults to the one the
-        output declares, else `application/octet-stream`. A busy runner (503)
-        raises `ArtifactBusyError` from the write or close that sees it: a
-        stream cannot be replayed, so there is no retry."""
+        """Returns a writer for artifact `name` (use it as a context manager).
+        `content_type` defaults to the one the output declares, else
+        `application/octet-stream`. The upload starts with the first chunk
+        written (1 MiB, or less once FLUSH_AFTER_SECONDS old), not here. A
+        busy runner (503) raises `ArtifactBusyError` from the write or close
+        that sees it: a stream cannot be replayed, so there is no retry.
+
+        Once bytes start flowing, the runner abandons an upload that receives
+        no byte for 2 minutes. For sparse output -- a little now, more many
+        minutes later -- write a file under the workdir and `add_file` it."""
         store = self._store()
         if isinstance(store, LocalArtifactSink):
             store.path_for(name)  # a bad name fails here, not in the background
@@ -553,8 +612,13 @@ class ArtifactsClient:
         broke -- the group is killed and that error raised. The child is
         always reaped. A busy runner is an `ArtifactBusyError`, not retried.
 
-        The runner's refusal can only be seen once a chunk is sent, so for a
-        quiet child it surfaces when the child has written 1 MiB or exited."""
+        The child's output is sent as it comes (see `open`): the upload
+        starts with its first MiB, or with the first output it writes once
+        earlier output is FLUSH_AFTER_SECONDS old, and the runner's refusal
+        can only be seen from then on. Once bytes start flowing, the runner
+        abandons an upload that receives no byte for 2 minutes: for a child
+        that may stay silent that long mid-output, write its output to a file
+        under the workdir and `add_file` it."""
         run_env = {**os.environ, **env} if env else None
         proc = subprocess.Popen(  # noqa: S603 -- argv is capability-controlled, by design
             argv,

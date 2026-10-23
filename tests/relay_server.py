@@ -62,6 +62,12 @@ handler a body that never reached its terminating chunk (`body_complete`
 False); the answer it then tries to send has nobody to read it, and that
 write failing is swallowed rather than printed as a server traceback.
 
+Live progress. A request is recorded only once its body has been read, so a
+test that must see bytes arrive WHILE an upload is still going on reads two
+live counters instead: `started` lists (method, path) for every request whose
+headers have arrived, before any of its body is read, and `bytes_received` is
+the body bytes read so far across all requests.
+
 Memory-bound tests. `PieceStream` produces a large body lazily, one piece at
 a time, and keeps only its length and sha256 -- so a test can upload tens of
 MiB, compare `RecordedRequest.body_length`/`body_sha256` against the stream's,
@@ -135,6 +141,8 @@ class RecordedRequest:
 class RelayServer:
     def __init__(self) -> None:
         self.requests: list[RecordedRequest] = []
+        self.started: list[tuple[str, str]] = []  # see "Live progress"
+        self.bytes_received = 0
         self.keep_limit = 1 << 20
         self.read_delay = 0.0  # seconds slept after each body read; see "Slow reader"
         self.stall_after: int | None = None  # see "A stall"
@@ -201,6 +209,14 @@ class RelayServer:
         with self._lock:
             self.requests.append(request)
 
+    def _started(self, method: str, path: str) -> None:
+        with self._lock:
+            self.started.append((method, path))
+
+    def _received(self, count: int) -> None:
+        with self._lock:
+            self.bytes_received += count
+
 
 def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
@@ -213,6 +229,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
 
         def _handle(self) -> None:
             method, path = self.command, self.path
+            server._started(method, path)
             response = server._next_response(method, path)
 
             chunked = "chunked" in self.headers.get("Transfer-Encoding", "").lower()
@@ -297,6 +314,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                 if not data:
                     return False
                 sink.add(data)
+                server._received(len(data))
                 remaining -= len(data)
                 server._pace(sink)
             return True
@@ -327,6 +345,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                     if not data:
                         return False
                     sink.add(data)
+                    server._received(len(data))
                     remaining -= len(data)
                     server._pace(sink)
                 self.rfile.readline(8)  # the CRLF after the chunk data

@@ -86,6 +86,13 @@ def _wait_for_requests(relay_server, count: int, timeout: float = 10.0):
     return relay_server.requests
 
 
+def _wait_for(condition, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert condition(), f"not true after {timeout}s"
+
+
 def _run_with_deadline(fn, seconds: float = 20.0):
     """Runs `fn` in a thread; fails (instead of hanging the suite) if it does
     not finish. Returns (result, exception)."""
@@ -388,6 +395,86 @@ def test_writer_raises_the_upload_error_when_the_upload_died_mid_stream():
     assert abort_error is None
 
 
+# -- the runner never sees an idle upload -------------------------------------
+#
+# The runner abandons an upload that receives no body byte for two minutes, and
+# each open upload holds one of its slots. So a writer sends nothing until it has
+# a chunk to send, and a slow producer's bytes go out within FLUSH_AFTER_SECONDS.
+
+
+def test_a_writer_left_idle_sends_no_request_until_its_first_chunk(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_1"))
+    relay_server.keep_limit = 2 * MIB
+    ctx = _ctx(relay_server, tmp_path)
+    before = _upload_threads()
+
+    writer = ctx.artifacts.open("a.txt")
+    writer.write(b"under a chunk")
+    time.sleep(0.3)
+
+    assert relay_server.started == []  # no connection: no upload slot held, nothing to stall
+    assert [t for t in _upload_threads() if t not in before] == []
+    writer.write(b"x" * MIB)  # a whole chunk is ready: the upload starts
+    _wait_for(lambda: relay_server.started)
+    assert writer.close().ref == "art_1"
+    (seen,) = relay_server.requests
+    assert seen.body == b"under a chunk" + b"x" * MIB and seen.body_complete
+
+
+def test_an_abort_before_the_upload_started_sends_nothing(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(RuntimeError):
+        with ctx.artifacts.open("a.txt") as writer:
+            writer.write(b"abc")
+            raise RuntimeError("the task failed before the first chunk")
+    time.sleep(0.3)
+
+    assert relay_server.started == []
+    assert writer.ref is None
+    with pytest.raises(ArtifactError):
+        writer.close()
+
+
+def test_an_abort_racing_the_first_chunk_never_starts_the_upload():
+    """from_process writes on one thread and aborts on another. A chunk that
+    reaches the writer after the abort (its write was already past the closed
+    check) must not start an upload that nothing would ever end."""
+    calls: list = []
+    writer = ArtifactWriter(lambda body: calls.append(body))
+    writer.abort()
+
+    with pytest.raises(ArtifactError) as excinfo:
+        writer._put(b"x" * MIB)  # where that write ends up
+
+    assert excinfo.value.code == "E_ARTIFACT_ABORTED"
+    assert calls == [] and writer._thread is None
+
+
+def test_a_trickling_writer_puts_its_bytes_on_the_wire_before_close(
+    relay_server, tmp_path, monkeypatch
+):
+    """Small writes are coalesced into 1 MiB chunks, but never held longer
+    than FLUSH_AFTER_SECONDS: a slow producer's bytes reach the runner while
+    the writer is still open."""
+    monkeypatch.setattr(artifacts, "FLUSH_AFTER_SECONDS", 0.2)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_slow"))
+    ctx = _ctx(relay_server, tmp_path)
+
+    writer = ctx.artifacts.open("slow.txt")
+    writer.write(b"first ")
+    time.sleep(0.4)  # older than the flush interval by the next write
+    writer.write(b"second ")
+    _wait_for(lambda: relay_server.bytes_received >= len(b"first second "))
+    assert not writer.closed and relay_server.requests == []  # mid-stream: the body is open
+    writer.write(b"third")
+    writer.close()
+
+    (seen,) = relay_server.requests
+    assert seen.body == b"first second third" and seen.body_complete
+
+
 # -- content type -----------------------------------------------------------
 
 
@@ -663,7 +750,8 @@ def test_from_process_timeout_kills_the_group_and_aborts_the_upload(relay_server
         "import os, subprocess, sys, time\n"
         "grandchild = subprocess.Popen(['sleep', '60'])\n"
         "open('pids', 'w').write(f'{os.getpid()} {grandchild.pid}')\n"
-        "print('partial output', flush=True)\n"
+        "sys.stdout.buffer.write(b'p' * (2 << 20))\n"  # whole chunks: the upload is under way
+        "sys.stdout.flush()\n"
         "time.sleep(60)\n"
     )
 
@@ -707,6 +795,45 @@ def test_from_process_without_a_timeout_runs_until_the_child_exits(
     (seen,) = relay_server.requests
     assert seen.body == b"done\n"
     assert seen.body_complete
+
+
+def test_from_process_sends_a_trickling_childs_bytes_before_it_exits(
+    relay_server, tmp_path, monkeypatch
+):
+    """A child that prints a line, pauses, prints another and then keeps
+    running: its first bytes must reach the runner while it is still running,
+    not when it exits or has written a whole chunk."""
+    monkeypatch.setattr(artifacts, "FLUSH_AFTER_SECONDS", 0.2)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_trickle"))
+    ctx = _ctx(relay_server, tmp_path)
+    script = (
+        "import os, sys, time\n"
+        "print('first', flush=True)\n"
+        "time.sleep(0.5)\n"
+        "print('second', flush=True)\n"
+        "deadline = time.monotonic() + 30\n"
+        "while not os.path.exists('release') and time.monotonic() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        "print('last', flush=True)\n"
+    )
+    box: dict = {}
+
+    def run():
+        box["result"] = ctx.artifacts.from_process([sys.executable, "-c", script], "out.txt")
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        _wait_for(lambda: relay_server.bytes_received >= len(b"first\nsecond\n"))
+        assert thread.is_alive()  # the child is still waiting for its release
+    finally:
+        (ctx.workdir / "release").write_text("")
+        thread.join(20)
+    assert not thread.is_alive(), "from_process did not return"
+
+    assert box["result"].ref.ref == "art_trickle"
+    (seen,) = relay_server.requests
+    assert seen.body == b"first\nsecond\nlast\n" and seen.body_complete
 
 
 def test_from_process_busy_relay_raises_busy_kills_the_child_and_does_not_retry(
