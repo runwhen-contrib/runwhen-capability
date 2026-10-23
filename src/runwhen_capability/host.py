@@ -306,7 +306,7 @@ def run_request(
                     log.exception("setup %r failed", request.setup.task)
                     result.setup = SetupResult(status="failed", error=str(exc))
                 finally:
-                    ctx.artifacts.abort_unclosed()
+                    ctx.artifacts._abort_unclosed()
 
     for task_spec in request.tasks:
         task_def = capability.registry.tasks.get(task_spec.task)
@@ -369,6 +369,6 @@ def run_request(
             log.exception("task %r failed", task_spec.task)
             result.tasks.append(TaskResult(task=task_spec.task, status="failed", error=str(exc)))
         finally:
-            ctx.artifacts.abort_unclosed()
+            ctx.artifacts._abort_unclosed()
 
     return result

@@ -18,7 +18,10 @@ RW_ARTIFACTS_DIR instead.)
 
 A successful `main()` return value is emitted as one "set" event per key (a
 value with a `model_dump`, such as the ArtifactRef `ctx.artifacts` returns, is
-written as its JSON form). Any other exception is left to propagate: this
+written as its JSON form). Whether `main()` returns or raises, a writer it left
+open is then aborted, with a warning on stderr: its partial file is removed,
+never left in RW_ARTIFACTS_DIR for the host to upload as if it were whole.
+Any other exception is left to propagate: this
 process's non-zero exit code (and its stderr, captured by bundle.py as part of
 the task's log) is how bundle.py learns the task failed -- there is no
 separate error channel.
@@ -147,6 +150,8 @@ def main() -> int:
         reason = str(exc.args[0]) if exc.args else ""
         _write_event(output_fd, {"op": "skip", "reason": reason})
         return 0
+    finally:
+        ctx.artifacts._abort_unclosed()
 
     for name, value in outputs.items():
         _write_event(output_fd, {"op": "set", "name": name, "value": value})

@@ -389,16 +389,25 @@ class ArtifactWriter:
                 return
 
 
-def _local_path(root: Path, name: str) -> Path:
-    """`root/name`, for a name that stays inside `root` (`E_ARTIFACT_PATH`
-    otherwise): relative, with no empty, '.' or '..' parts."""
+def _name_parts(name: str) -> list[str]:
+    """The '/'-separated parts of artifact name `name`, which must be a
+    relative path with no empty, '.' or '..' parts (`E_ARTIFACT_PATH`
+    otherwise). The one rule for every name, whatever stores it: a file under
+    the local sink's root must stay there, and a name in the relay's URL must
+    stay in its request's route (the HTTP layer resolves dot segments, so
+    `../../other/artifacts/x` would reach another request's)."""
     parts = name.split("/")
     if not name or name.startswith("/") or any(p in ("", ".", "..") for p in parts):
         raise ArtifactError(
             "E_ARTIFACT_PATH",
             f"artifact name {name!r} must be a relative path with no empty, '.' or '..' parts",
         )
-    return root.joinpath(*parts)
+    return parts
+
+
+def _local_path(root: Path, name: str) -> Path:
+    """`root/name`, for a name that stays inside `root` (`_name_parts`)."""
+    return root.joinpath(*_name_parts(name))
 
 
 class LocalArtifactSink:
@@ -501,7 +510,7 @@ class ArtifactsClient:
     def __init__(self, ctx: Context, local_sink: LocalArtifactSink | None = None) -> None:
         self._ctx = ctx
         self._local = local_sink
-        self._writers: list[tuple[str, ArtifactWriter]] = []  # opened here, see abort_unclosed
+        self._writers: list[tuple[str, ArtifactWriter]] = []  # opened here, see _abort_unclosed
         self._cache: ArtifactCache | None = None  # made on the first input_path
 
     def open(self, name: str, content_type: str | None = None) -> ArtifactWriter:
@@ -514,10 +523,12 @@ class ArtifactsClient:
 
         Once bytes start flowing, the runner abandons an upload that receives
         no byte for 2 minutes. For sparse output -- a little now, more many
-        minutes later -- write a file under the workdir and `add_file` it."""
-        store = self._store()
-        if isinstance(store, LocalArtifactSink):
-            store.path_for(name)  # a bad name fails here, not in the background
+        minutes later -- write a file under the workdir and `add_file` it.
+
+        `name` (here and in `add_file`/`from_process`) is a relative path with
+        no empty, '.' or '..' parts; anything else is `E_ARTIFACT_PATH`, raised
+        before anything is sent."""
+        _name_parts(name)  # a bad name fails here, not in the background
         writer = ArtifactWriter(lambda body: self._put(name, content_type, body))
         self._writers = [(n, w) for n, w in self._writers if not w.closed]
         self._writers.append((name, writer))
@@ -559,13 +570,16 @@ class ArtifactsClient:
         relay = self._ctx.relay
         return self._input_cache().fetch(name, expected, lambda: relay.open_input(name))
 
-    def abort_unclosed(self) -> None:
+    def _abort_unclosed(self) -> None:
         """Aborts every writer opened through this client that was neither
-        closed nor aborted, logging a warning for each. The task host calls it
-        when a setup/task returns or raises: a writer the task forgot would
-        otherwise keep its upload thread, its socket and a few MiB of queue
-        alive for as long as the process lives, and the runner would hold the
-        artifact open. Nothing is stored for an aborted writer."""
+        closed nor aborted, logging a warning for each. For the task hosts,
+        not tasks: host.py calls it when a setup/task returns or raises (a
+        writer the task forgot would otherwise keep its upload thread, its
+        socket and a few MiB of queue alive for as long as the process lives,
+        and the runner would hold the artifact open), and so does a bundle's
+        Python child (_bundle_entrypoint.py), so that no partial file is left
+        for the bundle host to upload. Nothing is stored for an aborted
+        writer."""
         writers, self._writers = self._writers, []
         for name, writer in writers:
             if not writer.closed:
@@ -585,6 +599,7 @@ class ArtifactsClient:
         names by the time it is opened again. A busy runner (503) is retried:
         three more attempts, BUSY_RETRY_DELAY seconds apart, the file read
         again each time. Any other error is final."""
+        _name_parts(name)
         attempt = 0
         while True:
             try:
@@ -633,6 +648,7 @@ class ArtifactsClient:
         abandons an upload that receives no byte for 2 minutes: for a child
         that may stay silent that long mid-output, write its output to a file
         under the workdir and `add_file` it."""
+        _name_parts(name)  # before the child starts
         limit = timeout
         if self._ctx.deadline_at is not None:
             left = max(0.0, self._ctx.deadline_at - time.monotonic())

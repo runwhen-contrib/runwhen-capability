@@ -726,6 +726,17 @@ def test_task_host_request_accepts_artifact_fields():
     assert (prior.input, prior.sizeBytes, prior.sha256) == ("prior", 12, "ab" * 32)
 
 
+def test_task_host_request_null_artifact_lists_read_as_empty():
+    """A protobuf-derived JSON may send an empty list as null; that must not
+    fail the whole request."""
+    request = TaskHostRequest.model_validate(
+        {**_next_body("req-1"), "outputs": None, "inputArtifacts": None}
+    )
+
+    assert request.outputs == []
+    assert request.inputArtifacts == []
+
+
 def test_task_host_request_artifact_fields_are_optional():
     request = TaskHostRequest.model_validate(_next_body("req-1"))
 

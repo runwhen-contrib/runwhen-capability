@@ -524,6 +524,23 @@ def test_a_python_task_writes_its_artifact_through_ctx_artifacts(relay_server, t
     assert put.header("x-rw-task") == "py-dump"
 
 
+def test_a_writer_a_python_task_left_open_is_aborted_not_uploaded(relay_server, tmp_path):
+    """The child's writer goes to the artifacts directory the host uploads
+    from. One the task left open is aborted when main() returns: no partial
+    file is left there for the host to take for a whole one, and the log says
+    so. The task itself reports as it always did."""
+    relay_server.script("PUT", PUT_PREFIX, _created("art_never"))
+
+    result, scope = _run_artifacts(["py-leaky"], tmp_path, relay_server)
+
+    [task] = result.tasks
+    assert task.status == "ok", task.error
+    assert task.outputs == {"note": "returned with the writer open"}
+    assert relay_server.requests == []
+    assert sorted(p.name for p in (scope / "artifacts").iterdir()) == [".rw-artifacts-dir"]
+    assert "'dump' was left open by the task" in task.logTail
+
+
 def test_a_ref_a_task_returns_for_nothing_it_uploaded_is_dropped(relay_server, tmp_path):
     result, _ = _run_artifacts(["py-forged-ref"], tmp_path, relay_server)
 

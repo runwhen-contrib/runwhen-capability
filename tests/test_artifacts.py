@@ -713,6 +713,48 @@ def test_add_file_missing_file_fails_before_any_request(relay_server, tmp_path):
     assert relay_server.requests == []
 
 
+@pytest.mark.parametrize("form", ["path", "handle"])
+def test_add_file_memory_stays_bounded(relay_server, tmp_path, form):
+    """32 MiB goes up through add_file -- from a path, and from an open
+    handle, the form the bundle host uploads with -- while tracemalloc (every
+    thread, the fixture's included; it keeps no body this big) stays far
+    below the file size: add_file reads 1 MiB at a time and never holds the
+    file.
+
+    Measured peak: 3.2-3.5 MiB for either form (the 1 MiB read, the HTTP
+    layer's copy of it as a chunk, and its framing). The bound, 8 MiB, is over
+    twice that for allocator noise and library versions, and a quarter of the
+    32 MiB a buffering upload would hold."""
+    total = 32 * MIB
+    path = tmp_path / "big.bin"
+    digest = hashlib.sha256()
+    with open(path, "wb") as out:
+        for piece in PieceStream(total, piece_size=MIB):
+            out.write(piece)
+            digest.update(piece)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_big", size=total))
+    ctx = _ctx(relay_server, tmp_path)
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        if form == "path":
+            ref = ctx.artifacts.add_file(path, "big.bin")
+        else:
+            with open(path, "rb") as fh:
+                ref = ctx.artifacts.add_file(fh, "big.bin")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    print(f"add_file ({form}) tracemalloc peak for 32 MiB: {peak / MIB:.2f} MiB")
+    assert ref.ref == "art_big"
+    (seen,) = relay_server.requests
+    assert (seen.body_length, seen.body_sha256) == (total, digest.hexdigest())
+    assert seen.body_complete
+    assert peak < 8 * MIB, f"peak {peak / MIB:.1f} MiB for a 32 MiB file"
+
+
 # -- from_process -----------------------------------------------------------
 
 _EMIT = """
@@ -1324,7 +1366,7 @@ def test_abort_unclosed_leaves_closed_and_aborted_writers_alone(relay_server, tm
 
     with ctx.artifacts.open("done.txt") as writer:
         writer.write(b"x")
-    ctx.artifacts.abort_unclosed()
+    ctx.artifacts._abort_unclosed()
 
     assert writer.ref.ref == "art_done"  # a finished artifact stays finished
     assert len(relay_server.requests) == 1
@@ -1335,7 +1377,13 @@ def test_artifact_types_are_exported_for_task_authors():
 
     assert runwhen_capability.ArtifactRef is ArtifactRef
     assert runwhen_capability.ProcessArtifact is ProcessArtifact
-    assert {"ArtifactRef", "ProcessArtifact"} <= set(runwhen_capability.__all__)
+    assert runwhen_capability.ArtifactWriter is ArtifactWriter  # what open() returns
+    assert {"ArtifactRef", "ProcessArtifact", "ArtifactWriter"} <= set(runwhen_capability.__all__)
+
+
+def test_aborting_unclosed_writers_is_for_the_host_not_the_task_api():
+    assert not hasattr(ArtifactsClient, "abort_unclosed")
+    assert callable(ArtifactsClient._abort_unclosed)
 
 
 def test_a_task_can_return_an_artifact_ref_as_an_output(relay_server, tmp_path):
@@ -1404,7 +1452,47 @@ def test_local_sink_abort_leaves_no_file(tmp_path):
     assert not any(p.is_file() for p in root.rglob("*"))
 
 
-@pytest.mark.parametrize("name", ["", "/etc/passwd", "../escape", "a/../../escape", "a/.."])
+_BAD_NAMES = ["", "/etc/passwd", "../escape", "a/../../escape", "a/..", "./a", "a//b"]
+
+
+def _open_name(ctx: Context, name: str):
+    with ctx.artifacts.open(name) as writer:
+        writer.write(b"x")
+
+
+def _add_file_name(ctx: Context, name: str):
+    path = ctx.workdir / "f.bin"
+    path.write_bytes(b"x")
+    return ctx.artifacts.add_file(path, name)
+
+
+def _from_process_name(ctx: Context, name: str):
+    marker = ctx.workdir / "child-ran"
+    return ctx.artifacts.from_process([sys.executable, "-c", f"open({str(marker)!r}, 'w')"], name)
+
+
+@pytest.mark.parametrize("name", _BAD_NAMES)
+@pytest.mark.parametrize(
+    "write", [_open_name, _add_file_name, _from_process_name], ids=["open", "add_file", "process"]
+)
+def test_relay_mode_refuses_names_that_could_leave_the_request_before_any_request(
+    relay_server, tmp_path, name, write
+):
+    """The HTTP layer normalises dot segments, so `../../other/artifacts/x`
+    would reach another request's artifact route. The relay gets the same
+    rule as the local sink, checked before anything is sent or started."""
+    relay_server.default = _created()
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(ArtifactError) as excinfo:
+        write(ctx, name)
+
+    assert excinfo.value.code == "E_ARTIFACT_PATH"
+    assert relay_server.started == []
+    assert not (ctx.workdir / "child-ran").exists()
+
+
+@pytest.mark.parametrize("name", _BAD_NAMES)
 def test_local_sink_rejects_names_that_could_leave_its_root(tmp_path, name):
     ctx = _local_ctx(tmp_path)
 
