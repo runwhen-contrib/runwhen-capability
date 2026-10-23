@@ -439,18 +439,19 @@ class ArtifactsClient:
         the artifact: check `.returncode`. stderr is returned (the first 1 MiB,
         decoded with replacement).
 
-        `timeout` (seconds; DEFAULT_RUN_TIMEOUT when unset, as in `ctx.run`):
-        when it passes, the child's whole process group is killed, the upload
-        is abandoned (no artifact) and `subprocess.TimeoutExpired` is raised.
+        `timeout` (seconds): when it passes, the child's whole process group
+        is killed, the upload is abandoned (no artifact) and
+        `subprocess.TimeoutExpired` is raised. Unlike `ctx.run`, unset (None)
+        means no limit here, not `DEFAULT_RUN_TIMEOUT`: this is for long dumps,
+        and the request's own deadline already bounds the run, so a silent cut
+        would only truncate a legitimate artifact.
         If the upload fails first -- the relay refused it, the connection
         broke -- the group is killed and that error raised. The child is
         always reaped. A busy runner is an `ArtifactBusyError`, not retried.
 
         The runner's refusal can only be seen once a chunk is sent, so for a
         quiet child it surfaces when the child has written 1 MiB or exited."""
-        from .context import DEFAULT_RUN_TIMEOUT  # context imports this module
-
-        limit = timeout or DEFAULT_RUN_TIMEOUT
+        limit = timeout
         run_env = {**os.environ, **env} if env else None
         proc = subprocess.Popen(  # noqa: S603 -- argv is capability-controlled, by design
             argv,
@@ -500,25 +501,28 @@ class ArtifactsClient:
         writer: ArtifactWriter,
         failure: list[BaseException],
         argv: list[str],
-        limit: float,
+        limit: float | None,
     ) -> None:
         """Returns once the child has exited and its stdout is fully copied
-        into the writer; raises if the upload failed first or `limit` passed.
-        The caller kills the child on a raise."""
-        deadline = time.monotonic() + limit
+        into the writer; raises if the upload failed first or `limit` (None:
+        no limit) passed. The caller kills the child on a raise."""
+        deadline = None if limit is None else time.monotonic() + limit
         # The upload's failure is checked on every turn: a relay that said
         # "busy" or "too large" at once must not wait for the child's first
         # byte of output (which a quiet child may never produce in time).
         while pump.is_alive() and not failure and writer.failure is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(argv, limit)
-            pump.join(timeout=min(remaining, _POLL_SECONDS))
+            wait = _POLL_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, limit)
+                wait = min(remaining, wait)
+            pump.join(timeout=wait)
         error = failure[0] if failure else writer.failure
         if error is not None:
             raise error
         try:
-            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            proc.wait(timeout=None if deadline is None else max(0.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             raise subprocess.TimeoutExpired(argv, limit) from None
 

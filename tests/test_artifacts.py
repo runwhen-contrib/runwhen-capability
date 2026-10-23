@@ -23,6 +23,7 @@ import requests
 from relay_server import PieceStream, Response
 
 from runwhen_capability import Context, artifacts
+from runwhen_capability import context as context_module
 from runwhen_capability.artifacts import (
     ArtifactRef,
     ArtifactsClient,
@@ -653,6 +654,26 @@ def test_from_process_timeout_kills_the_group_and_aborts_the_upload(relay_server
             time.sleep(0.05)
         else:
             pytest.fail(f"process {pid} survived the timeout")
+
+
+def test_from_process_without_a_timeout_runs_until_the_child_exits(
+    relay_server, tmp_path, monkeypatch
+):
+    """`timeout=None` is no SDK-side limit (a multi-GB dump may legitimately
+    take long; the request's own deadline bounds the run), not ctx.run's
+    default: a child outliving that default is not cut short."""
+    monkeypatch.setattr(context_module, "DEFAULT_RUN_TIMEOUT", 0.2)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_slow"))
+    ctx = _ctx(relay_server, tmp_path)
+    script = "import time; time.sleep(0.5); print('done')"
+
+    result = ctx.artifacts.from_process([sys.executable, "-c", script], "out.txt")
+
+    assert result.returncode == 0
+    assert result.ref.ref == "art_slow"
+    (seen,) = relay_server.requests
+    assert seen.body == b"done\n"
+    assert seen.body_complete
 
 
 def test_from_process_busy_relay_raises_busy_kills_the_child_and_does_not_retry(
