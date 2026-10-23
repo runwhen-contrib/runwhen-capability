@@ -12,14 +12,14 @@ Static codes (validate() only, no execution):
 - E_UNDECLARED_INPUT -- a Python main() parameter, or a bash $VAR read (directly
   or via rw_input), with no declared input.
 - E_OUTPUT_UNDECLARED -- a returned or rw_append/rw_set output name that isn't
-  declared.
+  declared, or an `rw_artifact` name that isn't a declared artifact output.
 - E_READONLY_WRITE -- kubectl delete/apply/patch/edit/scale/rollout restart/exec
   and similar in a readOnly task.
 - E_DUPLICATE_NAME -- a name is used twice.
 - E_EFFECTS_REQUIRED -- a task that isn't readOnly declares no effects.
 - E_UNKNOWN_SDK_HELPER -- a bash task calls an `rw_*` command rw.sh doesn't define
-  (only rw_input, rw_append, rw_set and rw_skip exist) and the script doesn't
-  define itself. An authoring gate: the bundle host ignores it at run time.
+  (only rw_input, rw_append, rw_set, rw_skip and rw_artifact exist) and the
+  script doesn't define itself. An authoring gate: the bundle host ignores it at run time.
 - E_SCHEMA_FEATURE -- a schema uses a JSON Schema feature custom tasks may not
   use (regex keywords: `pattern`, `patternProperties`).
 
@@ -37,6 +37,11 @@ a well-formed rw_set/rw_append/rw_skip event (the line is dropped, so an output
 was lost); well-formed lines still populate outputs.
 E_COMMAND_NOT_FOUND fails a bash task that ran a command the image doesn't have
 (bash's command_not_found_handle reports it), even if the task then skips.
+E_ARTIFACT_PATH fails a task whose artifact file is outside its scope, behind a
+symlink or not a regular file; E_ARTIFACT_UPLOAD fails it when the upload itself
+broke without a code of its own. The relay's own codes (E_ARTIFACT_TOO_LARGE,
+E_ARTIFACT_QUOTA, ...) fail it the same way, and no artifact is uploaded for a
+task that did not otherwise succeed.
 """
 
 from __future__ import annotations
@@ -72,6 +77,8 @@ E_OUTPUT_TOO_LARGE = "E_OUTPUT_TOO_LARGE"
 E_OUTPUT_MALFORMED = "E_OUTPUT_MALFORMED"
 E_COMMAND_NOT_FOUND = "E_COMMAND_NOT_FOUND"
 E_TIMEOUT = "E_TIMEOUT"
+E_ARTIFACT_PATH = "E_ARTIFACT_PATH"
+E_ARTIFACT_UPLOAD = "E_ARTIFACT_UPLOAD"
 
 
 class Diagnostic(BaseModel):

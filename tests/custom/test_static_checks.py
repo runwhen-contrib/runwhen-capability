@@ -3,8 +3,16 @@ that depend on it not mistaking prose for code."""
 
 from __future__ import annotations
 
+from runwhen_capability.custom import validate
+from runwhen_capability.custom.diagnostics import (
+    E_OUTPUT_UNDECLARED,
+    E_UNDECLARED_INPUT,
+    E_UNKNOWN_SDK_HELPER,
+)
 from runwhen_capability.custom.static_checks import (
+    RW_SH_HELPERS,
     _strip_comments_and_heredocs,
+    bash_artifact_registrations,
     bash_data_as_code,
     bash_env_reads,
     bash_input_used,
@@ -286,3 +294,55 @@ def test_awk_plain_getline_and_getline_from_file_are_safe():
 
 def test_awk_pipe_getline_is_flagged_without_spaces_too():
     assert bash_data_as_code("awk 'BEGIN { \"date\"|getline d }'\n") == [(1, "awk | getline")]
+
+
+# -- rw_artifact -------------------------------------------------------------
+
+_ARTIFACT_MANIFEST = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+      count: { schema: "integer" }
+"""
+
+
+def _messages_for(source: str, code: str) -> list[str]:
+    files = {"capability.yaml": _ARTIFACT_MANIFEST, "tasks/t.sh": source}
+    return [d.message for d in validate(files) if d.code == code]
+
+
+def test_rw_artifact_is_known_helper():
+    assert "rw_artifact" in RW_SH_HELPERS
+    source = 'source "$RW_SDK/rw.sh"\nseq 1 3 | rw_artifact dump -\nrw_artifact dump ./out.txt\n'
+    assert _messages_for(source, E_UNKNOWN_SDK_HELPER) == []
+    # ...and the directory it writes into is not an undeclared input.
+    assert _messages_for('echo x > "$RW_ARTIFACTS_DIR/dump"\n', E_UNDECLARED_INPUT) == []
+
+
+def test_rw_artifact_undeclared_name_flagged():
+    (message,) = _messages_for("seq 1 3 | rw_artifact mystery -\n", E_OUTPUT_UNDECLARED)
+    assert "mystery" in message
+    assert _messages_for("seq 1 3 | rw_artifact dump -\n", E_OUTPUT_UNDECLARED) == []
+
+
+def test_rw_artifact_to_a_schema_output_is_flagged():
+    (message,) = _messages_for("seq 1 3 | rw_artifact count -\n", E_OUTPUT_UNDECLARED)
+    assert "count" in message
+    assert "artifact" in message
+
+
+def test_rw_artifact_names_are_extracted_with_their_lines():
+    text = (
+        "# rw_artifact commented -\n"
+        "seq 1 3 | rw_artifact dump -\n"
+        "cat <<EOF\nrw_artifact heredoc -\nEOF\n"
+        "rw_artifact 'report.txt' ./r.txt\n"
+        'rw_artifact "files/a.bin" -\n'
+        'rw_artifact "$dynamic" -\n'
+    )
+    assert bash_artifact_registrations(text) == [(2, "dump"), (6, "report.txt"), (7, "files/a.bin")]

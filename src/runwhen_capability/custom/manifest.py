@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 API_VERSION = "runwhen.com/custom-capability/v1"
 
@@ -78,14 +78,45 @@ class InputSpec(BaseModel):
     runtime: bool = False
 
 
-class OutputSpec(BaseModel):
-    """One task's `outputs.<name>` entry. `schema` is either compact notation
-    or, when it starts with "./", a path to a JSON Schema file in the bundle
-    -- compiler.py resolves which."""
+# An artifact's `maxSize`: a plain non-negative integer, or an integer with a binary
+# suffix -- exactly the quantities the platform's parser accepts ("5GB" is not one).
+MAX_SIZE_RE = re.compile(r"[0-9]+(?:Ki|Mi|Gi|Ti)?")
 
-    schema_: str = Field(alias="schema")
+
+class ArtifactSpec(BaseModel):
+    """`outputs.<name>.artifact`: the output is a file, uploaded as an artifact,
+    not a value checked against a schema. `maxSize` is a quantity ("512Mi",
+    "2Gi", or a plain byte count); unset, the platform's own cap applies."""
+
+    contentType: str = "application/octet-stream"
+    maxSize: str | None = None
+
+    @field_validator("maxSize")
+    @classmethod
+    def _max_size_is_a_quantity(cls, value: str | None) -> str | None:
+        if value is not None and MAX_SIZE_RE.fullmatch(value) is None:
+            raise ValueError(
+                f"maxSize {value!r} is not a quantity: use a whole number of bytes or one "
+                "with a Ki, Mi, Gi or Ti suffix (e.g. 512Mi, 2Gi)"
+            )
+        return value
+
+
+class OutputSpec(BaseModel):
+    """One task's `outputs.<name>` entry: exactly one of `schema` or `artifact`.
+    `schema` is either compact notation or, when it starts with "./", a path to
+    a JSON Schema file in the bundle -- compiler.py resolves which."""
+
+    schema_: str | None = Field(default=None, alias="schema")
+    artifact: ArtifactSpec | None = None
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _exactly_one_of_schema_or_artifact(self) -> OutputSpec:
+        if (self.schema_ is None) == (self.artifact is None):
+            raise ValueError("an output needs exactly one of `schema` or `artifact`")
+        return self
 
 
 class SetupSpec(BaseModel):
@@ -152,6 +183,17 @@ def is_allowed_path(path: str) -> bool:
     if path in ALLOWED_ROOT_FILES:
         return True
     return any(path.startswith(prefix) for prefix in ALLOWED_DIR_PREFIXES)
+
+
+def is_valid_artifact_name(name: str) -> bool:
+    """An artifact output's name is a relative path under the task's artifacts
+    directory (`$RW_ARTIFACTS_DIR/<name>`), so it has to stay there: non-empty
+    "/"-separated segments, none of them "." or "..", no control characters or
+    backslashes, not over MAX_PATH_CHARS. Also what the name is sent to the relay
+    as, where it must not be able to climb out of the artifact route."""
+    if not name or len(name) > MAX_PATH_CHARS or _BAD_PATH_CHARS_RE.search(name):
+        return False
+    return not any(segment in ("", ".", "..") for segment in name.split("/"))
 
 
 # `name` (the capability) and every task name: a lowercase slug.

@@ -117,7 +117,13 @@ def test_a_python_task_sees_a_private_home_tmpdir_and_no_host_or_wrapper_env(tmp
     assert task.status == "ok", task
     info = json.loads(task.outputs["o"])
     assert info["hostOnly"] == []
-    assert info["env"] == ["RW_CAPABILITY", "RW_OPERATION", "RW_OUTPUT_FD", "RW_WORKDIR"]
+    assert info["env"] == [
+        "RW_ARTIFACTS_DIR",
+        "RW_CAPABILITY",
+        "RW_OPERATION",
+        "RW_OUTPUT_FD",
+        "RW_WORKDIR",
+    ]
     assert info["home"] == str(tmp_path / ".rw-home")
     assert info["tmpdir"] == str(tmp_path / ".rw-tmp")
     assert info["stdin"] == ""

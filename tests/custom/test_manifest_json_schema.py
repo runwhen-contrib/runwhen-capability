@@ -18,3 +18,12 @@ def test_it_is_the_model_schema_with_a_header():
 def test_it_documents_effects():
     task = manifest_json_schema()["$defs"]["TaskSpec"]["properties"]
     assert task["effects"]["type"] == "array"
+
+
+def test_it_documents_artifact_outputs():
+    defs = manifest_json_schema()["$defs"]
+    assert set(defs["OutputSpec"]["properties"]) == {"schema", "artifact"}
+    assert set(defs["ArtifactSpec"]["properties"]) == {"contentType", "maxSize"}
+    assert (
+        defs["ArtifactSpec"]["properties"]["contentType"]["default"] == "application/octet-stream"
+    )

@@ -1,0 +1,127 @@
+apiVersion: runwhen.com/custom-capability/v1
+name: artifacts-bundle
+description: Fixture bundle exercising artifact outputs, rw_artifact, host-side upload and spill
+tasks:
+  - name: dump-pipe
+    file: tasks/dump_pipe.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: { contentType: text/plain, maxSize: 2Gi } }
+  - name: dump-dir
+    file: tasks/dump_dir.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+      report: { artifact: { contentType: application/json } }
+  - name: dump-path
+    file: tasks/dump_path.sh
+    effects: [Test fixture]
+    outputs:
+      report: { artifact: { contentType: text/plain } }
+  - name: where
+    file: tasks/where.sh
+    effects: [Test fixture]
+    outputs:
+      dir: { schema: "string" }
+  - name: where-py
+    file: tasks/where.py
+    effects: [Test fixture]
+    outputs:
+      dir: { schema: "string" }
+  - name: symlink-file
+    file: tasks/symlink_file.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: symlink-component
+    file: tasks/symlink_component.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: path-outside
+    file: tasks/path_outside.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: dynamic-name
+    file: tasks/dynamic_name.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+      count: { schema: "integer" }
+  - name: dynamic-schema-name
+    file: tasks/dynamic_schema_name.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+      count: { schema: "integer" }
+  - name: fail-after-dump
+    file: tasks/fail_after_dump.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: skip-after-dump
+    file: tasks/skip_after_dump.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: slow-after-dump
+    file: tasks/slow_after_dump.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: bad-schema-after-dump
+    file: tasks/bad_schema_after_dump.sh
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+      count: { schema: "integer" }
+  - name: py-dump
+    file: tasks/py_dump.py
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: { contentType: text/plain } }
+  - name: py-forged-ref
+    file: tasks/py_forged_ref.py
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: {} }
+  - name: spill-scalar
+    file: tasks/spill_scalar.py
+    effects: [Test fixture]
+    outputs:
+      blob: { schema: "string" }
+  - name: spill-list
+    file: tasks/spill_list.py
+    effects: [Test fixture]
+    outputs:
+      items: { schema: "integer[]" }
+  - name: spill-small
+    file: tasks/spill_small.py
+    effects: [Test fixture]
+    outputs:
+      blob: { schema: "string" }
+  - name: spill-secret
+    file: tasks/spill_secret.py
+    effects: [Test fixture]
+    inputs:
+      token: { type: secret }
+    outputs:
+      blob: { schema: "string" }
+  - name: spill-and-inline
+    file: tasks/spill_and_inline.py
+    effects: [Test fixture]
+    inputs:
+      inline_count: { type: integer, default: 3, runtime: true }
+    outputs:
+      blob: { schema: "string" }
+      a: { schema: "string" }
+      b: { schema: "string" }
+      c: { schema: "string" }
+      d: { schema: "string" }
+      e: { schema: "string" }
+  - name: spill-then-fail
+    file: tasks/spill_then_fail.sh
+    effects: [Test fixture]
+    outputs:
+      blob: { schema: "string" }

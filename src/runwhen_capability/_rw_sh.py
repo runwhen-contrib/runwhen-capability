@@ -16,10 +16,19 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 #   rw_append <output> <json> append one JSON value to a list-shaped output
 #   rw_set <output> <json>    set (replace) an output's value
 #   rw_skip [reason]          mark the task skipped and exit 0
+#   rw_artifact <name> <path> register the file at <path> as artifact <name>
+#   rw_artifact <name> -      copy stdin to $RW_ARTIFACTS_DIR/<name> and register that
 #
-# rw_append/rw_set/rw_skip write one JSON line to the private file
+# rw_append/rw_set/rw_skip/rw_artifact write one JSON line to the private file
 # descriptor the host opened for this task ($RW_OUTPUT_FD) -- never to
 # stdout/stderr, which are logs only and never parsed for output data.
+#
+# <name> must be a declared artifact output. The host uploads the file after the
+# task exits, and only if the task succeeded; a file written straight into
+# $RW_ARTIFACTS_DIR under a declared artifact output's name is uploaded too, with
+# or without rw_artifact. Nothing is copied for <path>: the file is read where it
+# is, so it must stay inside the task's working directory tree and not be a
+# symlink, or the task fails with E_ARTIFACT_PATH.
 #
 # The <json> argument must be exactly one JSON value; build it with jq (or
 # printf with values you control) rather than by pasting untrusted text
@@ -92,9 +101,45 @@ rw_skip() {
     exit 0
 }
 
-# Minimal JSON string escaping for a plain-text argument (an output name or
-# a skip reason) -- values passed to rw_append/rw_set are the caller's own
-# JSON already and never go through this.
+rw_artifact() {
+    local name="${1:-}" src="${2:-}" path
+    if [[ -z $name || -z $src ]]; then
+        printf 'rw_artifact: usage: rw_artifact <name> <path|->\n' >&2
+        return 2
+    fi
+    # A name is a relative path under $RW_ARTIFACTS_DIR: no empty, "." or ".." part.
+    case "/$name/" in
+        *//*|*/./*|*/../*)
+            printf 'rw_artifact: invalid artifact name %s\n' "$name" >&2
+            return 1
+            ;;
+    esac
+    if [[ $src == - ]]; then
+        if [[ -z ${RW_ARTIFACTS_DIR:-} ]]; then
+            printf 'rw_artifact: RW_ARTIFACTS_DIR is not set\n' >&2
+            return 1
+        fi
+        path="$RW_ARTIFACTS_DIR/$name"
+        mkdir -p "$RW_ARTIFACTS_DIR/$(dirname "$name")" || return 1
+        # Streamed by cat, never held in a shell variable.
+        cat > "$path" || return 1
+    else
+        if [[ ! -f $src || ! -r $src ]]; then
+            printf 'rw_artifact: %s is not a readable file\n' "$src" >&2
+            return 1
+        fi
+        case "$src" in
+            /*) path="$src" ;;
+            *) path="$PWD/$src" ;;
+        esac
+    fi
+    printf '{"op":"artifact","name":%s,"path":%s}\n' \
+        "$(_rw_json_string "$name")" "$(_rw_json_string "$path")" >&"${RW_OUTPUT_FD}"
+}
+
+# Minimal JSON string escaping for a plain-text argument (an output name, a
+# skip reason or a file path) -- values passed to rw_append/rw_set are the
+# caller's own JSON already and never go through this.
 _rw_json_string() {
     local s=$1
     s=${s//\\/\\\\}

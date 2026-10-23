@@ -34,6 +34,18 @@ Inputs/outputs cross that boundary two ways:
   event per key -- the two languages share one wire format and one collector
   here.
 
+Artifacts. A task declares a file output as `outputs.<name>.artifact`. Its
+bash code writes the file to `$RW_ARTIFACTS_DIR/<name>` (or `rw_artifact <name>
+<path|->`, which also registers a file elsewhere in the scope) and a Python
+task uses `ctx.artifacts`, which in the child writes into that same directory:
+the child never has the relay. Once the child has exited -- and only if the
+task otherwise succeeded -- THIS process uploads each file to the relay. Every
+file must be a regular file inside the scope, reached without crossing a
+symlink (`E_ARTIFACT_PATH` otherwise). Files are uploaded as written, not
+redacted: that is the point of a dump. A schema output the platform has said
+may spill, and that outgrows MAX_OUTPUT_BYTES, goes the same way as an
+`application/json` artifact -- redacted first, since inline outputs are.
+
 A `resource`-typed input's value is the run's target resource (dict, JSON
 over the wire); a `secret`/`credential`-typed input's value is always a file
 path (the raw value is written to a new 0600 file in a fresh, randomly
@@ -54,6 +66,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,11 +80,16 @@ from typing import Any
 
 import jsonschema
 import referencing
+import requests
 
 from ._redaction import Redactor
 from ._rw_sh import BASH_ENV_SH, RW_SH
+from .artifacts import SPILL_THRESHOLD_BYTES
+from .context import Context
 from .custom.compiler import CompileError, compile_manifest
 from .custom.diagnostics import (
+    E_ARTIFACT_PATH,
+    E_ARTIFACT_UPLOAD,
     E_COMMAND_NOT_FOUND,
     E_EFFECTS_REQUIRED,
     E_INPUT_TYPE,
@@ -94,6 +112,7 @@ from .custom.manifest import (
 )
 from .custom.schema_features import regex_keyword_paths
 from .custom.yaml_lines import safe_load
+from .errors import ArtifactError
 from .models import (
     BundleRequestEnvelope,
     InputArtifactDecl,
@@ -102,10 +121,13 @@ from .models import (
     SetupResult,
     TaskResult,
 )
+from .pathsafe import confined_to
 from .relay import RelayClient
 
 LOG_TAIL_BYTES = 64 * 1024
-MAX_OUTPUT_BYTES = 256 * 1024
+# A schema output over this is cut to fit (a list), fails the task, or -- where the
+# platform allows it -- spills into an artifact.
+MAX_OUTPUT_BYTES = SPILL_THRESHOLD_BYTES
 MAX_RESULT_BYTES = 1024 * 1024
 # Output events a task may write before the rest are discarded -- well above
 # MAX_RESULT_BYTES so an oversized list can still be truncated to fit, but
@@ -121,6 +143,10 @@ _DRAIN_JOIN_TIMEOUT = 5
 _READ_CHUNK = 65536
 
 _DURATION_RE = re.compile(r"^\d+(\.\d+)?(ms|s|m|h|d)$")
+
+# Every artifact failure -- the relay's E_ARTIFACT_* codes, E_ARTIFACTS_DISABLED,
+# E_ARTIFACT_PATH, E_ARTIFACT_UPLOAD -- starts with this, and fails the task.
+_ARTIFACT_ERROR_PREFIX = "E_ARTIFACT"
 
 
 @dataclass
@@ -152,7 +178,9 @@ def run_bundle_request(
     child process is never given the relay -- no environment variable, file
     descriptor or argument carries it, and `_inherited_env` still strips the
     host's own variables -- so the host alone talks to the runner, uploading
-    artifacts on the task's behalf once the child has exited.
+    artifacts on the task's behalf once the child has exited. `outputs` is
+    what tells the host a schema output may spill (OutputDecl.spill); without
+    a relay (`rwtask run`) artifacts land in the local sink instead.
 
     `deadline_seconds` is ONE budget for the whole request, not a fresh
     allowance per task: setup and the tasks share it, each running with
@@ -236,6 +264,8 @@ def run_bundle_request(
             deadline_seconds=deadline_at - time.monotonic(),
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
+            relay=relay,
+            output_decls=outputs,
             log=log.getChild("setup"),
         )
         outcome = _redacted(outcome, redactor)
@@ -275,6 +305,8 @@ def run_bundle_request(
             deadline_seconds=deadline_at - time.monotonic(),
             allow_anonymous=allow_anonymous_credentials,
             redactor=redactor,
+            relay=relay,
+            output_decls=outputs,
             log=log.getChild(task_name),
         )
         outcome = _redacted(outcome, redactor)
@@ -312,12 +344,17 @@ def _run_setup_or_task(
     deadline_seconds: float,
     allow_anonymous: bool,
     redactor: Redactor,
+    relay: RelayClient | None,
+    output_decls: Sequence[OutputDecl],
     log: logging.Logger,
 ) -> _RunOutcome:
     """Runs one setup/task file. Outputs, errors and the skip reason come
     back unredacted -- run_bundle_request() redacts the whole outcome --
     except the log tail, which has to be redacted before it is cut to size
-    (see _execute)."""
+    (see _execute), and a spilled output, which is redacted before it is
+    uploaded (see _apply_size_caps). Artifact files are uploaded here, after
+    the child has exited and only when everything else about the task
+    succeeded (see _upload_artifacts)."""
     language = task_file_language(file_path)
     if language is None:
         return _RunOutcome(status="failed", error=f"{file_path}: unsupported file type")
@@ -360,6 +397,9 @@ def _run_setup_or_task(
         )
 
         try:
+            # Fresh for every invocation: what an earlier task left in it is never
+            # this task's artifact.
+            _fresh_dir(scope_dir / _ARTIFACTS_DIR)
             exit_code, stream, log_tail, timed_out = _execute(
                 files_dir=files_dir,
                 file_path=file_path,
@@ -411,7 +451,7 @@ def _run_setup_or_task(
             return _RunOutcome(status="skipped", reason=reason, log_tail=log_tail)
 
         # _parse_event() already guaranteed every event's shape: op is
-        # set/append/skip, name a string, reason a string.
+        # set/append/skip/artifact, name a string, reason a string, path a string.
         outputs: dict[str, Any] = {}
         for event in events:
             if event["op"] == "set":
@@ -421,11 +461,23 @@ def _run_setup_or_task(
                 if isinstance(bucket, list):
                     bucket.append(event["value"])
 
+        artifact_specs = {
+            name: decl["artifact"]
+            for name, decl in (declared_outputs or {}).items()
+            if "artifact" in decl
+        }
         if declared_outputs is not None:
             # A name the source produced but never declared already failed
             # validate() at authoring time (E_OUTPUT_UNDECLARED) -- at runtime
             # it is simply dropped rather than failing an otherwise-good result.
-            outputs = {name: value for name, value in outputs.items() if name in declared_outputs}
+            # An artifact output is only ever the ref of a file this host
+            # uploaded (below): a value the task set for one -- a ref it made
+            # up, a string -- is dropped the same way.
+            outputs = {
+                name: value
+                for name, value in outputs.items()
+                if name in declared_outputs and name not in artifact_specs
+            }
 
         errors: list[str] = [missing_error] if missing_error else []
         if exit_code != 0:
@@ -447,18 +499,17 @@ def _run_setup_or_task(
 
         if declared_outputs is not None:
             for name, value in outputs.items():
-                errors.extend(
-                    _validate_output_schema(name, value, declared_outputs[name]["schema"])
-                )
-
-        outputs, size_errors = _apply_size_caps(outputs)
-        errors.extend(size_errors)
+                if "schema" in declared_outputs[name]:  # an artifact output has none
+                    errors.extend(
+                        _validate_output_schema(name, value, declared_outputs[name]["schema"])
+                    )
 
         # A list output cut to fit its size cap is noted in `errors` but does
         # NOT fail the task -- only a non-list output/whole result still over
         # the cap (E_OUTPUT_TOO_LARGE) does, same as an exit code, a schema
-        # violation, a refused schema or a dropped output line
-        # (E_OUTPUT_MALFORMED). Notes (truncation) carry no E_ prefix, so this
+        # violation, a refused schema, a dropped output line
+        # (E_OUTPUT_MALFORMED) or an artifact that could not be uploaded
+        # (E_ARTIFACT_*). Notes (truncation) carry no E_ prefix, so this
         # is exactly "every error EXCEPT a plain note".
         failing = (
             E_OUTPUT_SCHEMA,
@@ -466,9 +517,47 @@ def _run_setup_or_task(
             E_OUTPUT_MALFORMED,
             E_COMMAND_NOT_FOUND,
             E_SCHEMA_FEATURE,
+            _ARTIFACT_ERROR_PREFIX,
         )
-        failed = exit_code != 0 or any(msg.startswith(failing) for msg in errors)
-        if failed:
+
+        def failed() -> bool:
+            return exit_code != 0 or any(msg.startswith(failing) for msg in errors)
+
+        # An output the platform lets spill goes to an artifact instead of being
+        # truncated or failing the task -- but a task that has already failed
+        # uploads nothing, so it is capped exactly as before.
+        spillable = frozenset(
+            decl.name for decl in output_decls if decl.spill and decl.task == operation
+        )
+        outputs, size_errors, spilled = _apply_size_caps(
+            outputs, frozenset() if failed() or is_setup else spillable, redactor
+        )
+        errors.extend(size_errors)
+
+        # Nothing is uploaded unless the task succeeded in every other respect: a
+        # half-written dump from a task that then failed must not be finalised as
+        # a complete artifact.
+        if not failed() and (artifact_specs or spilled):
+            registered = {e["name"]: e["path"] for e in events if e["op"] == "artifact"}
+            files, path_errors = _collect_artifacts(
+                scope_dir, secrets_dir, artifact_specs, registered
+            )
+            errors.extend(path_errors)
+            if not path_errors and (files or spilled):
+                refs, upload_errors = _upload_artifacts(
+                    capability=capability,
+                    operation=operation,
+                    scope_dir=scope_dir,
+                    relay=relay,
+                    output_decls=output_decls,
+                    artifact_specs=artifact_specs,
+                    files=files,
+                    spilled=spilled,
+                )
+                errors.extend(upload_errors)
+                outputs.update(refs)
+
+        if failed():
             return _RunOutcome(
                 status="failed",
                 outputs=outputs,
@@ -629,13 +718,31 @@ def _truncate_list_to_budget(value: list, budget: int) -> list:
     return kept
 
 
-def _apply_size_caps(outputs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+def _apply_size_caps(
+    outputs: dict[str, Any],
+    spill: frozenset[str] = frozenset(),
+    redactor: Redactor | None = None,
+) -> tuple[dict[str, Any], list[str], dict[str, bytes]]:
+    """Applies the per-output and per-result caps. Returns the outputs that stay
+    inline, the error messages, and -- for each output named in `spill` that
+    outgrew MAX_OUTPUT_BYTES -- the bytes to upload for it: its value
+    REDACTED (the inline ones are redacted by the caller, after this) and
+    serialised compactly as JSON. A spilled output is neither truncated nor
+    counted against the per-result cap, which applies to what stays inline;
+    nothing is uploaded here, and if the result is dropped for being over the
+    cap so are the spilled bytes."""
     errors: list[str] = []
     capped: dict[str, Any] = {}
+    spilled: dict[str, bytes] = {}
     for name, value in outputs.items():
         size = _json_size(value)
         if size <= MAX_OUTPUT_BYTES:
             capped[name] = value
+            continue
+        if name in spill:
+            if redactor:
+                value = redactor.value(value)
+            spilled[name] = json.dumps(value, separators=(",", ":"), allow_nan=False).encode()
             continue
         if isinstance(value, list):
             truncated = _truncate_list_to_budget(value, MAX_OUTPUT_BYTES)
@@ -659,8 +766,131 @@ def _apply_size_caps(outputs: dict[str, Any]) -> tuple[dict[str, Any], list[str]
             f"{E_OUTPUT_TOO_LARGE}: result is {total} bytes, over the {MAX_RESULT_BYTES}-byte "
             "per-result limit; its outputs were dropped"
         )
-        return {}, errors
-    return capped, errors
+        return {}, errors, {}
+    return capped, errors, spilled
+
+
+# -- artifacts: finding the files a task wrote, and uploading them ----------------
+
+
+class _ArtifactPathError(ValueError):
+    """A file a task asked to upload is not one the host will read."""
+
+
+def _artifact_file(scope_dir: Path, secrets_dir: Path, raw: str) -> Path:
+    """`raw` -- an artifact path from the child, absolute (rw_artifact) or
+    relative to the scope -- as a regular file inside `scope_dir`, reached
+    without crossing a symlink. Raises _ArtifactPathError otherwise.
+
+    The path is normalised first and every component below the scope is then
+    examined with lstat, so what is returned (and later opened) is exactly
+    the path that was checked. Nothing above the scope matters, which is why
+    the scope is also accepted by its resolved name (the child's `$PWD`
+    is the kernel's idea of its working directory). The invocation's secrets
+    directory is off limits: a credential file is never an artifact."""
+    if not raw or "\x00" in raw:
+        raise _ArtifactPathError("the path is empty or has a NUL byte")
+    candidate = os.path.normpath(os.path.join(scope_dir, raw))
+    for anchor in dict.fromkeys((os.path.abspath(scope_dir), os.path.realpath(scope_dir))):
+        if confined_to(Path(anchor), Path(candidate)):
+            break
+    else:
+        raise _ArtifactPathError(f"{raw} is outside the task's scope")
+    parts = os.path.relpath(candidate, anchor).split(os.sep)
+    if parts[0] == secrets_dir.name:
+        raise _ArtifactPathError(f"{raw} is inside the credentials directory")
+    current = anchor
+    for part in parts:
+        current = os.path.join(current, part)
+        try:
+            mode = os.lstat(current).st_mode
+        except OSError as exc:
+            raise _ArtifactPathError(f"{raw} cannot be read ({exc.strerror or exc})") from None
+        if stat.S_ISLNK(mode):
+            raise _ArtifactPathError(f"{raw} goes through a symbolic link")
+    if not stat.S_ISREG(mode):
+        raise _ArtifactPathError(f"{raw} is not a regular file")
+    return Path(current)
+
+
+def _collect_artifacts(
+    scope_dir: Path,
+    secrets_dir: Path,
+    artifact_specs: dict[str, dict],
+    registered: dict[str, str],
+) -> tuple[dict[str, Path], list[str]]:
+    """The file to upload for each declared artifact output, by name: the one
+    the task registered (rw_artifact), else a regular file sitting at
+    `$RW_ARTIFACTS_DIR/<name>`; none for an output the task never wrote.
+    A registration for a name that is not a declared artifact output is
+    ignored, like any undeclared output. Any file that fails
+    _artifact_file() is an E_ARTIFACT_PATH error, and so no upload happens."""
+    files: dict[str, Path] = {}
+    errors: list[str] = []
+    for name in sorted(artifact_specs):
+        raw = registered.get(name)
+        if raw is None:
+            default = os.path.join(scope_dir, _ARTIFACTS_DIR, name)
+            try:
+                mode = os.lstat(default).st_mode
+            except OSError:
+                continue  # never written (or a parent of it is a file)
+            if stat.S_ISDIR(mode):
+                continue
+            raw = default
+        try:
+            files[name] = _artifact_file(scope_dir, secrets_dir, raw)
+        except _ArtifactPathError as exc:
+            errors.append(f"{E_ARTIFACT_PATH}: artifact {name!r}: {exc}")
+    return files, errors
+
+
+def _upload_artifacts(
+    *,
+    capability: str,
+    operation: str,
+    scope_dir: Path,
+    relay: RelayClient | None,
+    output_decls: Sequence[OutputDecl],
+    artifact_specs: dict[str, dict],
+    files: dict[str, Path],
+    spilled: dict[str, bytes],
+) -> tuple[dict[str, Any], list[str]]:
+    """Uploads the files and the spilled outputs through a Context of the
+    host's own -- the one that has the relay -- and returns `{name: {"$artifact":
+    ref}}` for them. The first failure ends it: it returns no refs, and one
+    error that starts with the error's code (E_ARTIFACT_TOO_LARGE, ...). With no
+    relay (`rwtask run`) the same calls land in the local sink and yield
+    `local_...` refs."""
+    ctx = Context(
+        capability=capability,
+        operation=operation,
+        workdir=scope_dir,
+        relay=relay,
+        task=operation,
+        outputs=output_decls,
+    )
+    refs: dict[str, Any] = {}
+    current = ""
+    try:
+        for current, path in files.items():
+            ref = ctx.artifacts.add_file(
+                path, current, content_type=artifact_specs[current]["contentType"]
+            )
+            refs[current] = ref.model_dump(mode="json")
+        for current, data in spilled.items():
+            # A file, not a stream, so a busy runner is retried like any other upload.
+            with tempfile.TemporaryDirectory(dir=scope_dir / _TMP_DIR) as tmp:
+                path = Path(tmp) / "spill.json"
+                path.write_bytes(data)
+                ref = ctx.artifacts.add_file(path, current, content_type="application/json")
+            refs[current] = ref.model_dump(mode="json")
+    except ArtifactError as exc:
+        code = exc.code if exc.code.startswith(_ARTIFACT_ERROR_PREFIX) else E_ARTIFACT_UPLOAD
+        return {}, [f"{code}: artifact {current!r}: {exc}"]
+    except (OSError, requests.RequestException) as exc:
+        return {}, [f"{E_ARTIFACT_UPLOAD}: artifact {current!r}: {exc}"]
+    return refs, []
 
 
 # -- redaction ------------------------------------------------------------------
@@ -794,8 +1024,9 @@ def _reject_constant(name: str) -> None:
 def _parse_event(line: bytes, stream: _EventStream) -> None:
     """Appends `line` to stream.events if it is exactly one event of the
     wire format (_bundle_entrypoint.py's docstring): an object whose `op`
-    is set/append (keys exactly op, name, value; name a string) or skip
-    (keys op and optionally reason, a string). Duplicate keys are refused
+    is set/append (keys exactly op, name, value; name a string), skip
+    (keys op and optionally reason, a string) or artifact (keys exactly op,
+    name, path; both strings). Duplicate keys are refused
     -- rw_set/rw_append splice their value argument into the line
     unescaped, so a value like `1,"op":"skip"` would otherwise rewrite the
     event it sits in -- as are NaN/Infinity (not JSON; the result could not
@@ -827,6 +1058,10 @@ def _is_event(event: Any) -> bool:
         return event.keys() <= {"op", "reason"} and isinstance(event.get("reason", ""), str)
     if op == "missing_command":
         return event.keys() == {"op", "name"} and isinstance(event["name"], str)
+    if op == "artifact":
+        return event.keys() == {"op", "name", "path"} and all(
+            isinstance(event[key], str) for key in ("name", "path")
+        )
     return False
 
 
@@ -877,6 +1112,8 @@ def _execute(
         "HOME": str(scope_dir / _HOME_DIR),
         "TMPDIR": str(scope_dir / _TMP_DIR),
         "RW_WORKDIR": str(scope_dir),
+        # Not inherited (every RW_* is stripped): set here, for bash and Python alike.
+        "RW_ARTIFACTS_DIR": str(scope_dir / _ARTIFACTS_DIR),
         "RW_CAPABILITY": capability,
         "RW_OPERATION": operation,
     }
@@ -1023,6 +1260,7 @@ def _inherited_env() -> dict[str, str]:
 
 _HOME_DIR = ".rw-home"
 _TMP_DIR = ".rw-tmp"
+_ARTIFACTS_DIR = "artifacts"
 
 
 def _prepare_scope(scope_dir: Path) -> None:
