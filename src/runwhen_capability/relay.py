@@ -22,6 +22,15 @@ sending when that happens; requests/urllib3 tolerate the broken pipe a close
 can cause while a body is being sent and still read the response, so the
 caller sees the mapped exception below rather than a ConnectionError.
 
+Every failure is an ArtifactError. An answer with a code maps to its subclass
+(`_raise_for`); a failure to talk to the relay at all -- a refused or broken
+connection, a timeout, a body cut short, an unreadable token file, a 201
+whose body is not JSON -- is the base ArtifactError with the code
+E_ARTIFACT_TRANSPORT, raised from the original error. `_transport_errors` is
+the one place that conversion happens, for the calls and for every read of an
+input's body (`InputStream`), so a task that catches ArtifactError never
+sees a requests or urllib3 exception.
+
 The bearer token is read from the token file on every call (the same file
 `rwtask serve` polls with -- see serve.py), never cached: a request can run
 for minutes, long enough for the token to rotate under it.
@@ -29,12 +38,15 @@ for minutes, long enough for the token to rotate under it.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import io
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote
 
 import requests
+import urllib3
 
 from .errors import (
     ArtifactBusyError,
@@ -110,6 +122,69 @@ _DEFAULT_MESSAGE = {
 # How much of a non-JSON error body is quoted in the exception message.
 _BODY_SNIPPET = 200
 
+# The code of every failure to talk to the relay (see the module docstring).
+TRANSPORT_ERROR = "E_ARTIFACT_TRANSPORT"
+_TRANSPORT_EXCEPTIONS = (requests.RequestException, urllib3.exceptions.HTTPError, OSError)
+
+
+@contextmanager
+def _transport_errors(what: str) -> Iterator[None]:
+    """Re-raises a transport failure inside the block -- a requests or urllib3
+    error, or an OSError (the token file, the socket) -- as
+    ArtifactError(TRANSPORT_ERROR, "<what> failed: ..."), from the original.
+    ArtifactErrors (the relay's coded answers) pass through untouched."""
+    try:
+        yield
+    except _TRANSPORT_EXCEPTIONS as exc:
+        if isinstance(exc, requests.exceptions.InvalidJSONError):
+            detail = f"the relay's answer is not JSON ({exc})"
+        else:
+            detail = f"{type(exc).__name__}: {exc}"
+        raise ArtifactError(TRANSPORT_ERROR, f"{what} failed: {detail}") from exc
+
+
+class InputStream(io.RawIOBase):
+    """An input artifact as the relay is sending it, from `open_input`: a
+    binary stream of the stored bytes, never decoded (any Content-Encoding
+    is left alone) and never held whole -- each read takes at most what it
+    asks for off the response. `headers` are those of the relay's answer.
+    A read that fails -- the relay silent past the read timeout, a body that
+    ends short of its Content-Length -- raises ArtifactError(TRANSPORT_ERROR).
+    Closing it closes the response; it is a context manager."""
+
+    def __init__(self, resp: requests.Response, name: str) -> None:
+        super().__init__()
+        self.headers = resp.headers
+        self._resp = resp
+        self._raw = resp.raw
+        self._raw.decode_content = False
+        self._name = name
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self.closed:
+            raise ValueError("read from a closed input artifact stream")
+        amount = None if size is None or size < 0 else size
+        with _transport_errors(f"reading input artifact {self._name!r}"):
+            return self._raw.read(amount, decode_content=False)
+
+    def readall(self) -> bytes:
+        return self.read()
+
+    def readinto(self, buffer) -> int:
+        data = self.read(len(buffer))
+        memoryview(buffer).cast("B")[: len(data)] = data
+        return len(data)
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self._resp.close()
+            finally:
+                super().close()
+
 
 class RelayClient:
     """One request's view of the relay: `base_url` is the relay root,
@@ -135,51 +210,57 @@ class RelayClient:
         returns the relay's 201 JSON (`artifactRef`, `sizeBytes`, `sha256`,
         `lineCount`, `isText`). `body` is consumed lazily, once; it is
         streamed, never buffered. Any other answer raises the matching
-        ArtifactError subclass -- see `_raise_for`."""
+        ArtifactError subclass -- see `_raise_for` -- and a transport failure
+        is ArtifactError(TRANSPORT_ERROR)."""
         # An iterator (not the list the caller may have passed): requests
         # form-encodes a bare list, and only an iterator of unknown length
         # goes out chunked. Empty pieces are dropped -- a zero-length chunk is
         # the body's terminator on the wire.
         chunks = (piece for piece in body if piece)
-        resp = self.session.put(
-            self._url(f"artifacts/{quote(name, safe='/')}"),
-            data=chunks,
-            headers={
-                **self._auth(),
-                "Content-Type": content_type,
-                "X-RW-Task": task,
-            },
-            timeout=(_SEND_TIMEOUT, _RESPONSE_TIMEOUT),
-        )
-        with resp:
-            if resp.status_code != 201:
-                self._raise_for(resp)
-            return resp.json()
-
-    def open_input(self, input: str) -> requests.Response:  # noqa: A002 -- the relay's name
-        """Opens input artifact `input` for streaming: a `stream=True`
-        response whose body the caller reads (`iter_content`, `raw`) and must
-        close. A non-200 raises the matching ArtifactError instead. Each read
-        of the body waits at most `_READ_TIMEOUT` seconds for data."""
-        resp = self.session.get(
-            self._url(f"artifacts/in/{quote(input, safe='')}"),
-            headers=self._auth(),
-            stream=True,
-            timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
-        )
-        if resp.status_code != 200:
+        with _transport_errors(f"uploading artifact {name!r}"):
+            resp = self.session.put(
+                self._url(f"artifacts/{quote(name, safe='/')}"),
+                data=chunks,
+                headers={
+                    **self._auth(),
+                    "Content-Type": content_type,
+                    "X-RW-Task": task,
+                },
+                timeout=(_SEND_TIMEOUT, _RESPONSE_TIMEOUT),
+            )
             with resp:
-                self._raise_for(resp)
-        return resp
+                if resp.status_code != 201:
+                    self._raise_for(resp, upload=True)
+                return resp.json()
+
+    def open_input(self, input: str) -> InputStream:  # noqa: A002 -- the relay's name
+        """Opens input artifact `input` for streaming, as an InputStream the
+        caller reads and must close. A non-200 raises the matching
+        ArtifactError instead, a transport failure ArtifactError(
+        TRANSPORT_ERROR). Each read of the body waits at most `_READ_TIMEOUT`
+        seconds for data."""
+        with _transport_errors(f"downloading input artifact {input!r}"):
+            resp = self.session.get(
+                self._url(f"artifacts/in/{quote(input, safe='')}"),
+                headers=self._auth(),
+                stream=True,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+            )
+            if resp.status_code != 200:
+                with resp:
+                    self._raise_for(resp)
+        return InputStream(resp, input)
 
     @staticmethod
-    def _raise_for(resp: requests.Response) -> NoReturn:
+    def _raise_for(resp: requests.Response, *, upload: bool = False) -> NoReturn:
         """Maps a relay error response to the ArtifactError subclass for its
         `code` (see the module docstring). A 404 with no code -- the input
-        GET's answer for an undeclared input -- is ArtifactUndeclaredError.
-        Anything else (a 401, a non-JSON body, a code this SDK predates)
-        is the base ArtifactError, carrying the body's code if there is one,
-        else `HTTP_<status>`, and a message that names the status."""
+        GET's answer for an undeclared input -- is ArtifactUndeclaredError;
+        on an `upload` it may also be a runner that predates artifact support
+        (it has no such route), and the message says so. Anything else (a
+        401, a non-JSON body, a code this SDK predates) is the base
+        ArtifactError, carrying the body's code if there is one, else
+        `HTTP_<status>`, and a message that names the status."""
         status = resp.status_code
         try:
             parsed = resp.json()
@@ -191,6 +272,11 @@ class RelayClient:
 
         if code is None and status == 404:
             code = "E_ARTIFACT_UNDECLARED"
+            if upload and message is None:
+                message = (
+                    "the relay answered 404 with no code: the artifact output is not declared "
+                    "for this request, or the runner predates artifact support"
+                )
         exc_type = _BY_CODE.get(code) if code else None
         if exc_type is None:
             text = f"{message or 'unexpected relay response'} (HTTP {status})"

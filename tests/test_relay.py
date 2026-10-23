@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 import requests
-from relay_server import PieceStream, Response
+import urllib3
+from relay_server import PieceStream, Response, refused_url
 
 from runwhen_capability import relay as relay_module
 from runwhen_capability.errors import (
@@ -44,6 +45,15 @@ def _client(relay_server, tmp_path: Path, token: str = "tok-1") -> RelayClient:
 
 def _put(client: RelayClient, body, name: str = "report.txt") -> dict:
     return client.put_artifact(task="scan", name=name, content_type="text/plain", body=body)
+
+
+def _transport_error(excinfo, cause: type[BaseException]) -> None:
+    """A transport failure is the base ArtifactError with E_ARTIFACT_TRANSPORT,
+    raised from the HTTP layer's own error."""
+    err = excinfo.value
+    assert type(err) is ArtifactError
+    assert err.code == "E_ARTIFACT_TRANSPORT"
+    assert isinstance(err.__cause__, cause), repr(err.__cause__)
 
 
 def test_put_artifact_streams_chunked_body(relay_server, tmp_path):
@@ -144,8 +154,9 @@ def test_put_artifact_survives_a_relay_pause_shorter_than_the_send_timeout(
         assert (seen.body_length, seen.body_sha256) == (total, stream.sha256)
         assert seen.body_complete
     else:
-        with pytest.raises(requests.ConnectionError):
+        with pytest.raises(ArtifactError) as excinfo:
             _put(client, stream)
+        _transport_error(excinfo, requests.ConnectionError)
 
 
 def test_put_artifact_gives_up_on_a_relay_that_takes_the_body_and_never_answers(
@@ -157,8 +168,9 @@ def test_put_artifact_gives_up_on_a_relay_that_takes_the_body_and_never_answers(
     relay_server.script("PUT", "/", Response(201, json=CREATED, delay=6))
     started = time.monotonic()
 
-    with pytest.raises(requests.Timeout):
+    with pytest.raises(ArtifactError) as excinfo:
         _put(_client(relay_server, tmp_path), [b"all", b"the body"])
+    _transport_error(excinfo, requests.Timeout)
 
     assert time.monotonic() - started < 4
     (seen,) = relay_server.requests
@@ -261,6 +273,52 @@ def test_put_artifact_maps_413_to_too_large(relay_server, tmp_path):
     assert not seen.body_complete
 
 
+def test_put_artifact_to_a_relay_that_refuses_the_connection_is_a_transport_error(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    client = RelayClient(refused_url(), token_file, "req-1", requests.Session())
+
+    with pytest.raises(ArtifactError) as excinfo:
+        _put(client, [b"x"])
+
+    _transport_error(excinfo, requests.ConnectionError)
+
+
+def test_a_201_that_is_not_json_is_a_transport_error(relay_server, tmp_path):
+    relay_server.script("PUT", "/", Response(201, body=b"<html>created</html>"))
+
+    with pytest.raises(ArtifactError) as excinfo:
+        _put(_client(relay_server, tmp_path), [b"x"])
+
+    _transport_error(excinfo, ValueError)
+    assert "not JSON" in excinfo.value.message
+
+
+def test_a_token_file_that_cannot_be_read_is_a_transport_error(relay_server, tmp_path):
+    client = _client(relay_server, tmp_path)
+    (tmp_path / "token").unlink()
+
+    with pytest.raises(ArtifactError) as put:
+        _put(client, [b"x"])
+    with pytest.raises(ArtifactError) as get:
+        client.open_input("prior")
+
+    _transport_error(put, OSError)
+    _transport_error(get, OSError)
+    assert relay_server.started == []
+
+
+def test_a_codeless_404_on_upload_says_the_runner_may_predate_artifacts(relay_server, tmp_path):
+    """A runner without the artifact routes answers the PUT with a bare 404."""
+    relay_server.script("PUT", "/", Response(404, body=b"404 page not found"))
+
+    with pytest.raises(ArtifactUndeclaredError) as excinfo:
+        _put(_client(relay_server, tmp_path), [b"x"])
+
+    assert excinfo.value.code == "E_ARTIFACT_UNDECLARED"
+    assert "predates artifact support" in excinfo.value.message
+
+
 def test_put_artifact_maps_409_exists(relay_server, tmp_path):
     relay_server.script("PUT", "/", Response(409, json={"code": "E_ARTIFACT_EXISTS"}))
 
@@ -355,14 +413,38 @@ def test_open_input_returns_a_streaming_response(relay_server, tmp_path):
         Response(200, body=payload, headers={"X-RW-Sha256": hashlib.sha256(payload).hexdigest()}),
     )
 
-    resp = _client(relay_server, tmp_path).open_input("prior")
+    stream = _client(relay_server, tmp_path).open_input("prior")
 
-    with resp:
-        assert resp.headers["X-RW-Sha256"] == hashlib.sha256(payload).hexdigest()
-        assert b"".join(resp.iter_content(chunk_size=4096)) == payload
+    with stream:
+        assert stream.headers["X-RW-Sha256"] == hashlib.sha256(payload).hexdigest()
+        assert stream.read(4096) == payload[:4096]
+        assert stream.read() == payload[4096:]
+    assert stream.closed
     (seen,) = relay_server.requests
     assert seen.path == "/v1/tasks/req-1/artifacts/in/prior"
     assert seen.header("Authorization") == "Bearer tok-1"
+
+
+def test_open_input_from_a_relay_that_refuses_the_connection_is_a_transport_error(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    client = RelayClient(refused_url(), token_file, "req-1", requests.Session())
+
+    with pytest.raises(ArtifactError) as excinfo:
+        client.open_input("prior")
+
+    _transport_error(excinfo, requests.ConnectionError)
+
+
+def test_reading_an_input_the_relay_cuts_short_is_a_transport_error(relay_server, tmp_path):
+    relay_server.script("GET", "/", Response(200, stream=iter([b"x" * 1000]), content_length=5000))
+    stream = _client(relay_server, tmp_path).open_input("prior")
+
+    with stream, pytest.raises(ArtifactError) as excinfo:
+        stream.read()
+
+    _transport_error(excinfo, urllib3.exceptions.HTTPError)
+    assert "prior" in excinfo.value.message
 
 
 def test_open_input_404_is_undeclared(relay_server, tmp_path):

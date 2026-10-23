@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 Severity = Literal["error", "warning", "note"]
 
@@ -372,6 +372,13 @@ class TaskHostRequest(BaseModel):
     maxResultBytes: int | None = None
     outputs: list[OutputDecl] = Field(default_factory=list)
     inputArtifacts: list[InputArtifactDecl] = Field(default_factory=list)
+
+    @field_validator("outputs", "inputArtifacts", mode="before")
+    @classmethod
+    def _null_is_empty(cls, value: Any) -> Any:
+        """A JSON null reads as an empty list (a protobuf-derived encoder may
+        send one for an empty repeated field), not a failed request."""
+        return [] if value is None else value
 
 
 class TaskHostResult(BaseModel):

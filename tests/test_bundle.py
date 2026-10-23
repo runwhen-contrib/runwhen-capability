@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -20,6 +21,8 @@ from runwhen_capability import artifacts as artifacts_module
 from runwhen_capability import bundle as bundle_module
 from runwhen_capability import relay as relay_module
 from runwhen_capability.bundle import (
+    MAX_OUTPUT_BYTES,
+    _apply_size_caps,
     _ArtifactPathError,
     _collect_artifacts,
     _dir_identity,
@@ -27,6 +30,7 @@ from runwhen_capability.bundle import (
     _open_artifact,
     _parse_event,
     _stamp_artifacts_dir,
+    _truncate_list_to_budget,
     _upload_artifacts,
     run_bundle_request,
 )
@@ -520,6 +524,23 @@ def test_a_python_task_writes_its_artifact_through_ctx_artifacts(relay_server, t
     assert put.header("x-rw-task") == "py-dump"
 
 
+def test_a_writer_a_python_task_left_open_is_aborted_not_uploaded(relay_server, tmp_path):
+    """The child's writer goes to the artifacts directory the host uploads
+    from. One the task left open is aborted when main() returns: no partial
+    file is left there for the host to take for a whole one, and the log says
+    so. The task itself reports as it always did."""
+    relay_server.script("PUT", PUT_PREFIX, _created("art_never"))
+
+    result, scope = _run_artifacts(["py-leaky"], tmp_path, relay_server)
+
+    [task] = result.tasks
+    assert task.status == "ok", task.error
+    assert task.outputs == {"note": "returned with the writer open"}
+    assert relay_server.requests == []
+    assert sorted(p.name for p in (scope / "artifacts").iterdir()) == [".rw-artifacts-dir"]
+    assert "'dump' was left open by the task" in task.logTail
+
+
 def test_a_ref_a_task_returns_for_nothing_it_uploaded_is_dropped(relay_server, tmp_path):
     result, _ = _run_artifacts(["py-forged-ref"], tmp_path, relay_server)
 
@@ -554,6 +575,10 @@ def test_without_a_relay_artifacts_land_in_the_local_sink(tmp_path):
             Response(422, json={"code": "E_ARTIFACTS_DISABLED", "message": "off"}),
             "E_ARTIFACTS_DISABLED",
         ),
+        (
+            Response(422, json={"code": "E_ARTIFACTS_UNSUPPORTED", "message": "none here"}),
+            "E_ARTIFACTS_UNSUPPORTED",
+        ),
     ],
 )
 def test_an_upload_error_fails_the_task_with_its_code(relay_server, tmp_path, response, code):
@@ -563,9 +588,9 @@ def test_an_upload_error_fails_the_task_with_its_code(relay_server, tmp_path, re
 
     [task] = result.tasks
     assert task.status == "failed"
-    assert task.errors[0].startswith(f"{code}: "), task.errors
+    assert task.errors[0].startswith(f"{code}: artifact 'dump': "), task.errors
+    assert task.errors[0].count(code) == 1  # "E_X: artifact 'n': <message>", never "E_X: ... E_X:"
     assert task.error.startswith(f"{code}: ")
-    assert "dump" in task.errors[0]
     assert task.outputs == {}
     assert len(relay_server.requests) == 1  # the second artifact is not even tried
 
@@ -784,6 +809,78 @@ def test_a_spill_upload_error_fails_the_task_with_its_code(relay_server, tmp_pat
     assert task.error.startswith("E_ARTIFACT_TOO_LARGE: ")
     assert "blob" in task.error
     assert task.outputs == {}
+
+
+@pytest.mark.parametrize("code", ["E_ARTIFACTS_DISABLED", "E_ARTIFACTS_UNSUPPORTED"])
+def test_a_spill_falls_back_to_the_caps_when_artifacts_are_unavailable(
+    relay_server, tmp_path, caplog, code
+):
+    """The platform declares every schema output of a custom bundle as spill,
+    even while artifacts are switched off (the default). A spill the relay
+    cannot take is capped as it was before spill existed -- a list is cut to
+    fit, with a note; anything else fails E_OUTPUT_TOO_LARGE -- instead of
+    failing the task with the artifact error. One log line per task says why."""
+    relay_server.default = Response(422, json={"code": code, "message": "artifacts are off"})
+    decls = [_spill("spill-scalar", "blob"), _spill("spill-list", "items")]
+
+    with caplog.at_level(logging.WARNING):
+        result, _ = _run_artifacts(
+            ["spill-scalar", "spill-list"], tmp_path, relay_server, decls=decls
+        )
+
+    scalar, items = result.tasks
+    assert scalar.status == "failed"
+    assert scalar.error.startswith("E_OUTPUT_TOO_LARGE outputs.blob"), scalar.error
+    assert not any(code in e for e in scalar.errors)
+    assert items.status == "ok", items.error
+    assert 0 < len(items.outputs["items"]) < 100000
+    assert any("truncated" in e for e in items.errors)
+    assert len(relay_server.requests) == 2  # one try per task
+    lines = [r.getMessage() for r in caplog.records if "spill" in r.getMessage()]
+    assert len(lines) == 2 and all(code in line for line in lines), lines
+
+
+def test_a_busy_relay_is_retried_for_a_spill(relay_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts_module, "_sleep", lambda seconds: None)
+    busy = Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    relay_server.script("PUT", PUT_PREFIX, busy, _created("art_spill"))
+
+    result, _ = _run_artifacts(
+        ["spill-scalar"], tmp_path, relay_server, decls=[_spill("spill-scalar", "blob")]
+    )
+
+    [task] = result.tasks
+    assert task.status == "ok", task.error
+    assert task.outputs == {"blob": {"$artifact": "art_spill"}}
+    first, second = relay_server.requests
+    assert first.body_length == 0
+    assert second.body == _compact("x" * (300 * 1024)) and second.body_complete
+
+
+def test_outputs_are_measured_as_compact_json_like_the_packaged_spill():
+    """Both hosts measure an output the way the result carries it: compact
+    JSON. A list whose compact form fits the cap stays whole even though its
+    spaced form (", " between items) would not."""
+    fits = [1] * 131070 + [10]
+    assert len(_compact(fits)) == MAX_OUTPUT_BYTES
+    assert len(json.dumps(fits).encode()) > MAX_OUTPUT_BYTES
+
+    inline, errors, spilled = _apply_size_caps({"items": fits}, frozenset({"items"}))
+    assert (inline, errors, spilled) == ({"items": fits}, [], {})
+
+    over = [*fits, 7]
+    inline, errors, spilled = _apply_size_caps({"items": over}, frozenset({"items"}))
+    assert (inline, errors, spilled) == ({}, [], {"items": _compact(over)})
+
+
+def test_a_truncated_list_is_the_longest_prefix_whose_compact_json_fits():
+    value = list(range(100000))
+
+    kept = _truncate_list_to_budget(value, MAX_OUTPUT_BYTES)
+
+    assert kept == value[: len(kept)]
+    assert len(_compact(kept)) <= MAX_OUTPUT_BYTES
+    assert len(_compact(value[: len(kept) + 1])) > MAX_OUTPUT_BYTES
 
 
 # -- the host opens each artifact file once, safely ---------------------------------------
@@ -1191,15 +1288,15 @@ def test_a_spilled_output_is_not_uploaded_after_the_deadline_either(relay_server
         spilled={"blob": b'"x"'},
     )
 
-    refs, errors = _upload_artifacts(**args, deadline_at=time.monotonic() - 1)
+    refs, errors, unavailable = _upload_artifacts(**args, deadline_at=time.monotonic() - 1)
 
-    assert refs == {}
+    assert refs == {} and unavailable is None
     [error] = errors
     assert error.startswith("E_TIMEOUT: ") and "artifact 'blob'" in error
     assert relay_server.requests == []
 
-    refs, errors = _upload_artifacts(**args, deadline_at=time.monotonic() + 60)
-    assert errors == [] and refs == {"blob": {"$artifact": "art_blob"}}
+    refs, errors, unavailable = _upload_artifacts(**args, deadline_at=time.monotonic() + 60)
+    assert errors == [] and refs == {"blob": {"$artifact": "art_blob"}} and unavailable is None
 
 
 def _token(tmp_path: Path) -> Path:

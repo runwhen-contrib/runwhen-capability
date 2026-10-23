@@ -94,6 +94,12 @@ tasks:
     effects: [Test fixture]
     outputs:
       dump: { artifact: { contentType: text/plain } }
+  - name: py-leaky
+    file: tasks/py_leaky.py
+    effects: [Test fixture]
+    outputs:
+      dump: { artifact: { contentType: text/plain } }
+      note: { schema: "string" }
   - name: py-forged-ref
     file: tasks/py_forged_ref.py
     effects: [Test fixture]
