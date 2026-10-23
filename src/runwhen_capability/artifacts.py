@@ -62,7 +62,9 @@ task's inputs (`ctx.input_artifacts`, from the lease):
         for line in fh: ...
     path = ctx.artifacts.input_path("prior-report")    # a local file, for tools that want one
 
-`input` is the relay's response body, undecoded, never buffered. `input_path`
+`input` is the relay's response body, undecoded, read through a small buffer
+and never held whole; a read the relay fails mid-way raises ArtifactError
+(E_ARTIFACT_TRANSPORT), like every other transport failure. `input_path`
 spools the artifact to a file in a sha256-keyed cache that outlives the
 request, so the same artifact is downloaded once however many requests use it,
 and verifies the digest while it streams (`E_ARTIFACT_CORRUPT` on a mismatch).
@@ -82,6 +84,7 @@ through `context`, and must not pay for that.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import queue
@@ -524,15 +527,15 @@ class ArtifactsClient:
         """The bytes of input artifact `name`, as a stream the relay is still
         sending: read it in pieces and close it (it is a context manager). The
         body is exactly the stored bytes -- any `Content-Encoding` is left
-        alone. `name` must be one of the request's input artifacts, else
-        `ArtifactUndeclaredError` (before any HTTP). With no relay it is the
-        file `<workdir>/.rw-artifacts/inputs/<name>`, opened for reading."""
+        alone. A read that fails mid-way (the relay went quiet, the connection
+        broke) raises ArtifactError. `name` must be one of the request's input
+        artifacts, else `ArtifactUndeclaredError` (before any HTTP). With no
+        relay it is the file `<workdir>/.rw-artifacts/inputs/<name>`, opened
+        for reading."""
         if self._ctx.relay is None:
             return open(self._local_input(name), "rb")
         self._declared_input(name)
-        raw = self._ctx.relay.open_input(name).raw
-        raw.decode_content = False
-        return raw
+        return io.BufferedReader(self._ctx.relay.open_input(name))
 
     def input_path(self, name: str) -> Path:
         """Input artifact `name` as a local file, for code that wants a path.

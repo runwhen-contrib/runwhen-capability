@@ -47,8 +47,9 @@ a task holds a lot; it is trimmed by the next request. The same pass removes
 part files and locks abandoned by dead hosts. Housekeeping never fails the
 download it follows: an OS error in it is logged as a warning.
 
-This module does not import `requests`: the response is duck-typed (`.raw`,
-`.headers`, `.close()`), like the relay client in artifacts.py.
+This module does not import `requests`: the response is duck-typed (`.read()`,
+`.headers`, `.close()` -- the relay's InputStream, whose reads already turn a
+transport failure into ArtifactError), like the relay client in artifacts.py.
 """
 
 from __future__ import annotations
@@ -139,8 +140,9 @@ class ArtifactCache:
         """The path of the artifact in the cache, downloading it first if it
         is not there. `label` names the input in errors. `expected` is the
         declared sha256 (normalized) or None. `open_response` opens the
-        download and returns a streaming `requests.Response`; it is not called
-        at all when `expected` is known and cached."""
+        download and returns the relay's InputStream (a binary stream with
+        `.headers`); it is not called at all when `expected` is known and
+        cached."""
         self.root.mkdir(parents=True, exist_ok=True)
         if expected is not None:
             return self._fetch_keyed(label, expected, open_response, None)
@@ -229,15 +231,15 @@ class ArtifactCache:
     def _download(self, resp: Any, prefix: str, lock: _Lock | None) -> tuple[Path, str]:
         """Streams the response body to a new part file in `_READ_BYTES` reads,
         hashing as it goes. Closes `resp`. Returns the part file and the hex
-        sha256 of what was read; on any error the part file is removed."""
+        sha256 of what was read; on any error the part file is removed. The
+        body is the stored bytes, never decoded (InputStream), so the digest is
+        of what the lease declared."""
         part = self.root / f"{prefix}.part-{secrets.token_hex(6)}"
         digest = hashlib.sha256()
-        raw = resp.raw
-        raw.decode_content = False  # the digest is of the stored bytes
         try:
             with resp, open(part, "wb") as out:
                 while True:
-                    data = raw.read(_READ_BYTES)
+                    data = resp.read(_READ_BYTES)
                     if not data:
                         break
                     out.write(data)

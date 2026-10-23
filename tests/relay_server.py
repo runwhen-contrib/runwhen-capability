@@ -80,6 +80,9 @@ body). The declared Content-Length is `content_length`, else the stream's
 `total` (`PieceStream` has one). A `content_length` larger than what the
 stream yields makes the connection end short of its length -- an interrupted
 download.
+
+No relay at all. `refused_url()` is a local URL nothing listens on, for a client
+whose connection must be refused.
 """
 
 from __future__ import annotations
@@ -353,6 +356,14 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
         do_GET = do_PUT = do_POST = do_DELETE = do_HEAD = _handle
 
     return Handler
+
+
+def refused_url() -> str:
+    """A local URL nothing listens on: connecting to it is refused at once."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
 
 
 class PieceStream:

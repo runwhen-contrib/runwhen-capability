@@ -24,7 +24,7 @@ from pathlib import Path
 import pytest
 import requests
 import urllib3
-from relay_server import PieceStream, Response
+from relay_server import PieceStream, Response, refused_url
 
 from runwhen_capability import Context, artifacts
 from runwhen_capability import _artifact_cache as cache_module
@@ -150,6 +150,12 @@ def _wait_for(condition, timeout: float = 10.0) -> None:
     assert condition(), f"not true after {timeout}s"
 
 
+def _assert_transport(error: BaseException, cause: type[BaseException]) -> None:
+    assert type(error) is ArtifactError, repr(error)
+    assert error.code == "E_ARTIFACT_TRANSPORT"
+    assert isinstance(error.__cause__, cause), repr(error.__cause__)
+
+
 def _dead_pid() -> int:
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
@@ -190,6 +196,65 @@ def test_input_and_input_path_hand_back_the_stored_bytes_not_a_decoded_copy(rela
     with ctx.artifacts.input("blob") as fh:
         assert fh.read() == stored
     assert ctx.artifacts.input_path("blob").read_bytes() == stored
+
+
+def test_input_is_a_binary_stream_with_bounded_reads_that_closes_the_response(
+    relay_server, tmp_path
+):
+    data = b"0123456789" * 100_000
+    relay_server.script("GET", IN_PREFIX, _served(data))
+    ctx = _ctx(relay_server, tmp_path, [_decl("report", data)])
+
+    with ctx.artifacts.input("report") as fh:
+        assert fh.readable()
+        assert fh.read(3) == b"012"
+        assert fh.read(7) == b"3456789"
+        assert fh.readline() == data[10:]  # no newline: the rest
+    assert fh.closed
+    with pytest.raises(ValueError):
+        fh.read(1)
+
+
+def test_input_from_a_relay_that_refuses_the_connection_is_an_artifact_error(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    relay = RelayClient(refused_url(), token_file, "req-1", requests.Session())
+    ctx = Context(
+        "rw-fixture", "scan", workdir, relay=relay, task="scan", input_artifacts=[_decl("r", b"x")]
+    )
+
+    for read in (ctx.artifacts.input, ctx.artifacts.input_path):
+        with pytest.raises(ArtifactError) as excinfo:
+            read("r")
+        _assert_transport(excinfo.value, requests.ConnectionError)
+
+
+def test_input_read_errors_mid_body_are_artifact_errors(relay_server, tmp_path, monkeypatch):
+    """A relay that goes quiet mid-body (past the read timeout) and one whose
+    body ends short of its length: both surface from `read` as ArtifactError."""
+    monkeypatch.setattr(relay_module, "_READ_TIMEOUT", 0.5)
+    data = b"q" * (2 * MIB)
+
+    def pausing():
+        yield data[:MIB]
+        time.sleep(3)
+        yield data[MIB:]
+
+    relay_server.script(
+        "GET",
+        IN_PREFIX,
+        Response(200, stream=pausing(), content_length=len(data)),
+        Response(200, stream=iter([data[:1000]]), content_length=len(data)),
+    )
+    ctx = _ctx(relay_server, tmp_path, [_decl("report", data)])
+
+    for _ in range(2):
+        with ctx.artifacts.input("report") as fh:
+            _, error = _run_with_deadline(fh.read, seconds=20)
+        _assert_transport(error, urllib3.exceptions.HTTPError)
+        assert "report" in error.message
 
 
 def test_unknown_input_raises_undeclared(relay_server, tmp_path):
@@ -295,9 +360,10 @@ def test_an_interrupted_download_leaves_nothing_behind(relay_server, tmp_path):
     relay_server.script("GET", IN_PREFIX, short, _served(data))
     ctx = _ctx(relay_server, tmp_path, [_decl("report", data)])
 
-    with pytest.raises(urllib3.exceptions.HTTPError):  # the HTTP layer's own error, unchanged
+    with pytest.raises(ArtifactError) as excinfo:  # never the HTTP layer's own error
         ctx.artifacts.input_path("report")
 
+    _assert_transport(excinfo.value, urllib3.exceptions.HTTPError)
     cache = ctx.workdir / ".rw-artifact-cache"
     assert _names(cache) == []  # no half file, and the lock is released
     assert ctx.artifacts.input_path("report").read_bytes() == data
@@ -738,8 +804,9 @@ def test_a_relay_that_goes_quiet_mid_body_fails_the_read_instead_of_hanging(
     if completes:
         assert ctx.artifacts.input_path("report").read_bytes() == data
     else:
-        with pytest.raises(urllib3.exceptions.HTTPError):
+        with pytest.raises(ArtifactError) as excinfo:
             ctx.artifacts.input_path("report")
+        _assert_transport(excinfo.value, urllib3.exceptions.HTTPError)
         assert _names(cache) == []
 
 

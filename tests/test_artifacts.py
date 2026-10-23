@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 import relay_server as relay_module
 import requests
-from relay_server import PieceStream, Response
+from relay_server import PieceStream, Response, refused_url
 
 from runwhen_capability import Context, artifacts
 from runwhen_capability import context as context_module
@@ -474,6 +474,70 @@ def test_a_trickling_writer_puts_its_bytes_on_the_wire_before_close(
 
     (seen,) = relay_server.requests
     assert seen.body == b"first second third" and seen.body_complete
+
+
+# -- transport failures are ArtifactErrors ------------------------------------
+
+
+def _refused_ctx(tmp_path: Path) -> Context:
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    workdir = tmp_path / "work"
+    workdir.mkdir(exist_ok=True)
+    relay = RelayClient(refused_url(), token_file, "req-1", requests.Session())
+    return Context("rw-fixture", "scan", workdir, relay=relay, task="scan")
+
+
+def _write_and_close(ctx: Context):
+    with ctx.artifacts.open("a.txt") as writer:
+        writer.write(b"x" * 10)
+    return writer.ref
+
+
+def _add_path(ctx: Context):
+    path = ctx.workdir / "f.bin"
+    path.write_bytes(b"x" * 10)
+    return ctx.artifacts.add_file(path, "f.bin")
+
+
+def _add_handle(ctx: Context):
+    path = ctx.workdir / "f.bin"
+    path.write_bytes(b"x" * 10)
+    with open(path, "rb") as fh:
+        return ctx.artifacts.add_file(fh, "f.bin")
+
+
+def _from_process(ctx: Context):
+    return ctx.artifacts.from_process([sys.executable, "-c", "print('out')"], "out.txt").ref
+
+
+_WRITE_PATHS = [_write_and_close, _add_path, _add_handle, _from_process]
+
+
+@pytest.mark.parametrize("write", _WRITE_PATHS, ids=lambda f: f.__name__.lstrip("_"))
+def test_a_refused_connection_is_an_artifact_error_from_every_writer(tmp_path, write):
+    """A task that catches ArtifactError must also catch a relay it cannot
+    reach: never a raw requests/urllib3 error."""
+    ctx = _refused_ctx(tmp_path)
+
+    _, error = _run_with_deadline(lambda: write(ctx))
+
+    assert type(error) is ArtifactError, repr(error)
+    assert error.code == "E_ARTIFACT_TRANSPORT"
+    assert isinstance(error.__cause__, requests.ConnectionError)
+
+
+@pytest.mark.parametrize("write", _WRITE_PATHS, ids=lambda f: f.__name__.lstrip("_"))
+def test_a_201_that_is_not_json_is_an_artifact_error_from_every_writer(
+    relay_server, tmp_path, write
+):
+    relay_server.default = Response(201, body=b"stored, thanks")
+    ctx = _ctx(relay_server, tmp_path)
+
+    _, error = _run_with_deadline(lambda: write(ctx))
+
+    assert type(error) is ArtifactError, repr(error)
+    assert error.code == "E_ARTIFACT_TRANSPORT"
 
 
 # -- content type -----------------------------------------------------------

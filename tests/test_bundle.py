@@ -571,9 +571,9 @@ def test_an_upload_error_fails_the_task_with_its_code(relay_server, tmp_path, re
 
     [task] = result.tasks
     assert task.status == "failed"
-    assert task.errors[0].startswith(f"{code}: "), task.errors
+    assert task.errors[0].startswith(f"{code}: artifact 'dump': "), task.errors
+    assert task.errors[0].count(code) == 1  # "E_X: artifact 'n': <message>", never "E_X: ... E_X:"
     assert task.error.startswith(f"{code}: ")
-    assert "dump" in task.errors[0]
     assert task.outputs == {}
     assert len(relay_server.requests) == 1  # the second artifact is not even tried
 

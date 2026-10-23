@@ -86,7 +86,6 @@ from typing import Any, BinaryIO
 
 import jsonschema
 import referencing
-import requests
 
 from ._redaction import Redactor
 from ._rw_sh import BASH_ENV_SH, RW_SH
@@ -128,7 +127,7 @@ from .models import (
     TaskResult,
 )
 from .pathsafe import confined_to
-from .relay import RelayClient
+from .relay import TRANSPORT_ERROR, RelayClient
 
 LOG_TAIL_BYTES = 64 * 1024
 # A schema output over this is cut to fit (a list), fails the task, or -- where the
@@ -1018,9 +1017,15 @@ def _upload_artifacts(
                 return refs, [], exc
             refs[current] = ref.model_dump(mode="json")
     except ArtifactError as exc:
-        code = exc.code if exc.code.startswith(_ARTIFACT_ERROR_PREFIX) else E_ARTIFACT_UPLOAD
-        return {}, [_clipped(f"{code}: artifact {current!r}: {exc}")], None
-    except (OSError, requests.RequestException) as exc:
+        # A relay code is reported as it is, without repeating it; a status with
+        # no code (HTTP_401) or a transport failure is E_ARTIFACT_UPLOAD, quoting
+        # the original code.
+        if exc.code.startswith(_ARTIFACT_ERROR_PREFIX) and exc.code != TRANSPORT_ERROR:
+            message = f"{exc.code}: artifact {current!r}: {exc.message or exc.code}"
+        else:
+            message = f"{E_ARTIFACT_UPLOAD}: artifact {current!r}: {exc}"
+        return {}, [_clipped(message)], None
+    except OSError as exc:  # the local sink (no relay), or a file handle
         return {}, [_clipped(f"{E_ARTIFACT_UPLOAD}: artifact {current!r}: {exc}")], None
     return refs, [], None
 
