@@ -723,7 +723,7 @@ def test_from_process_missing_program_raises_and_uploads_nothing(relay_server, t
 _TASKS = """
 from pathlib import Path
 
-from runwhen_capability import task
+from runwhen_capability import setup, task
 
 
 @task(outputs={"blob": "text", "note": "text"})
@@ -734,6 +734,26 @@ def sized(ctx, length):
 @task(outputs={"files": "json"})
 def paths(ctx, count):
     return {"files": [Path(f"/srv/data/{i:06d}") for i in range(count)]}
+
+
+@setup(outputs=[])
+def leaky_setup(ctx):
+    writer = ctx.artifacts.open("from-setup")
+    writer.write(b"x" * (2 * 1024 * 1024))  # in flight; never closed
+
+
+@task(outputs={"note": "text"})
+def leaky(ctx):
+    writer = ctx.artifacts.open("forgotten")
+    writer.write(b"x" * (2 * 1024 * 1024))  # in flight; never closed
+    return {"note": "returned without closing"}
+
+
+@task(outputs={"note": "text"})
+def leaky_then_raise(ctx):
+    writer = ctx.artifacts.open("forgotten")
+    writer.write(b"x" * (2 * 1024 * 1024))
+    raise RuntimeError("failed with the writer open")
 
 
 @task(outputs={"report": "artifact"})
@@ -871,6 +891,88 @@ def test_a_failed_spill_upload_fails_the_task(relay_server, tmp_path):
 
     assert result.tasks[0].status == "failed"
     assert "E_ARTIFACT_EXISTS" in result.tasks[0].error
+
+
+def _upload_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "rw-artifact-upload" and t.is_alive()]
+
+
+def test_a_writer_the_task_left_open_is_aborted_when_the_task_returns(relay_server, tmp_path):
+    """A forgotten writer would keep its upload thread (parked on an empty
+    queue), its socket and a few MiB alive for the life of the pod."""
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    before = _upload_threads()
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("leaky"),
+        [OutputDecl(task="leaky", name="forgotten", artifact=True)],
+    )
+
+    assert result.tasks[0].status == "ok"
+    assert [t for t in _upload_threads() if t not in before] == []  # gone, not merely idle
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete  # an abandoned upload, never a finished artifact
+
+
+def test_a_writer_left_open_by_a_task_that_raises_is_aborted_too(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    before = _upload_threads()
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("leaky_then_raise"),
+        [OutputDecl(task="leaky_then_raise", name="forgotten", artifact=True)],
+    )
+
+    assert result.tasks[0].status == "failed"
+    assert "failed with the writer open" in result.tasks[0].error
+    assert [t for t in _upload_threads() if t not in before] == []
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete
+
+
+def test_a_writer_left_open_by_setup_is_aborted(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    before = _upload_threads()
+    scope = tmp_path / "scope"
+    scope.mkdir()
+
+    result = run_request(
+        _capability(tmp_path),
+        RequestEnvelope.model_validate({"version": 1, "setup": {"task": "leaky_setup"}}),
+        credentials={},
+        scope_dir=scope,
+        relay=_relay(relay_server, tmp_path),
+        outputs=[OutputDecl(task="leaky_setup", name="from-setup", artifact=True)],
+    )
+
+    assert result.setup.status == "ok"
+    assert [t for t in _upload_threads() if t not in before] == []
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete
+
+
+def test_abort_unclosed_leaves_closed_and_aborted_writers_alone(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_done"))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with ctx.artifacts.open("done.txt") as writer:
+        writer.write(b"x")
+    ctx.artifacts.abort_unclosed()
+
+    assert writer.ref.ref == "art_done"  # a finished artifact stays finished
+    assert len(relay_server.requests) == 1
+
+
+def test_artifact_types_are_exported_for_task_authors():
+    import runwhen_capability
+
+    assert runwhen_capability.ArtifactRef is ArtifactRef
+    assert runwhen_capability.ProcessArtifact is ProcessArtifact
+    assert {"ArtifactRef", "ProcessArtifact"} <= set(runwhen_capability.__all__)
 
 
 def test_a_task_can_return_an_artifact_ref_as_an_output(relay_server, tmp_path):

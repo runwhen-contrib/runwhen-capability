@@ -47,6 +47,12 @@ early response included), so a producer that is faster than the "network"
 backs up deterministically -- what a bounded-queue test needs. Zero (the
 default) is full speed.
 
+A stall. `relay_server.stall_after = N` with `relay_server.stall_seconds = S`
+makes each request's handler stop reading for S seconds once, right after the
+body bytes read so far reach N -- a runner that pauses reading (to flush a
+part to storage, say). A client sending more than the socket buffers hold
+blocks in send for the whole pause.
+
 An aborted upload. A client that drops the connection mid-body leaves the
 handler a body that never reached its terminating chunk (`body_complete`
 False); the answer it then tries to send has nobody to read it, and that
@@ -114,6 +120,8 @@ class RelayServer:
         self.requests: list[RecordedRequest] = []
         self.keep_limit = 1 << 20
         self.read_delay = 0.0  # seconds slept after each body read; see "Slow reader"
+        self.stall_after: int | None = None  # see "A stall"
+        self.stall_seconds = 0.0
         self.default = Response(404, json={"code": "E_UNSCRIPTED"})
         self._scripts: list[tuple[str, str, list[Response]]] = []
         self._lock = threading.Lock()
@@ -160,7 +168,15 @@ class RelayServer:
                     return queue.pop(0)
         return self.default
 
-    def _pace(self) -> None:
+    def _pace(self, sink: _BodySink | None = None) -> None:
+        if (
+            sink is not None
+            and self.stall_after is not None
+            and not sink.stalled
+            and sink.length >= self.stall_after
+        ):
+            sink.stalled = True
+            time.sleep(self.stall_seconds)
         if self.read_delay:
             time.sleep(self.read_delay)
 
@@ -254,7 +270,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                     return False
                 sink.add(data)
                 remaining -= len(data)
-                server._pace()
+                server._pace(sink)
             return True
 
         def _read_chunked(self, sink: _BodySink, limit: int | None) -> bool:
@@ -284,7 +300,7 @@ def _make_handler(server: RelayServer) -> type[BaseHTTPRequestHandler]:
                         return False
                     sink.add(data)
                     remaining -= len(data)
-                    server._pace()
+                    server._pace(sink)
                 self.rfile.readline(8)  # the CRLF after the chunk data
 
         do_GET = do_PUT = do_POST = do_DELETE = do_HEAD = _handle
@@ -335,6 +351,7 @@ class _BodySink:
         self._buf: bytearray | None = bytearray()
         self.length = 0
         self.digest = hashlib.sha256()
+        self.stalled = False  # the one stall (RelayServer.stall_after) already happened
 
     def add(self, data: bytes) -> None:
         self.length += len(data)

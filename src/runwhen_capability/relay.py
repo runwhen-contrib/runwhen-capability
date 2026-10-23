@@ -47,11 +47,24 @@ from .errors import (
     ArtifactUndeclaredError,
 )
 
-# (connect, read). The read timeout is None on purpose: an upload's response
-# only comes after the runner has taken the whole body, however slow the
-# producer is, and a download's reads are paced by the caller. The task's own
-# deadline is what ends a stalled transfer.
-_TIMEOUT = (10, None)
+# requests/urllib3 timeout tuples are (connect, read). The read timeout is None
+# on purpose: an upload's response only comes after the runner has taken the
+# whole body, however slow the producer is, and a download's reads are paced
+# by the caller. The task's own deadline is what ends a stalled transfer.
+#
+# The connect slot is not only about connecting. urllib3 leaves the connect
+# timeout on the socket for the whole time it SENDS the request body (the read
+# timeout applies only once it starts reading the response), and Python's
+# sendall treats that timeout as a limit on the whole call. So for an upload
+# the first number is the longest the runner may stop reading mid-body before
+# the chunk in flight fails with a raw requests.ConnectionError. The runner
+# legitimately stops reading for up to its stall timeout (2 minutes) while it
+# waits for an upload slot or flushes a part to object storage, so the upload
+# gets 150 s, more than that. A refused or reset connection still fails at
+# once; only a blackholed one waits this long. A download sends no body, so
+# its connect slot stays short.
+_SEND_TIMEOUT = 150
+_CONNECT_TIMEOUT = 10
 
 _BY_CODE: dict[str, type[ArtifactError]] = {
     "E_ARTIFACT_TOO_LARGE": ArtifactTooLargeError,
@@ -119,7 +132,7 @@ class RelayClient:
                 "Content-Type": content_type,
                 "X-RW-Task": task,
             },
-            timeout=_TIMEOUT,
+            timeout=(_SEND_TIMEOUT, None),
         )
         with resp:
             if resp.status_code != 201:
@@ -134,7 +147,7 @@ class RelayClient:
             self._url(f"artifacts/in/{quote(input, safe='')}"),
             headers=self._auth(),
             stream=True,
-            timeout=_TIMEOUT,
+            timeout=(_CONNECT_TIMEOUT, None),
         )
         if resp.status_code != 200:
             with resp:

@@ -274,6 +274,8 @@ def run_request(
                 except Exception as exc:  # noqa: BLE001 -- a task's own bug must not crash the host
                     log.exception("setup %r failed", request.setup.task)
                     result.setup = SetupResult(status="failed", error=str(exc))
+                finally:
+                    ctx.artifacts.abort_unclosed()
 
     for task_spec in request.tasks:
         task_def = capability.registry.tasks.get(task_spec.task)
@@ -333,5 +335,7 @@ def run_request(
         except Exception as exc:  # noqa: BLE001 -- one task failing must not lose the others
             log.exception("task %r failed", task_spec.task)
             result.tasks.append(TaskResult(task=task_spec.task, status="failed", error=str(exc)))
+        finally:
+            ctx.artifacts.abort_unclosed()
 
     return result

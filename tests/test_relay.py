@@ -12,6 +12,7 @@ import pytest
 import requests
 from relay_server import PieceStream, Response
 
+from runwhen_capability import relay as relay_module
 from runwhen_capability.errors import (
     ArtifactBusyError,
     ArtifactError,
@@ -95,6 +96,40 @@ def test_put_artifact_streams_without_buffering_the_body(relay_server, tmp_path)
     assert seen.chunked
     assert seen.body_complete
     assert peak < 8 * (1 << 20), f"peak {peak / (1 << 20):.1f} MiB while uploading 32 MiB"
+
+
+def test_send_timeout_outlasts_the_runners_stall_timeout():
+    """The runner may stop reading for up to its stall timeout (2 minutes)
+    while it waits for an upload slot or flushes a part to storage, and a
+    chunk waiting to be sent must outlive that. Guards against a regression to
+    a small value; the next test pins what the value means."""
+    assert relay_module._SEND_TIMEOUT >= 120
+
+
+@pytest.mark.parametrize(("pause", "completes"), [(0.3, True), (2.0, False)])
+def test_put_artifact_survives_a_relay_pause_shorter_than_the_send_timeout(
+    relay_server, tmp_path, monkeypatch, pause, completes
+):
+    """urllib3 keeps the connect timeout (the first of the timeout tuple) on
+    the socket while it sends the body, and sendall treats it as a limit on
+    the whole call -- so it is the longest the relay may stop reading mid-body.
+    With it at 1 s, a 0.3 s pause is fine and a 2 s one fails the upload."""
+    monkeypatch.setattr(relay_module, "_SEND_TIMEOUT", 1)
+    relay_server.stall_after = 1 << 20
+    relay_server.stall_seconds = pause
+    relay_server.script("PUT", "/", Response(201, json=CREATED))
+    total = 64 * (1 << 20)  # far more than the socket buffers hold, so the sender blocks
+    stream = PieceStream(total, piece_size=1 << 20)
+    client = _client(relay_server, tmp_path)
+
+    if completes:
+        assert _put(client, stream) == CREATED
+        (seen,) = relay_server.requests
+        assert (seen.body_length, seen.body_sha256) == (total, stream.sha256)
+        assert seen.body_complete
+    else:
+        with pytest.raises(requests.ConnectionError):
+            _put(client, stream)
 
 
 def test_put_artifact_accepts_a_list_of_chunks(relay_server, tmp_path):

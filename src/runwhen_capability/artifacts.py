@@ -177,6 +177,11 @@ class ArtifactWriter:
         return self._ref
 
     @property
+    def closed(self) -> bool:
+        """True once `close()` or `abort()` was called (no more writes)."""
+        return self._closed
+
+    @property
     def failure(self) -> BaseException | None:
         """The error that ended the upload, if it has failed."""
         return self._error
@@ -397,6 +402,7 @@ class ArtifactsClient:
     def __init__(self, ctx: Context, local_sink: LocalArtifactSink | None = None) -> None:
         self._ctx = ctx
         self._local = local_sink
+        self._writers: list[tuple[str, ArtifactWriter]] = []  # opened here, see abort_unclosed
 
     def open(self, name: str, content_type: str | None = None) -> ArtifactWriter:
         """Starts the upload of artifact `name` and returns its writer (use
@@ -407,7 +413,26 @@ class ArtifactsClient:
         store = self._store()
         if isinstance(store, LocalArtifactSink):
             store.path_for(name)  # a bad name fails here, not in the background
-        return ArtifactWriter(lambda body: self._put(name, content_type, body))
+        writer = ArtifactWriter(lambda body: self._put(name, content_type, body))
+        self._writers = [(n, w) for n, w in self._writers if not w.closed]
+        self._writers.append((name, writer))
+        return writer
+
+    def abort_unclosed(self) -> None:
+        """Aborts every writer opened through this client that was neither
+        closed nor aborted, logging a warning for each. The task host calls it
+        when a setup/task returns or raises: a writer the task forgot would
+        otherwise keep its upload thread, its socket and a few MiB of queue
+        alive for as long as the process lives, and the runner would hold the
+        artifact open. Nothing is stored for an aborted writer."""
+        writers, self._writers = self._writers, []
+        for name, writer in writers:
+            if not writer.closed:
+                self._ctx.log.warning(
+                    "artifact %r was left open by the task; its upload is aborted, nothing stored",
+                    name,
+                )
+                writer.abort()
 
     def add_file(self, path: str | Path, name: str, content_type: str | None = None) -> ArtifactRef:
         """Uploads the file at `path` as artifact `name`. A busy runner (503)
@@ -451,7 +476,6 @@ class ArtifactsClient:
 
         The runner's refusal can only be seen once a chunk is sent, so for a
         quiet child it surfaces when the child has written 1 MiB or exited."""
-        limit = timeout
         run_env = {**os.environ, **env} if env else None
         proc = subprocess.Popen(  # noqa: S603 -- argv is capability-controlled, by design
             argv,
@@ -473,7 +497,7 @@ class ArtifactsClient:
             writer = self.open(name, content_type)
             pump = threading.Thread(target=_pump_stdout, args=(proc, writer, failure), daemon=True)
             pump.start()
-            self._await_exit(proc, pump, writer, failure, argv, limit)
+            self._await_exit(proc, pump, writer, failure, argv, timeout)
             ref = writer.close()
         except BaseException:
             _kill_if_unreaped(proc)
