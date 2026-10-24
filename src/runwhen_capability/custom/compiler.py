@@ -2,7 +2,8 @@
 platform's CapabilityManifest parses, compiled from a custom capability
 bundle's capability.yaml: `capability`, `appliesTo`, `needs.credentials`, and
 `tasks[{name, description, readOnly, file, inputs, outputs}]` with every
-output's compact schema (or escape-hatch file) resolved to JSON Schema.
+schema output's compact schema (or escape-hatch file) resolved to JSON Schema
+and every artifact output as `{"artifact": {contentType, maxSize?}}`.
 `execution` is omitted -- the platform fills the image (the rw-task
 runtime).
 """
@@ -12,7 +13,7 @@ from __future__ import annotations
 import json
 
 from .diagnostics import Diagnostic
-from .manifest import Manifest, TaskSpec
+from .manifest import Manifest, OutputSpec, TaskSpec
 from .schema_notation import compile_schema_notation
 from .validate import validate
 from .yaml_lines import safe_load
@@ -87,11 +88,20 @@ def _compile_task(files: dict[str, str], manifest: Manifest, task: TaskSpec) -> 
         "effects": [effect for effect in task.effects if effect.strip()],
         "file": task.file,
         "inputs": {name: spec.model_dump(mode="json") for name, spec in merged_inputs.items()},
-        "outputs": {
-            name: {"schema": _compile_output_schema(files, output.schema_)}
-            for name, output in task.outputs.items()
-        },
+        "outputs": {name: _compile_output(files, output) for name, output in task.outputs.items()},
     }
+
+
+def _compile_output(files: dict[str, str], output: OutputSpec) -> dict:
+    """An artifact output keeps its own fields (`maxSize` only when the author
+    set one); a schema output is its resolved JSON Schema. Whether a schema
+    output may spill into an artifact is the platform's call, not compiled here."""
+    if output.artifact is not None:
+        artifact = {"contentType": output.artifact.contentType}
+        if output.artifact.maxSize is not None:
+            artifact["maxSize"] = output.artifact.maxSize
+        return {"artifact": artifact}
+    return {"schema": _compile_output_schema(files, output.schema_)}
 
 
 def _compile_output_schema(files: dict[str, str], schema_text: str) -> dict:

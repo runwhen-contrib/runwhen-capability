@@ -1,0 +1,1535 @@
+"""ctx.artifacts -- the writers (open / add_file / from_process), the local
+sink used when there is no relay, and the spill of large task outputs. The
+upload tests run against the real local relay (tests/relay_server.py): the
+point is the bytes and the termination on the wire, which a mock cannot show.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import queue
+import subprocess
+import sys
+import threading
+import time
+import tracemalloc
+from pathlib import Path
+
+import pytest
+import relay_server as relay_module
+import requests
+from relay_server import PieceStream, Response, refused_url
+
+from runwhen_capability import Context, artifacts
+from runwhen_capability import context as context_module
+from runwhen_capability.artifacts import (
+    ArtifactRef,
+    ArtifactsClient,
+    ArtifactWriter,
+    LocalArtifactSink,
+    ProcessArtifact,
+)
+from runwhen_capability.errors import (
+    ArtifactBusyError,
+    ArtifactError,
+    ArtifactExistsError,
+    ArtifactTooLargeError,
+)
+from runwhen_capability.host import _to_jsonable, run_request
+from runwhen_capability.loader import load_capability
+from runwhen_capability.models import OutputDecl, RequestEnvelope
+from runwhen_capability.relay import RelayClient
+
+MIB = 1 << 20
+PUT_PREFIX = "/v1/tasks/req-1/artifacts/"
+
+
+def _created(ref: str = "art_abc", size: int = 0, sha256: str = "0" * 64) -> Response:
+    body = {"artifactRef": ref, "sizeBytes": size, "sha256": sha256, "lineCount": 1, "isText": True}
+    return Response(201, json=body)
+
+
+def _relay(relay_server, tmp_path: Path) -> RelayClient:
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    return RelayClient(relay_server.url, token_file, "req-1", requests.Session())
+
+
+def _ctx(relay_server, tmp_path: Path, outputs=()) -> Context:
+    workdir = tmp_path / "work"
+    workdir.mkdir(exist_ok=True)
+    return Context(
+        "rw-fixture",
+        "scan",
+        workdir,
+        relay=_relay(relay_server, tmp_path),
+        task="scan",
+        outputs=outputs,
+    )
+
+
+def _local_ctx(tmp_path: Path) -> Context:
+    workdir = tmp_path / "work"
+    workdir.mkdir(exist_ok=True)
+    return Context("rw-fixture", "scan", workdir, task="scan")
+
+
+def _wait_for_requests(relay_server, count: int, timeout: float = 10.0):
+    """The handler records a request only once it has finished reading the
+    body, which for an aborted upload is after the client call returned."""
+    deadline = time.monotonic() + timeout
+    while len(relay_server.requests) < count and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(relay_server.requests) >= count, f"server saw {len(relay_server.requests)} requests"
+    return relay_server.requests
+
+
+def _wait_for(condition, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert condition(), f"not true after {timeout}s"
+
+
+def _run_with_deadline(fn, seconds: float = 20.0):
+    """Runs `fn` in a thread; fails (instead of hanging the suite) if it does
+    not finish. Returns (result, exception)."""
+    outcome: list = [None, None]
+
+    def target():
+        try:
+            outcome[0] = fn()
+        except BaseException as exc:  # noqa: BLE001 -- handed to the test to assert on
+            outcome[1] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    assert not thread.is_alive(), f"still running after {seconds}s: it hung"
+    return outcome[0], outcome[1]
+
+
+# -- ArtifactRef ------------------------------------------------------------
+
+
+def test_ref_serializes_to_dollar_artifact():
+    ref = ArtifactRef(ref="art_1", size_bytes=5, sha256="ab" * 32)
+
+    assert ref.model_dump(mode="json") == {"$artifact": "art_1"}
+    assert ref.model_dump() == {"$artifact": "art_1"}
+    # The host's _to_jsonable needs no special case for it, at any depth.
+    assert _to_jsonable({"report": ref, "all": [ref]}) == {
+        "report": {"$artifact": "art_1"},
+        "all": [{"$artifact": "art_1"}],
+    }
+    assert json.loads(ref.model_dump_json()) == {"$artifact": "art_1"}
+    assert (ref.ref, ref.size_bytes, ref.sha256) == ("art_1", 5, "ab" * 32)
+
+
+# -- open -------------------------------------------------------------------
+
+
+class _TrackingQueue(queue.Queue):
+    """Counts the payload bytes sitting in the queue, and their peak."""
+
+    def __init__(self, maxsize: int = 0) -> None:
+        super().__init__(maxsize)
+        self.queued = 0
+        self.peak = 0
+
+    def _put(self, item) -> None:
+        super()._put(item)
+        if isinstance(item, bytes):
+            self.queued += len(item)
+            self.peak = max(self.peak, self.queued)
+
+    def _get(self):
+        item = super()._get()
+        if isinstance(item, bytes):
+            self.queued -= len(item)
+        return item
+
+
+def test_open_streams_with_bounded_queue(relay_server, tmp_path, monkeypatch):
+    """50 MiB goes through the writer in odd-sized writes while the relay
+    reads slowly. The producer must be held back by the queue (4 chunks of
+    1 MiB), not run ahead of it, and every byte must still arrive, in order."""
+    tracking: list[_TrackingQueue] = []
+
+    def make_queue(maxsize: int) -> _TrackingQueue:
+        tracking.append(_TrackingQueue(maxsize))
+        return tracking[0]
+
+    monkeypatch.setattr(ArtifactWriter, "_new_queue", staticmethod(make_queue))
+    relay_server.read_delay = 0.0005
+    relay_server.script("PUT", PUT_PREFIX, _created("art_big", size=50 * MIB))
+    total = 50 * MIB
+    stream = PieceStream(total, piece_size=700_000)  # neither aligned to nor below the chunk size
+    ctx = _ctx(relay_server, tmp_path)
+
+    with ctx.artifacts.open("big.bin", "application/octet-stream") as writer:
+        for piece in stream:
+            writer.write(piece)
+
+    (seen,) = relay_server.requests
+    assert writer.ref.ref == "art_big"
+    assert (seen.body_length, seen.body_sha256) == (total, stream.sha256)
+    assert seen.chunked and seen.body_complete
+    (tq,) = tracking
+    assert tq.peak <= 4 * MIB + MIB, f"{tq.peak / MIB:.1f} MiB queued"
+    assert tq.peak >= 2 * MIB, "the queue never backed up, so the bound was not exercised"
+
+
+def test_open_sends_the_task_name_content_type_and_path(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_1", size=3))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with ctx.artifacts.open("out dir/a b.txt", "text/plain") as writer:
+        writer.write(b"abc")
+
+    (seen,) = relay_server.requests
+    assert seen.method == "PUT"
+    assert seen.path == "/v1/tasks/req-1/artifacts/out%20dir/a%20b.txt"
+    assert seen.header("X-RW-Task") == "scan"
+    assert seen.header("Content-Type") == "text/plain"
+    assert seen.body == b"abc"
+    assert writer.ref == ArtifactRef(ref="art_1", size_bytes=3, sha256="0" * 64)
+
+
+def test_close_returns_the_ref_and_closing_twice_is_harmless(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_1", size=2, sha256="f" * 64))
+    ctx = _ctx(relay_server, tmp_path)
+
+    writer = ctx.artifacts.open("a.txt")
+    writer.write(b"hi")
+    first = writer.close()
+    second = writer.close()
+
+    assert first == second == writer.ref
+    assert first == ArtifactRef(ref="art_1", size_bytes=2, sha256="f" * 64)
+    assert len(relay_server.requests) == 1
+    with pytest.raises(ValueError):
+        writer.write(b"more")
+
+
+def test_open_zero_bytes_uploads_empty_artifact(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_empty", size=0))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with ctx.artifacts.open("empty.txt", "text/plain") as writer:
+        pass
+
+    (seen,) = relay_server.requests
+    assert seen.chunked
+    assert seen.body == b""
+    assert seen.body_complete  # the terminator went out: a zero-length artifact, not an abort
+    assert writer.ref.ref == "art_empty"
+
+
+def test_write_of_nothing_is_a_noop_not_a_terminator(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created())
+    ctx = _ctx(relay_server, tmp_path)
+
+    with ctx.artifacts.open("a.txt") as writer:
+        writer.write(b"")
+        writer.write(b"abc")
+        writer.write(b"")
+        writer.write(b"def")
+
+    (seen,) = relay_server.requests
+    assert seen.body == b"abcdef"
+    assert seen.body_complete
+
+
+def test_many_small_writes_arrive_whole_and_in_order(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created())
+    ctx = _ctx(relay_server, tmp_path)
+    lines = [f"line {i}\n".encode() for i in range(20_000)]
+
+    with ctx.artifacts.open("lines.txt", "text/plain") as writer:
+        for line in lines:
+            writer.write(line)
+
+    (seen,) = relay_server.requests
+    assert seen.body == b"".join(lines)
+
+
+def test_open_busy_raises_without_retry(relay_server, tmp_path, monkeypatch):
+    """A stream cannot be replayed, so a busy answer is final for `open`."""
+    monkeypatch.setattr(artifacts, "BUSY_RETRY_DELAY", 0)
+    relay_server.script("PUT", PUT_PREFIX, Response(503, json={"code": "E_ARTIFACT_BUSY"}))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(ArtifactBusyError):
+        with ctx.artifacts.open("a.txt") as writer:
+            writer.write(b"x" * 1000)
+
+    assert len(relay_server.requests) == 1
+    assert writer.ref is None
+
+
+def test_close_raises_the_error_the_relay_answered_with(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, Response(409, json={"code": "E_ARTIFACT_EXISTS"}))
+    ctx = _ctx(relay_server, tmp_path)
+
+    writer = ctx.artifacts.open("a.txt")
+    writer.write(b"abc")
+    with pytest.raises(ArtifactExistsError):
+        writer.close()
+    with pytest.raises(ArtifactExistsError):  # and again: the same error, no second attempt
+        writer.close()
+
+    assert len(relay_server.requests) == 1
+    assert writer.ref is None
+
+
+def test_exception_inside_with_block_aborts_upload(relay_server, tmp_path):
+    """The with-block's own exception propagates, the runner sees a body that
+    never reached its terminator (so it cannot finalize an artifact), and no
+    ref comes back."""
+    # Were the abort to end the body cleanly, this is the answer the runner
+    # would give: a finalized artifact.
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    ctx = _ctx(relay_server, tmp_path)
+
+    class Boom(RuntimeError):
+        pass
+
+    with pytest.raises(Boom):
+        with ctx.artifacts.open("partial.bin") as writer:
+            for _ in range(6):  # more than the queue holds: the upload is mid-flight
+                writer.write(b"x" * MIB)
+            raise Boom("task failed half-way")
+
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete
+    assert writer.ref is None
+    with pytest.raises(ArtifactError):  # nothing to hand back, and not a silent success
+        writer.close()
+
+
+def test_abort_makes_the_body_raise_it_never_just_ends():
+    """urllib3 sends the chunked terminator when the body iterator returns,
+    which would finalize a half-written artifact. So an abort must surface
+    inside the iterator as an exception."""
+    seen: dict = {}
+
+    def upload(body):
+        try:
+            for _ in body:
+                pass
+        except BaseException as exc:  # noqa: BLE001 -- recording what the iterator did
+            seen["raised"] = type(exc)
+            raise
+        seen["ended"] = True
+        return ArtifactRef(ref="art_x", size_bytes=0, sha256="")
+
+    writer = ArtifactWriter(upload)
+    writer.write(b"x" * (3 * MIB))
+    writer.abort()
+
+    assert "raised" in seen
+    assert "ended" not in seen
+    assert writer.ref is None
+
+
+def test_write_after_early_413_raises_instead_of_hanging(relay_server, tmp_path, monkeypatch):
+    """The runner answers 413 after `maxBytes + 1` bytes and drops the
+    connection while the producer is still writing. The upload thread is then
+    gone, and the producer is typically parked on a full queue that nothing
+    will drain; a `write` that just blocked there would never return. The
+    slow relay keeps the queue full up to the moment the connection drops."""
+    monkeypatch.setattr(relay_module, "_DRAIN_TOTAL_TIMEOUT", 0.3)  # the runner closes soon
+    relay_server.read_delay = 0.005
+    max_bytes = 1024
+    relay_server.script(
+        "PUT",
+        PUT_PREFIX,
+        Response(
+            413, json={"code": "E_ARTIFACT_TOO_LARGE", "maxBytes": max_bytes}, read_limit=max_bytes
+        ),
+    )
+    ctx = _ctx(relay_server, tmp_path)
+
+    def produce():
+        with ctx.artifacts.open("big.bin") as writer:
+            for _ in range(200):  # far more than the queue holds
+                writer.write(b"x" * MIB)
+
+    _, error = _run_with_deadline(produce)
+
+    assert isinstance(error, ArtifactTooLargeError)
+    assert error.max_bytes == max_bytes
+    assert relay_server.requests[0].body_length == max_bytes
+    assert not relay_server.requests[0].body_complete
+
+
+def test_writer_raises_the_upload_error_when_the_upload_died_mid_stream():
+    """The upload thread can end (the runner answered and dropped the
+    connection) while the queue is full and nothing will ever drain it. A
+    blocking put would hang the task forever; the writer must notice the dead
+    thread and raise its error -- from then on, from every write."""
+
+    def upload(body):
+        next(iter(body))  # takes one chunk...
+        time.sleep(0.5)  # ...lets the producer fill the queue and park on a put...
+        raise ArtifactTooLargeError("E_ARTIFACT_TOO_LARGE", "too big", max_bytes=1)
+
+    writer = ArtifactWriter(upload)
+
+    def produce():
+        for _ in range(64):
+            writer.write(b"x" * MIB)
+
+    _, error = _run_with_deadline(produce, seconds=10)
+
+    assert isinstance(error, ArtifactTooLargeError)
+    with pytest.raises(ArtifactTooLargeError) as again:
+        writer.write(b"y")
+    assert again.value is error
+    _, close_error = _run_with_deadline(writer.close, seconds=10)
+    assert close_error is error
+    _, abort_error = _run_with_deadline(writer.abort, seconds=10)  # the with-block exit path
+    assert abort_error is None
+
+
+# -- the runner never sees an idle upload -------------------------------------
+#
+# The runner abandons an upload that receives no body byte for two minutes, and
+# each open upload holds one of its slots. So a writer sends nothing until it has
+# a chunk to send, and a slow producer's bytes go out within FLUSH_AFTER_SECONDS.
+
+
+def test_a_writer_left_idle_sends_no_request_until_its_first_chunk(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_1"))
+    relay_server.keep_limit = 2 * MIB
+    ctx = _ctx(relay_server, tmp_path)
+    before = _upload_threads()
+
+    writer = ctx.artifacts.open("a.txt")
+    writer.write(b"under a chunk")
+    time.sleep(0.3)
+
+    assert relay_server.started == []  # no connection: no upload slot held, nothing to stall
+    assert [t for t in _upload_threads() if t not in before] == []
+    writer.write(b"x" * MIB)  # a whole chunk is ready: the upload starts
+    _wait_for(lambda: relay_server.started)
+    assert writer.close().ref == "art_1"
+    (seen,) = relay_server.requests
+    assert seen.body == b"under a chunk" + b"x" * MIB and seen.body_complete
+
+
+def test_an_abort_before_the_upload_started_sends_nothing(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(RuntimeError):
+        with ctx.artifacts.open("a.txt") as writer:
+            writer.write(b"abc")
+            raise RuntimeError("the task failed before the first chunk")
+    time.sleep(0.3)
+
+    assert relay_server.started == []
+    assert writer.ref is None
+    with pytest.raises(ArtifactError):
+        writer.close()
+
+
+def test_an_abort_racing_the_first_chunk_never_starts_the_upload():
+    """from_process writes on one thread and aborts on another. A chunk that
+    reaches the writer after the abort (its write was already past the closed
+    check) must not start an upload that nothing would ever end."""
+    calls: list = []
+    writer = ArtifactWriter(lambda body: calls.append(body))
+    writer.abort()
+
+    with pytest.raises(ArtifactError) as excinfo:
+        writer._put(b"x" * MIB)  # where that write ends up
+
+    assert excinfo.value.code == "E_ARTIFACT_ABORTED"
+    assert calls == [] and writer._thread is None
+
+
+def test_a_trickling_writer_puts_its_bytes_on_the_wire_before_close(
+    relay_server, tmp_path, monkeypatch
+):
+    """Small writes are coalesced into 1 MiB chunks, but never held longer
+    than FLUSH_AFTER_SECONDS: a slow producer's bytes reach the runner while
+    the writer is still open."""
+    monkeypatch.setattr(artifacts, "FLUSH_AFTER_SECONDS", 0.2)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_slow"))
+    ctx = _ctx(relay_server, tmp_path)
+
+    writer = ctx.artifacts.open("slow.txt")
+    writer.write(b"first ")
+    time.sleep(0.4)  # older than the flush interval by the next write
+    writer.write(b"second ")
+    _wait_for(lambda: relay_server.bytes_received >= len(b"first second "))
+    assert not writer.closed and relay_server.requests == []  # mid-stream: the body is open
+    writer.write(b"third")
+    writer.close()
+
+    (seen,) = relay_server.requests
+    assert seen.body == b"first second third" and seen.body_complete
+
+
+# -- transport failures are ArtifactErrors ------------------------------------
+
+
+def _refused_ctx(tmp_path: Path) -> Context:
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    workdir = tmp_path / "work"
+    workdir.mkdir(exist_ok=True)
+    relay = RelayClient(refused_url(), token_file, "req-1", requests.Session())
+    return Context("rw-fixture", "scan", workdir, relay=relay, task="scan")
+
+
+def _write_and_close(ctx: Context):
+    with ctx.artifacts.open("a.txt") as writer:
+        writer.write(b"x" * 10)
+    return writer.ref
+
+
+def _add_path(ctx: Context):
+    path = ctx.workdir / "f.bin"
+    path.write_bytes(b"x" * 10)
+    return ctx.artifacts.add_file(path, "f.bin")
+
+
+def _add_handle(ctx: Context):
+    path = ctx.workdir / "f.bin"
+    path.write_bytes(b"x" * 10)
+    with open(path, "rb") as fh:
+        return ctx.artifacts.add_file(fh, "f.bin")
+
+
+def _from_process(ctx: Context):
+    return ctx.artifacts.from_process([sys.executable, "-c", "print('out')"], "out.txt").ref
+
+
+_WRITE_PATHS = [_write_and_close, _add_path, _add_handle, _from_process]
+
+
+@pytest.mark.parametrize("write", _WRITE_PATHS, ids=lambda f: f.__name__.lstrip("_"))
+def test_a_refused_connection_is_an_artifact_error_from_every_writer(tmp_path, write):
+    """A task that catches ArtifactError must also catch a relay it cannot
+    reach: never a raw requests/urllib3 error."""
+    ctx = _refused_ctx(tmp_path)
+
+    _, error = _run_with_deadline(lambda: write(ctx))
+
+    assert type(error) is ArtifactError, repr(error)
+    assert error.code == "E_ARTIFACT_TRANSPORT"
+    assert isinstance(error.__cause__, requests.ConnectionError)
+
+
+@pytest.mark.parametrize("write", _WRITE_PATHS, ids=lambda f: f.__name__.lstrip("_"))
+def test_a_201_that_is_not_json_is_an_artifact_error_from_every_writer(
+    relay_server, tmp_path, write
+):
+    relay_server.default = Response(201, body=b"stored, thanks")
+    ctx = _ctx(relay_server, tmp_path)
+
+    _, error = _run_with_deadline(lambda: write(ctx))
+
+    assert type(error) is ArtifactError, repr(error)
+    assert error.code == "E_ARTIFACT_TRANSPORT"
+
+
+# -- content type -----------------------------------------------------------
+
+
+def test_content_type_defaults_to_the_declared_one_then_octet_stream(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, *[_created() for _ in range(4)])
+    ctx = _ctx(
+        relay_server,
+        tmp_path,
+        outputs=[
+            OutputDecl(
+                task="scan", name="report.json", artifact=True, contentType="application/json"
+            ),
+            OutputDecl(task="other", name="elsewhere.txt", artifact=True, contentType="text/csv"),
+            OutputDecl(
+                task="scan", name="logs", artifact=True, wildcard=True, contentType="text/x-log"
+            ),
+        ],
+    )
+
+    for name in ("report.json", "elsewhere.txt", "logs/a.log", "unknown.bin"):
+        with ctx.artifacts.open(name) as writer:
+            writer.write(b"x")
+
+    types = [r.header("Content-Type") for r in relay_server.requests]
+    assert types == [
+        "application/json",
+        "application/octet-stream",
+        "text/x-log",
+        "application/octet-stream",
+    ]
+
+
+def test_an_explicit_content_type_wins_over_the_declared_one(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created())
+    ctx = _ctx(
+        relay_server,
+        tmp_path,
+        outputs=[OutputDecl(task="scan", name="r", artifact=True, contentType="application/json")],
+    )
+
+    with ctx.artifacts.open("r", "text/plain") as writer:
+        writer.write(b"x")
+
+    assert relay_server.requests[0].header("Content-Type") == "text/plain"
+
+
+# -- add_file ---------------------------------------------------------------
+
+
+def _file(tmp_path: Path, size: int, name: str = "data.bin") -> tuple[Path, str]:
+    path = tmp_path / name
+    data = bytes(range(251)) * (size // 251 + 1)
+    path.write_bytes(data[:size])
+    return path, hashlib.sha256(data[:size]).hexdigest()
+
+
+def test_add_file_uploads_and_returns_ref(relay_server, tmp_path):
+    path, digest = _file(tmp_path, 3 * MIB + 17)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_file", size=3 * MIB + 17, sha256=digest))
+    ctx = _ctx(relay_server, tmp_path)
+
+    ref = ctx.artifacts.add_file(path, "data.bin", "application/x-test")
+
+    assert ref == ArtifactRef(ref="art_file", size_bytes=3 * MIB + 17, sha256=digest)
+    (seen,) = relay_server.requests
+    assert seen.path == PUT_PREFIX + "data.bin"
+    assert seen.body_sha256 == digest
+    assert seen.body_length == 3 * MIB + 17
+    assert seen.chunked and seen.body_complete
+    assert seen.header("Content-Type") == "application/x-test"
+    assert seen.header("X-RW-Task") == "scan"
+
+
+def test_add_file_accepts_a_str_path_and_an_empty_file(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created())
+    (tmp_path / "empty").write_bytes(b"")
+    ctx = _ctx(relay_server, tmp_path)
+
+    ctx.artifacts.add_file(str(tmp_path / "empty"), "empty")
+
+    (seen,) = relay_server.requests
+    assert seen.body == b"" and seen.body_complete
+
+
+def test_add_file_retries_busy_then_succeeds(relay_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "BUSY_RETRY_DELAY", 0)
+    path, digest = _file(tmp_path, 2 * MIB)
+    busy = Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    relay_server.script("PUT", PUT_PREFIX, busy, busy, _created("art_third", size=2 * MIB))
+    ctx = _ctx(relay_server, tmp_path)
+
+    ref = ctx.artifacts.add_file(path, "data.bin")
+
+    assert ref.ref == "art_third"
+    seen = relay_server.requests
+    assert len(seen) == 3
+    assert [r.body_length for r in seen[:2]] == [0, 0]  # rejected before any body was read
+    # The file was reopened each time: the accepted attempt got every byte.
+    assert (seen[2].body_length, seen[2].body_sha256) == (2 * MIB, digest)
+    assert seen[2].body_complete
+
+
+def test_add_file_waits_between_busy_attempts_and_gives_up_after_four(
+    relay_server, tmp_path, monkeypatch
+):
+    sleeps: list[float] = []
+    monkeypatch.setattr(artifacts, "_sleep", sleeps.append)
+    path, _ = _file(tmp_path, 1000)
+    busy = Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    relay_server.script("PUT", PUT_PREFIX, busy, busy, busy, busy, busy)
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(ArtifactBusyError):
+        ctx.artifacts.add_file(path, "data.bin")
+
+    assert len(relay_server.requests) == 4  # the first try and three retries
+    assert sleeps == [5, 5, 5]  # BUSY_RETRY_DELAY between attempts, none after the last
+
+
+def test_add_file_does_not_retry_other_errors(relay_server, tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "BUSY_RETRY_DELAY", 0)
+    path, _ = _file(tmp_path, 1000)
+    relay_server.script("PUT", PUT_PREFIX, Response(409, json={"code": "E_ARTIFACT_EXISTS"}))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(ArtifactExistsError):
+        ctx.artifacts.add_file(path, "data.bin")
+
+    assert len(relay_server.requests) == 1
+
+
+def test_add_file_uploads_an_open_file_from_its_start_and_leaves_it_open(relay_server, tmp_path):
+    path, digest = _file(tmp_path, 3 * MIB + 5)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_handle", size=3 * MIB + 5, sha256=digest))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with open(path, "rb") as fh:
+        fh.seek(1000)  # wherever it was left
+        ref = ctx.artifacts.add_file(fh, "data.bin", "application/x-test")
+        assert not fh.closed
+
+    assert ref.ref == "art_handle"
+    (seen,) = relay_server.requests
+    assert (seen.body_length, seen.body_sha256) == (3 * MIB + 5, digest)
+
+
+def test_add_file_rereads_an_open_file_from_the_start_on_each_busy_retry(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(artifacts, "BUSY_RETRY_DELAY", 0)
+    path, digest = _file(tmp_path, 2 * MIB)
+    busy = Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    relay_server.script("PUT", PUT_PREFIX, busy, busy, _created("art_third", size=2 * MIB))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with open(path, "rb") as fh:
+        ref = ctx.artifacts.add_file(fh, "data.bin")
+
+    assert ref.ref == "art_third"
+    seen = relay_server.requests
+    assert len(seen) == 3
+    assert (seen[2].body_length, seen[2].body_sha256) == (2 * MIB, digest)
+
+
+def test_add_file_missing_file_fails_before_any_request(relay_server, tmp_path):
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        ctx.artifacts.add_file(tmp_path / "nope", "nope")
+
+    assert relay_server.requests == []
+
+
+@pytest.mark.parametrize("form", ["path", "handle"])
+def test_add_file_memory_stays_bounded(relay_server, tmp_path, form):
+    """32 MiB goes up through add_file -- from a path, and from an open
+    handle, the form the bundle host uploads with -- while tracemalloc (every
+    thread, the fixture's included; it keeps no body this big) stays far
+    below the file size: add_file reads 1 MiB at a time and never holds the
+    file.
+
+    Measured peak: 3.2-3.5 MiB for either form (the 1 MiB read, the HTTP
+    layer's copy of it as a chunk, and its framing). The bound, 8 MiB, is over
+    twice that for allocator noise and library versions, and a quarter of the
+    32 MiB a buffering upload would hold."""
+    total = 32 * MIB
+    path = tmp_path / "big.bin"
+    digest = hashlib.sha256()
+    with open(path, "wb") as out:
+        for piece in PieceStream(total, piece_size=MIB):
+            out.write(piece)
+            digest.update(piece)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_big", size=total))
+    ctx = _ctx(relay_server, tmp_path)
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        if form == "path":
+            ref = ctx.artifacts.add_file(path, "big.bin")
+        else:
+            with open(path, "rb") as fh:
+                ref = ctx.artifacts.add_file(fh, "big.bin")
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    print(f"add_file ({form}) tracemalloc peak for 32 MiB: {peak / MIB:.2f} MiB")
+    assert ref.ref == "art_big"
+    (seen,) = relay_server.requests
+    assert (seen.body_length, seen.body_sha256) == (total, digest.hexdigest())
+    assert seen.body_complete
+    assert peak < 8 * MIB, f"peak {peak / MIB:.1f} MiB for a 32 MiB file"
+
+
+# -- from_process -----------------------------------------------------------
+
+_EMIT = """
+import sys
+out = sys.stdout.buffer
+block = bytes(range(256)) * 4096  # 1 MiB
+for i in range({count}):
+    out.write(block[i:] + block[:i])
+sys.stderr.write("boom\\n")
+sys.exit(3)
+"""
+
+
+def _emitted(count: int) -> tuple[int, str]:
+    """What _EMIT writes to stdout: its length and sha256."""
+    block = bytes(range(256)) * 4096
+    digest = hashlib.sha256()
+    for i in range(count):
+        digest.update(block[i:] + block[:i])
+    return count * len(block), digest.hexdigest()
+
+
+def test_from_process_streams_stdout_and_returns_returncode(relay_server, tmp_path):
+    """A child prints 20 MiB; the server must get exactly that, a non-zero exit
+    still completes the artifact, and the client's memory stays far below the
+    output size.
+
+    The tracemalloc peak counts every thread, the fixture server's included.
+    Measured at 8.3 MiB (the 4 MiB queue, the chunk being sent, the 1 MiB
+    read in hand and its copy, the fixture's 1 MiB retention); the bound has
+    headroom for allocator noise yet is well under the 20 MiB a buffering
+    client would hold."""
+    total, digest = _emitted(20)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_proc", size=total, sha256=digest))
+    ctx = _ctx(relay_server, tmp_path)
+
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        result = ctx.artifacts.from_process(
+            [sys.executable, "-c", _EMIT.format(count=20)], "out.txt"
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert isinstance(result, ProcessArtifact)
+    assert result.returncode == 3
+    assert result.stderr == "boom\n"
+    assert result.ref == ArtifactRef(ref="art_proc", size_bytes=total, sha256=digest)
+    (seen,) = relay_server.requests
+    assert (seen.body_length, seen.body_sha256) == (total, digest)
+    assert seen.body_complete
+    assert seen.header("Content-Type") == "text/plain"  # from_process' default
+    assert peak < 14 * MIB, f"peak {peak / MIB:.1f} MiB for a 20 MiB output"
+
+
+def test_from_process_runs_in_the_workdir_with_the_env_merged_over_the_parent(
+    relay_server, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("RW_TEST_PARENT", "from-parent")
+    relay_server.script("PUT", PUT_PREFIX, _created())
+    ctx = _ctx(relay_server, tmp_path)
+    script = (
+        "import os; print(os.getcwd(), os.environ['RW_TEST_PARENT'], os.environ['RW_TEST_ADDED'])"
+    )
+
+    result = ctx.artifacts.from_process(
+        [sys.executable, "-c", script], "out.txt", env={"RW_TEST_ADDED": "added"}
+    )
+
+    assert result.returncode == 0
+    (seen,) = relay_server.requests
+    assert seen.body.decode().split() == [
+        str(ctx.workdir.resolve()),
+        "from-parent",
+        "added",
+    ]
+
+
+def test_from_process_caps_stderr_and_decodes_it_leniently(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created())
+    ctx = _ctx(relay_server, tmp_path)
+    script = (
+        "import sys; sys.stderr.buffer.write(b'bad:\\xff:' + b'e' * (2 * 1024 * 1024)); print('ok')"
+    )
+
+    result = ctx.artifacts.from_process([sys.executable, "-c", script], "out.txt")
+
+    assert result.returncode == 0
+    assert result.stderr.startswith("bad:�:eee")
+    assert len(result.stderr) <= MIB
+    assert relay_server.requests[0].body == b"ok\n"
+
+
+def test_from_process_timeout_kills_the_group_and_aborts_the_upload(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    ctx = _ctx(relay_server, tmp_path)
+    script = (
+        "import os, subprocess, sys, time\n"
+        "grandchild = subprocess.Popen(['sleep', '60'])\n"
+        "open('pids', 'w').write(f'{os.getpid()} {grandchild.pid}')\n"
+        "sys.stdout.buffer.write(b'p' * (2 << 20))\n"  # whole chunks: the upload is under way
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n"
+    )
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        ctx.artifacts.from_process([sys.executable, "-c", script], "out.txt", timeout=2)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 15
+    assert excinfo.value.timeout == 2
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete  # an abort, not a finished artifact
+    pids = [int(p) for p in (ctx.workdir / "pids").read_text().split()]
+    deadline = time.monotonic() + 5
+    for pid in pids:  # the child (reaped by from_process) and its grandchild
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"process {pid} survived the timeout")
+
+
+def test_from_process_without_a_timeout_runs_until_the_child_exits(
+    relay_server, tmp_path, monkeypatch
+):
+    """`timeout=None` is no SDK-side limit (a multi-GB dump may legitimately
+    take long; the request's own deadline bounds the run), not ctx.run's
+    default: a child outliving that default is not cut short."""
+    monkeypatch.setattr(context_module, "DEFAULT_RUN_TIMEOUT", 0.2)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_slow"))
+    ctx = _ctx(relay_server, tmp_path)
+    script = "import time; time.sleep(0.5); print('done')"
+
+    result = ctx.artifacts.from_process([sys.executable, "-c", script], "out.txt")
+
+    assert result.returncode == 0
+    assert result.ref.ref == "art_slow"
+    (seen,) = relay_server.requests
+    assert seen.body == b"done\n"
+    assert seen.body_complete
+
+
+def test_from_process_sends_a_trickling_childs_bytes_before_it_exits(
+    relay_server, tmp_path, monkeypatch
+):
+    """A child that prints a line, pauses, prints another and then keeps
+    running: its first bytes must reach the runner while it is still running,
+    not when it exits or has written a whole chunk."""
+    monkeypatch.setattr(artifacts, "FLUSH_AFTER_SECONDS", 0.2)
+    relay_server.script("PUT", PUT_PREFIX, _created("art_trickle"))
+    ctx = _ctx(relay_server, tmp_path)
+    script = (
+        "import os, sys, time\n"
+        "print('first', flush=True)\n"
+        "time.sleep(0.5)\n"
+        "print('second', flush=True)\n"
+        "deadline = time.monotonic() + 30\n"
+        "while not os.path.exists('release') and time.monotonic() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        "print('last', flush=True)\n"
+    )
+    box: dict = {}
+
+    def run():
+        box["result"] = ctx.artifacts.from_process([sys.executable, "-c", script], "out.txt")
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        _wait_for(lambda: relay_server.bytes_received >= len(b"first\nsecond\n"))
+        assert thread.is_alive()  # the child is still waiting for its release
+    finally:
+        (ctx.workdir / "release").write_text("")
+        thread.join(20)
+    assert not thread.is_alive(), "from_process did not return"
+
+    assert box["result"].ref.ref == "art_trickle"
+    (seen,) = relay_server.requests
+    assert seen.body == b"first\nsecond\nlast\n" and seen.body_complete
+
+
+_QUIET_CHILD = "import time; time.sleep(60)"
+
+
+def test_from_process_without_a_timeout_stops_at_the_request_deadline(tmp_path):
+    """A packaged task's quiet, hung child must not wedge `rwtask serve`: with
+    no timeout, from_process runs until the request's deadline, which serve
+    hands run_request, and no longer."""
+    scope = tmp_path / "scope"
+    scope.mkdir()
+
+    def run():
+        return run_request(
+            _capability(tmp_path),
+            _request("hang"),
+            credentials={},
+            scope_dir=scope,
+            deadline_seconds=1,
+        )
+
+    started = time.monotonic()
+    result, error = _run_with_deadline(run, seconds=20)
+
+    assert error is None
+    (task_result,) = result.tasks
+    assert task_result.status == "failed"
+    assert "timed out" in task_result.error
+    assert time.monotonic() - started < 15
+    assert not (scope / ".rw-artifacts" / "out").exists()  # an abandoned upload
+
+
+def test_from_process_cuts_an_explicit_timeout_to_what_is_left_of_the_deadline(tmp_path):
+    ctx = _local_ctx(tmp_path)
+    ctx.deadline_at = time.monotonic() + 1
+
+    def run():
+        return ctx.artifacts.from_process(
+            [sys.executable, "-c", _QUIET_CHILD], "out.txt", timeout=60
+        )
+
+    _, error = _run_with_deadline(run, seconds=20)
+
+    assert isinstance(error, subprocess.TimeoutExpired)
+    assert error.timeout <= 1
+
+
+def test_from_process_does_not_start_a_child_once_the_deadline_has_passed(tmp_path):
+    ctx = _local_ctx(tmp_path)
+    ctx.deadline_at = time.monotonic() - 1
+    marker = tmp_path / "started"
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        ctx.artifacts.from_process(
+            [sys.executable, "-c", f"open({str(marker)!r}, 'w')"], "out.txt", timeout=60
+        )
+
+    time.sleep(0.5)
+    assert not marker.exists()
+
+
+def test_from_process_busy_relay_raises_busy_kills_the_child_and_does_not_retry(
+    relay_server, tmp_path, monkeypatch
+):
+    """The runner says busy before it reads a byte and closes; the child is
+    an endless writer that would otherwise run to the timeout."""
+    monkeypatch.setattr(relay_module, "_DRAIN_TOTAL_TIMEOUT", 0.3)  # the runner closes soon
+    relay_server.script(
+        "PUT", PUT_PREFIX, Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    )
+    ctx = _ctx(relay_server, tmp_path)
+    script = (
+        "import os, sys, time\n"
+        "open('pid', 'w').write(str(os.getpid()))\n"
+        "out = sys.stdout.buffer\n"
+        "while True:\n"
+        "    out.write(b'x' * 65536)\n"
+        "    time.sleep(0.001)\n"
+    )
+
+    def run():
+        return ctx.artifacts.from_process([sys.executable, "-c", script], "out.txt", timeout=60)
+
+    started = time.monotonic()
+    _, error = _run_with_deadline(run, seconds=30)
+
+    assert isinstance(error, ArtifactBusyError)
+    assert time.monotonic() - started < 25  # nowhere near the 60 s timeout
+    assert len(relay_server.requests) == 1  # never retried
+    pid = int((ctx.workdir / "pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+def test_from_process_missing_program_raises_and_uploads_nothing(relay_server, tmp_path):
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        ctx.artifacts.from_process(["/nonexistent/program"], "out.txt")
+
+    assert relay_server.requests == []
+
+
+# -- spill ------------------------------------------------------------------
+
+_TASKS = """
+import sys
+from pathlib import Path
+
+from runwhen_capability import setup, task
+
+
+@task(outputs={"blob": "text", "note": "text"})
+def sized(ctx, length):
+    return {"blob": "x" * length, "note": "hi"}
+
+
+@task(outputs={"a": "text", "b": "text"})
+def two_big(ctx, length):
+    return {"a": "a" * length, "b": "b" * length}
+
+
+@task(outputs={"out": "artifact"})
+def hang(ctx):
+    run = ctx.artifacts.from_process([sys.executable, "-c", "import time; time.sleep(60)"], "out")
+    return {"out": run.ref}
+
+
+@task(outputs={"files": "json"})
+def paths(ctx, count):
+    return {"files": [Path(f"/srv/data/{i:06d}") for i in range(count)]}
+
+
+@setup(outputs=[])
+def leaky_setup(ctx):
+    writer = ctx.artifacts.open("from-setup")
+    writer.write(b"x" * (2 * 1024 * 1024))  # in flight; never closed
+
+
+@task(outputs={"note": "text"})
+def leaky(ctx):
+    writer = ctx.artifacts.open("forgotten")
+    writer.write(b"x" * (2 * 1024 * 1024))  # in flight; never closed
+    return {"note": "returned without closing"}
+
+
+@task(outputs={"note": "text"})
+def leaky_then_raise(ctx):
+    writer = ctx.artifacts.open("forgotten")
+    writer.write(b"x" * (2 * 1024 * 1024))
+    raise RuntimeError("failed with the writer open")
+
+
+@task(outputs={"report": "artifact"})
+def publish(ctx):
+    path = ctx.workdir / "report.txt"
+    path.write_text("findings\\n")
+    return {"report": ctx.artifacts.add_file(path, "report")}
+"""
+
+
+def _capability(tmp_path: Path):
+    cap_dir = tmp_path / "cap"
+    cap_dir.mkdir(exist_ok=True)
+    (cap_dir / "manifest.yaml").write_text('capability: rw-artifacts-fixture\nversion: "0.0.0"\n')
+    (cap_dir / "tasks.py").write_text(_TASKS)
+    return load_capability(cap_dir)
+
+
+def _request(task: str, **inputs) -> RequestEnvelope:
+    return RequestEnvelope.model_validate(
+        {"version": 1, "tasks": [{"task": task, "inputs": inputs}]}
+    )
+
+
+def _run(relay_server, tmp_path, request, outputs):
+    scope = tmp_path / "scope"
+    scope.mkdir(exist_ok=True)
+    return run_request(
+        _capability(tmp_path),
+        request,
+        credentials={},
+        scope_dir=scope,
+        relay=_relay(relay_server, tmp_path),
+        outputs=outputs,
+    )
+
+
+def test_spill_auto_moves_large_output_to_artifact(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_spilled", size=300 * 1024 + 2))
+    length = 300 * 1024
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("sized", length=length),
+        [OutputDecl(task="sized", name="blob", spill=True, maxBytes=10 * MIB)],
+    )
+
+    (task_result,) = result.tasks
+    assert task_result.status == "ok"
+    assert task_result.outputs == {"blob": {"$artifact": "art_spilled"}, "note": "hi"}
+    (seen,) = relay_server.requests
+    assert seen.path == PUT_PREFIX + "blob"
+    assert seen.header("Content-Type") == "application/json"
+    assert seen.header("X-RW-Task") == "sized"
+    assert seen.body == json.dumps("x" * length, separators=(",", ":")).encode()
+    assert seen.body_complete
+
+
+def test_spill_threshold_is_on_the_serialised_json_size(relay_server, tmp_path):
+    threshold = artifacts.SPILL_THRESHOLD_BYTES
+    assert threshold == 256 * 1024
+    relay_server.script("PUT", PUT_PREFIX, _created("art_over"))
+    decls = [OutputDecl(task="sized", name="blob", spill=True)]
+
+    # A JSON string is its length plus two quotes: exactly the threshold stays inline...
+    at = _run(relay_server, tmp_path, _request("sized", length=threshold - 2), decls)
+    assert at.tasks[0].outputs["blob"] == "x" * (threshold - 2)
+    assert relay_server.requests == []
+
+    # ...and one byte more spills.
+    over = _run(relay_server, tmp_path, _request("sized", length=threshold - 1), decls)
+    assert over.tasks[0].outputs["blob"] == {"$artifact": "art_over"}
+    assert len(relay_server.requests) == 1
+
+
+def test_spill_serialises_the_value_before_measuring_it(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_paths"))
+    count = 20_000  # 20k Paths of ~17 characters: well past the threshold once serialised
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("paths", count=count),
+        [OutputDecl(task="paths", name="files", spill=True)],
+    )
+
+    assert result.tasks[0].outputs == {"files": {"$artifact": "art_paths"}}
+    (seen,) = relay_server.requests
+    uploaded = json.loads(seen.body.decode())
+    assert uploaded[:2] == ["/srv/data/000000", "/srv/data/000001"]
+    assert len(uploaded) == count
+
+
+def test_spill_never_keeps_inline(relay_server, tmp_path):
+    """Without a spill declaration for the output (none at all, one for another
+    task, one that is not `spill`, or one for another name) a big output stays
+    in the result and nothing is uploaded."""
+    length = 300 * 1024
+    undeclared = [
+        [],
+        [OutputDecl(task="other", name="blob", spill=True)],
+        [OutputDecl(task="sized", name="blob", artifact=True)],
+        [OutputDecl(task="sized", name="elsewhere", spill=True)],
+    ]
+
+    for decls in undeclared:
+        result = _run(relay_server, tmp_path, _request("sized", length=length), decls)
+        assert result.tasks[0].outputs["blob"] == "x" * length
+
+    assert relay_server.requests == []
+
+
+def test_spill_leaves_small_outputs_inline(relay_server, tmp_path):
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("sized", length=1000),
+        [OutputDecl(task="sized", name="blob", spill=True)],
+    )
+
+    assert result.tasks[0].outputs == {"blob": "x" * 1000, "note": "hi"}
+    assert relay_server.requests == []
+
+
+def test_a_failed_spill_upload_fails_the_task(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, Response(409, json={"code": "E_ARTIFACT_EXISTS"}))
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("sized", length=300 * 1024),
+        [OutputDecl(task="sized", name="blob", spill=True)],
+    )
+
+    assert result.tasks[0].status == "failed"
+    assert "E_ARTIFACT_EXISTS" in result.tasks[0].error
+
+
+@pytest.mark.parametrize("code", ["E_ARTIFACTS_DISABLED", "E_ARTIFACTS_UNSUPPORTED"])
+def test_spill_keeps_the_value_inline_when_artifacts_are_unavailable(
+    relay_server, tmp_path, caplog, code
+):
+    """The platform declares spill outputs even while artifacts are switched
+    off (the default), and a runner may have no artifact storage at all. A
+    spill then does what it did before spill existed: the value stays in the
+    result (serve's result cap still applies to it). One line in the log
+    says why, and the relay is not asked again for the task's other spill
+    outputs."""
+    relay_server.default = Response(422, json={"code": code, "message": "artifacts are off"})
+    length = 300 * 1024
+    decls = [OutputDecl(task="two_big", name=n, spill=True) for n in ("a", "b")]
+
+    with caplog.at_level(logging.WARNING):
+        result = _run(relay_server, tmp_path, _request("two_big", length=length), decls)
+
+    (task_result,) = result.tasks
+    assert task_result.status == "ok", task_result.error
+    assert task_result.outputs == {"a": "a" * length, "b": "b" * length}
+    assert len(relay_server.requests) == 1
+    (line,) = [r.getMessage() for r in caplog.records if "spill" in r.getMessage()]
+    assert code in line and "'a'" in line and "'b'" in line
+
+
+def test_spill_retries_a_busy_relay(relay_server, tmp_path, monkeypatch):
+    """A spill's bytes are in memory, so a busy runner (503) is retried, like
+    add_file's, instead of failing the task."""
+    monkeypatch.setattr(artifacts, "_sleep", lambda seconds: None)
+    busy = Response(503, json={"code": "E_ARTIFACT_BUSY"}, read_limit=0)
+    relay_server.script("PUT", PUT_PREFIX, busy, _created("art_spilled"))
+    length = 300 * 1024
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("sized", length=length),
+        [OutputDecl(task="sized", name="blob", spill=True)],
+    )
+
+    (task_result,) = result.tasks
+    assert task_result.status == "ok", task_result.error
+    assert task_result.outputs["blob"] == {"$artifact": "art_spilled"}
+    first, second = relay_server.requests
+    assert first.body_length == 0
+    assert second.body == json.dumps("x" * length, separators=(",", ":")).encode()
+    assert second.body_complete
+
+
+def test_an_artifact_the_task_asked_for_still_fails_when_artifacts_are_unavailable(
+    relay_server, tmp_path
+):
+    relay_server.script(
+        "PUT", PUT_PREFIX, Response(422, json={"code": "E_ARTIFACTS_DISABLED", "message": "off"})
+    )
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("publish"),
+        [OutputDecl(task="publish", name="report", artifact=True)],
+    )
+
+    assert result.tasks[0].status == "failed"
+    assert "E_ARTIFACTS_DISABLED" in result.tasks[0].error
+
+
+def _upload_threads() -> list[threading.Thread]:
+    return [t for t in threading.enumerate() if t.name == "rw-artifact-upload" and t.is_alive()]
+
+
+def test_a_writer_the_task_left_open_is_aborted_when_the_task_returns(relay_server, tmp_path):
+    """A forgotten writer would keep its upload thread (parked on an empty
+    queue), its socket and a few MiB alive for the life of the pod."""
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    before = _upload_threads()
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("leaky"),
+        [OutputDecl(task="leaky", name="forgotten", artifact=True)],
+    )
+
+    assert result.tasks[0].status == "ok"
+    assert [t for t in _upload_threads() if t not in before] == []  # gone, not merely idle
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete  # an abandoned upload, never a finished artifact
+
+
+def test_a_writer_left_open_by_a_task_that_raises_is_aborted_too(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    before = _upload_threads()
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("leaky_then_raise"),
+        [OutputDecl(task="leaky_then_raise", name="forgotten", artifact=True)],
+    )
+
+    assert result.tasks[0].status == "failed"
+    assert "failed with the writer open" in result.tasks[0].error
+    assert [t for t in _upload_threads() if t not in before] == []
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete
+
+
+def test_a_writer_left_open_by_setup_is_aborted(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_should_not_exist"))
+    before = _upload_threads()
+    scope = tmp_path / "scope"
+    scope.mkdir()
+
+    result = run_request(
+        _capability(tmp_path),
+        RequestEnvelope.model_validate({"version": 1, "setup": {"task": "leaky_setup"}}),
+        credentials={},
+        scope_dir=scope,
+        relay=_relay(relay_server, tmp_path),
+        outputs=[OutputDecl(task="leaky_setup", name="from-setup", artifact=True)],
+    )
+
+    assert result.setup.status == "ok"
+    assert [t for t in _upload_threads() if t not in before] == []
+    (seen,) = _wait_for_requests(relay_server, 1)
+    assert not seen.body_complete
+
+
+def test_abort_unclosed_leaves_closed_and_aborted_writers_alone(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_done"))
+    ctx = _ctx(relay_server, tmp_path)
+
+    with ctx.artifacts.open("done.txt") as writer:
+        writer.write(b"x")
+    ctx.artifacts._abort_unclosed()
+
+    assert writer.ref.ref == "art_done"  # a finished artifact stays finished
+    assert len(relay_server.requests) == 1
+
+
+def test_artifact_types_are_exported_for_task_authors():
+    import runwhen_capability
+
+    assert runwhen_capability.ArtifactRef is ArtifactRef
+    assert runwhen_capability.ProcessArtifact is ProcessArtifact
+    assert runwhen_capability.ArtifactWriter is ArtifactWriter  # what open() returns
+    assert {"ArtifactRef", "ProcessArtifact", "ArtifactWriter"} <= set(runwhen_capability.__all__)
+
+
+def test_aborting_unclosed_writers_is_for_the_host_not_the_task_api():
+    assert not hasattr(ArtifactsClient, "abort_unclosed")
+    assert callable(ArtifactsClient._abort_unclosed)
+
+
+def test_a_task_can_return_an_artifact_ref_as_an_output(relay_server, tmp_path):
+    relay_server.script("PUT", PUT_PREFIX, _created("art_report", size=9))
+
+    result = _run(
+        relay_server,
+        tmp_path,
+        _request("publish"),
+        [OutputDecl(task="publish", name="report", artifact=True)],
+    )
+
+    assert result.tasks[0].status == "ok"
+    assert result.tasks[0].outputs == {"report": {"$artifact": "art_report"}}
+    assert relay_server.requests[0].body == b"findings\n"
+
+
+# -- the local sink ---------------------------------------------------------
+
+
+def test_local_sink_used_without_relay(tmp_path):
+    ctx = _local_ctx(tmp_path)
+    digest = hashlib.sha256(b"hello world").hexdigest()
+
+    with ctx.artifacts.open("reports/out.txt", "text/plain") as writer:
+        writer.write(b"hello ")
+        writer.write(b"world")
+
+    assert (ctx.workdir / ".rw-artifacts" / "reports" / "out.txt").read_bytes() == b"hello world"
+    assert writer.ref == ArtifactRef(ref="local_" + digest[:32], size_bytes=11, sha256=digest)
+    assert writer.ref.model_dump(mode="json") == {"$artifact": "local_" + digest[:32]}
+    # Nothing but the artifact is left behind (no partial file).
+    assert [p.name for p in (ctx.workdir / ".rw-artifacts" / "reports").iterdir()] == ["out.txt"]
+
+
+def test_local_sink_add_file_and_from_process(tmp_path):
+    ctx = _local_ctx(tmp_path)
+    path, digest = _file(tmp_path, 2 * MIB + 5)
+
+    file_ref = ctx.artifacts.add_file(path, "copy.bin")
+    proc = ctx.artifacts.from_process(
+        [sys.executable, "-c", "import sys; print('out'); sys.stderr.write('err')"], "proc.txt"
+    )
+
+    root = ctx.workdir / ".rw-artifacts"
+    assert file_ref == ArtifactRef(
+        ref="local_" + digest[:32], size_bytes=2 * MIB + 5, sha256=digest
+    )
+    assert (root / "copy.bin").read_bytes() == path.read_bytes()
+    assert (root / "proc.txt").read_bytes() == b"out\n"
+    assert (proc.returncode, proc.stderr) == (0, "err")
+    assert proc.ref.size_bytes == 4
+
+
+def test_local_sink_abort_leaves_no_file(tmp_path):
+    ctx = _local_ctx(tmp_path)
+
+    with pytest.raises(RuntimeError):
+        with ctx.artifacts.open("a.txt") as writer:
+            writer.write(b"x" * (2 * MIB))
+            raise RuntimeError("half-way")
+
+    assert writer.ref is None
+    root = ctx.workdir / ".rw-artifacts"
+    assert not (root / "a.txt").exists()
+    assert not any(p.is_file() for p in root.rglob("*"))
+
+
+_BAD_NAMES = ["", "/etc/passwd", "../escape", "a/../../escape", "a/..", "./a", "a//b"]
+
+
+def _open_name(ctx: Context, name: str):
+    with ctx.artifacts.open(name) as writer:
+        writer.write(b"x")
+
+
+def _add_file_name(ctx: Context, name: str):
+    path = ctx.workdir / "f.bin"
+    path.write_bytes(b"x")
+    return ctx.artifacts.add_file(path, name)
+
+
+def _from_process_name(ctx: Context, name: str):
+    marker = ctx.workdir / "child-ran"
+    return ctx.artifacts.from_process([sys.executable, "-c", f"open({str(marker)!r}, 'w')"], name)
+
+
+@pytest.mark.parametrize("name", _BAD_NAMES)
+@pytest.mark.parametrize(
+    "write", [_open_name, _add_file_name, _from_process_name], ids=["open", "add_file", "process"]
+)
+def test_relay_mode_refuses_names_that_could_leave_the_request_before_any_request(
+    relay_server, tmp_path, name, write
+):
+    """The HTTP layer normalises dot segments, so `../../other/artifacts/x`
+    would reach another request's artifact route. The relay gets the same
+    rule as the local sink, checked before anything is sent or started."""
+    relay_server.default = _created()
+    ctx = _ctx(relay_server, tmp_path)
+
+    with pytest.raises(ArtifactError) as excinfo:
+        write(ctx, name)
+
+    assert excinfo.value.code == "E_ARTIFACT_PATH"
+    assert relay_server.started == []
+    assert not (ctx.workdir / "child-ran").exists()
+
+
+@pytest.mark.parametrize("name", _BAD_NAMES)
+def test_local_sink_rejects_names_that_could_leave_its_root(tmp_path, name):
+    ctx = _local_ctx(tmp_path)
+
+    with pytest.raises(ArtifactError) as excinfo:
+        with ctx.artifacts.open(name) as writer:
+            writer.write(b"x")
+
+    assert excinfo.value.code == "E_ARTIFACT_PATH"
+    assert not (tmp_path / "escape").exists()
+
+
+def test_local_sink_root_is_a_parameter(tmp_path):
+    ctx = _local_ctx(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    ctx.artifacts = ArtifactsClient(ctx, local_sink=LocalArtifactSink(elsewhere))
+
+    with ctx.artifacts.open("a.txt") as writer:
+        writer.write(b"x")
+
+    assert (elsewhere / "a.txt").read_bytes() == b"x"
+    assert not (ctx.workdir / ".rw-artifacts").exists()
+
+
+def test_spill_works_through_the_local_sink(tmp_path):
+    """No relay but a spill declaration (a test harness, say): the same path."""
+    cap = _capability(tmp_path)
+    (tmp_path / "scope").mkdir()
+
+    result = run_request(
+        cap,
+        _request("sized", length=300 * 1024),
+        credentials={},
+        scope_dir=tmp_path / "scope",
+        outputs=[OutputDecl(task="sized", name="blob", spill=True)],
+    )
+
+    ref = result.tasks[0].outputs["blob"]["$artifact"]
+    assert ref.startswith("local_")
+    stored = (tmp_path / "scope" / ".rw-artifacts" / "blob").read_bytes()
+    assert json.loads(stored) == "x" * (300 * 1024)

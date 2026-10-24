@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import sys
 
+import pytest
+
 from runwhen_capability import Context
+from runwhen_capability.models import InputArtifactDecl, OutputDecl
 
 # Interpreter startup itself may add a variable or two to its OWN environ
 # (e.g. CPython's locale coercion, or a macOS CoreFoundation runtime var) --
@@ -38,3 +41,41 @@ def test_run_default_still_inherits_the_parent_environment(tmp_path, monkeypatch
     )
 
     assert proc.stdout.strip() == "present"
+
+
+def test_storage_put_points_to_artifacts(tmp_path):
+    ctx = Context(capability="rw-checks", operation="test", workdir=tmp_path)
+
+    with pytest.raises(NotImplementedError, match=r"use ctx\.artifacts"):
+        ctx.storage.put("report.txt", b"data")
+
+
+def test_context_artifact_wiring_defaults_to_none(tmp_path):
+    ctx = Context(capability="rw-checks", operation="test", workdir=tmp_path)
+
+    assert ctx.relay is None
+    assert ctx.task is None
+    assert ctx.outputs == []
+    assert ctx.input_artifacts == []
+    assert ctx.artifacts is not None
+
+
+def test_context_carries_the_relay_task_outputs_and_input_artifacts(tmp_path):
+    relay = object()
+    outputs = [OutputDecl(task="scan", name="report.txt", artifact=True)]
+    inputs = [InputArtifactDecl(input="prior", sizeBytes=3, sha256="ab" * 32)]
+
+    ctx = Context(
+        capability="rw-checks",
+        operation="scan",
+        workdir=tmp_path,
+        relay=relay,
+        task="scan",
+        outputs=outputs,
+        input_artifacts=inputs,
+    )
+
+    assert ctx.relay is relay
+    assert ctx.task == "scan"
+    assert ctx.outputs == outputs
+    assert ctx.input_artifacts == inputs

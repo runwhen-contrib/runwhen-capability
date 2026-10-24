@@ -9,6 +9,7 @@ import stat
 import time
 
 import pytest
+import requests
 
 from runwhen_capability.bundle import (
     MAX_SCHEMA_ERROR_CHARS,
@@ -17,7 +18,14 @@ from runwhen_capability.bundle import (
     run_bundle_request,
 )
 from runwhen_capability.custom.hashing import content_hash
-from runwhen_capability.models import Bundle, BundleFile, BundleRequestEnvelope
+from runwhen_capability.models import (
+    Bundle,
+    BundleFile,
+    BundleRequestEnvelope,
+    InputArtifactDecl,
+    OutputDecl,
+)
+from runwhen_capability.relay import RelayClient
 
 _MANIFEST = """\
 apiVersion: runwhen.com/custom-capability/v1
@@ -109,7 +117,13 @@ def test_a_python_task_sees_a_private_home_tmpdir_and_no_host_or_wrapper_env(tmp
     assert task.status == "ok", task
     info = json.loads(task.outputs["o"])
     assert info["hostOnly"] == []
-    assert info["env"] == ["RW_CAPABILITY", "RW_OPERATION", "RW_OUTPUT_FD", "RW_WORKDIR"]
+    assert info["env"] == [
+        "RW_ARTIFACTS_DIR",
+        "RW_CAPABILITY",
+        "RW_OPERATION",
+        "RW_OUTPUT_FD",
+        "RW_WORKDIR",
+    ]
     assert info["home"] == str(tmp_path / ".rw-home")
     assert info["tmpdir"] == str(tmp_path / ".rw-tmp")
     assert info["stdin"] == ""
@@ -118,6 +132,42 @@ def test_a_python_task_sees_a_private_home_tmpdir_and_no_host_or_wrapper_env(tmp
     # the secret file and its directory are gone once the task has finished
     assert not os.path.exists(info["tokenPath"])
     assert not os.path.exists(os.path.dirname(info["tokenPath"]))
+
+
+_PY_RELAY_PROBE = """\
+import json, os
+
+
+def main(ctx):
+    leaked = [
+        key
+        for key, value in os.environ.items()
+        if "relay-secret" in value or "relay-secret" in key
+    ]
+    return {"o": json.dumps({"relay": ctx.relay, "outputs": ctx.outputs, "leaked": leaked})}
+"""
+
+
+def test_the_relay_never_reaches_a_bundle_task(tmp_path, monkeypatch):
+    """The request's relay client and artifact declarations stay in the host:
+    the child gets no environment variable, and its Context has no relay."""
+    token_file = tmp_path / "relay-secret-token"
+    token_file.write_text("relay-secret-value")
+    monkeypatch.setenv("EXECUTOR_TOKEN_FILE", str(token_file))
+    relay = RelayClient("http://relay-secret.invalid", token_file, "req-1", requests.Session())
+
+    result = run_bundle_request(
+        _request(_files("t.py", _PY_RELAY_PROBE)),
+        {},
+        tmp_path / "scope",
+        relay=relay,
+        outputs=[OutputDecl(task="t", name="report.txt", artifact=True)],
+        input_artifacts=[InputArtifactDecl(input="prior", sizeBytes=3, sha256="ab" * 32)],
+    )
+
+    [task] = result.tasks
+    assert task.status == "ok", task
+    assert json.loads(task.outputs["o"]) == {"relay": None, "outputs": [], "leaked": []}
 
 
 def test_a_python_task_only_gets_credentials_its_inputs_declare(tmp_path):
@@ -242,6 +292,7 @@ def test_a_malformed_event_line_fails_the_run_but_keeps_good_outputs(tmp_path, l
     [error] = task.errors
     assert error.startswith("E_OUTPUT_MALFORMED: 1 output line(s)")
     assert "an output was lost" in error
+    assert "rw_set/rw_append/rw_skip/rw_artifact" in error
     assert task.error == error
 
 

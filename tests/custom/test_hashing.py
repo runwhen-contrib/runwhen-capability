@@ -143,3 +143,21 @@ tasks:
     assert task_hash(changed, "a") != task_hash(files, "a")
     # a task that does not reference the edited schema keeps its evidence
     assert task_hash(changed, "b") == task_hash(files, "b")
+
+
+def test_task_files_copes_with_an_artifact_output():
+    files = {
+        "capability.yaml": (
+            "apiVersion: runwhen.com/custom-capability/v1\n"
+            "name: x\n"
+            "tasks:\n"
+            "  - name: t\n"
+            "    file: tasks/t.sh\n"
+            "    outputs:\n"
+            "      dump: { artifact: {} }\n"
+            '      count: { schema: "./schemas/count.json" }\n'
+        ),
+        "tasks/t.sh": "echo hi\n",
+        "schemas/count.json": '{"type": "integer"}',
+    }
+    assert task_files(files, "t") == ["capability.yaml", "schemas/count.json", "tasks/t.sh"]

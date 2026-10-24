@@ -14,6 +14,8 @@ dependencies = [
     "pydantic>=2,<3",
     "PyYAML>=6",
     "requests>=2.31",
+    # An early 413/503 relay response is only readable mid-upload on urllib3 2.x.
+    "urllib3>=2",
     "jsonschema>=4.18",
 ]
 

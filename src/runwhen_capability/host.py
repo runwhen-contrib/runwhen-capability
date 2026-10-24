@@ -23,16 +23,28 @@ See _load_setup_cache/_save_setup_cache below.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
+import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from .artifacts import SPILL_THRESHOLD_BYTES, spill_json
 from .context import Context
-from .errors import CredentialNotFoundError, SkipTask, UnknownTaskError
+from .errors import ArtifactsUnavailableError, CredentialNotFoundError, SkipTask, UnknownTaskError
 from .loader import LoadedCapability
-from .models import RequestEnvelope, ResultEnvelope, SetupResult, TaskResult
+from .models import (
+    InputArtifactDecl,
+    OutputDecl,
+    RequestEnvelope,
+    ResultEnvelope,
+    SetupResult,
+    TaskResult,
+)
+from .relay import RelayClient
 from .repo_fs import TreeNotMaterializedError
 
 _PLACEHOLDER_RE = re.compile(r"^\$\{setup\.(\w+)\}$")
@@ -79,6 +91,59 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_jsonable(v) for v in value]
     return value
+
+
+def _spill_large_outputs(ctx: Context, returned: Any) -> Any:
+    """Moves a task's large `spill: auto` outputs into artifacts: for each
+    declared spill output of this task that the task returned, the value is
+    converted with `_to_jsonable` and serialised exactly as the result would
+    carry it (`spill_json`); when that is more than SPILL_THRESHOLD_BYTES it is
+    uploaded as an `application/json` artifact and the output becomes its
+    ArtifactRef (which `_to_jsonable` later turns into `{"$artifact": ...}`).
+    Smaller values stay inline. A copy is returned when anything spilled; the
+    task's own dict is never modified.
+
+    The bytes are uploaded from memory with `add_file`, so a busy runner
+    (503) is retried. The platform declares spill outputs even where
+    artifacts are switched off or the runner has no storage for them
+    (`ArtifactsUnavailableError`): then the value stays inline, as it did
+    before spill existed (serve's result cap still applies to it), one log
+    line says so, and the task's other spill outputs are not tried. Any other
+    upload error propagates and fails the task like any other task error."""
+    if not isinstance(returned, dict):
+        return returned
+    spilled: dict[str, Any] | None = None
+    unavailable: ArtifactsUnavailableError | None = None
+    kept: list[str] = []
+    for decl in ctx.outputs:
+        if not decl.spill or decl.task != ctx.task or decl.name not in returned:
+            continue
+        try:
+            data = spill_json(_to_jsonable(returned[decl.name]))
+        except (TypeError, ValueError):
+            # Not JSON: left in place, to fail where it always has (the
+            # result's own encoding) rather than as a spill error.
+            continue
+        if len(data) <= SPILL_THRESHOLD_BYTES:
+            continue
+        if unavailable is None:
+            try:
+                ref = ctx.artifacts.add_file(io.BytesIO(data), decl.name, "application/json")
+            except ArtifactsUnavailableError as exc:
+                unavailable = exc
+        if unavailable is not None:
+            kept.append(decl.name)
+            continue
+        if spilled is None:
+            spilled = dict(returned)
+        spilled[decl.name] = ref
+    if unavailable is not None:
+        ctx.log.warning(
+            "spill unavailable (%s): output(s) %s kept inline",
+            unavailable,
+            ", ".join(repr(name) for name in kept),
+        )
+    return returned if spilled is None else spilled
 
 
 def _setup_cache_path(scope_dir: Path) -> Path:
@@ -159,10 +224,25 @@ def run_request(
     scope_dir: Path,
     log: logging.Logger | None = None,
     allow_anonymous_credentials: bool = False,
+    *,
+    relay: RelayClient | None = None,
+    outputs: Sequence[OutputDecl] = (),
+    input_artifacts: Sequence[InputArtifactDecl] = (),
+    artifact_cache_dir: Path | None = None,
+    deadline_seconds: float | None = None,
 ) -> ResultEnvelope:
+    """`relay`, `outputs` and `input_artifacts` are the request's artifact
+    wiring (see serve.py): handed to every Context built here, so setup and
+    each task can reach `ctx.artifacts`. `artifact_cache_dir` is where input
+    artifacts are cached across requests (outside `scope_dir`, which may be
+    wiped). `deadline_seconds` is the request's deadline, counted from this
+    call: every Context records it (`Context.deadline_at`), and what a task
+    runs through `ctx.artifacts.from_process` stops there. All unset for
+    `rwtask run`."""
     log = log or logging.getLogger("runwhen_capability.host")
     result = ResultEnvelope()
     setup_outputs: dict[str, Any] = {}
+    deadline_at = None if deadline_seconds is None else time.monotonic() + deadline_seconds
 
     if request.setup is not None:
         setup_def = capability.registry.setups.get(request.setup.task)
@@ -188,14 +268,20 @@ def run_request(
                     credentials=credentials,
                     log=log.getChild(request.setup.task),
                     allow_anonymous_credentials=allow_anonymous_credentials,
+                    relay=relay,
+                    task=request.setup.task,
+                    outputs=outputs,
+                    input_artifacts=input_artifacts,
+                    artifact_cache_dir=artifact_cache_dir,
+                    deadline_at=deadline_at,
                 )
                 try:
                     kwargs = _kwargs_from_inputs(request.setup.inputs)
-                    outputs = setup_def.func(ctx, **kwargs) or {}
-                    setup_outputs = outputs
-                    result.setup = SetupResult(status="ok", outputs=_to_jsonable(outputs))
+                    returned = setup_def.func(ctx, **kwargs) or {}
+                    setup_outputs = returned
+                    result.setup = SetupResult(status="ok", outputs=_to_jsonable(returned))
                     _save_setup_cache(
-                        scope_dir, request.setup.task, request.setup.inputs, outputs, log
+                        scope_dir, request.setup.task, request.setup.inputs, returned, log
                     )
                 except CredentialNotFoundError as exc:
                     # Not cached, and can't materialise here without a
@@ -219,6 +305,8 @@ def run_request(
                 except Exception as exc:  # noqa: BLE001 -- a task's own bug must not crash the host
                     log.exception("setup %r failed", request.setup.task)
                     result.setup = SetupResult(status="failed", error=str(exc))
+                finally:
+                    ctx.artifacts._abort_unclosed()
 
     for task_spec in request.tasks:
         task_def = capability.registry.tasks.get(task_spec.task)
@@ -237,13 +325,19 @@ def run_request(
             credentials=credentials,
             log=log.getChild(task_spec.task),
             allow_anonymous_credentials=allow_anonymous_credentials,
+            relay=relay,
+            task=task_spec.task,
+            outputs=outputs,
+            input_artifacts=input_artifacts,
+            artifact_cache_dir=artifact_cache_dir,
+            deadline_at=deadline_at,
         )
         try:
             resolved_inputs = _resolve_placeholders(task_spec.inputs, setup_outputs)
             kwargs = _kwargs_from_inputs(resolved_inputs)
-            outputs = task_def.func(ctx, **kwargs) or {}
+            returned = _spill_large_outputs(ctx, task_def.func(ctx, **kwargs) or {})
             result.tasks.append(
-                TaskResult(task=task_spec.task, status="ok", outputs=_to_jsonable(outputs))
+                TaskResult(task=task_spec.task, status="ok", outputs=_to_jsonable(returned))
             )
         except SkipTask as exc:
             reason = str(exc.args[0]) if exc.args else ""
@@ -274,5 +368,7 @@ def run_request(
         except Exception as exc:  # noqa: BLE001 -- one task failing must not lose the others
             log.exception("task %r failed", task_spec.task)
             result.tasks.append(TaskResult(task=task_spec.task, status="failed", error=str(exc)))
+        finally:
+            ctx.artifacts._abort_unclosed()
 
     return result

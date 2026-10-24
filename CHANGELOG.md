@@ -3,6 +3,69 @@
 This project follows [Semantic Versioning](https://semver.org/). Releases are git tags `v<version>`
 with the wheel and sdist attached to the GitHub Release.
 
+## 0.4.0
+
+### Added
+
+- `ctx.artifacts`, for outputs too big or too binary to travel in the result. Each artifact is its
+  own streamed upload to the runner, so memory stays bounded however large it is; a task returns the
+  `ArtifactRef`, which serialises as `{"$artifact": "<ref>"}`.
+  - `open(name, content_type=None)`: a writer context manager; `.ref` is the `ArtifactRef` after the
+    block. Leaving the block on an exception stores nothing.
+  - `add_file(path_or_open_file, name, content_type=None)`: uploads a file; retries a busy runner
+    (503) three times.
+  - `from_process(argv, name, ...)` -> `ProcessArtifact(ref, returncode, stderr)`: streams a
+    process's stdout as the artifact. `timeout=None` runs until the request's deadline (no limit
+    under `rwtask run`).
+  - `ArtifactRef`, `ArtifactWriter` and `ProcessArtifact` are exported from `runwhen_capability`.
+- Artifact inputs: `ctx.artifacts.input(name)` (a stream) and `ctx.artifacts.input_path(name)` (a
+  sha256-verified local copy). Copies live in `.rw-artifact-cache/` under the executor's workdir,
+  are shared by later requests, and the cache is LRU-bounded by `RW_ARTIFACT_CACHE_MAX_BYTES`
+  (default 1 GiB). The files are read-only and stay available for the rest of the task.
+- Local mode (`rwtask run`, no relay): outputs are written to `<workdir>/.rw-artifacts/<name>` with
+  `local_...` refs, and inputs are read from `<workdir>/.rw-artifacts/inputs/<name>`.
+- Spill: an output the platform declares spillable, whose JSON is larger than 256 KiB, is stored as
+  an `application/json` artifact and replaced by its ref. Where the platform has artifacts switched
+  off or unsupported, the output stays inline as before.
+- Custom bundles:
+  - `artifact:` outputs in `capability.yaml`: `contentType`, and `maxSize` (a quantity such as
+    `2Gi`, or a plain byte count). Each output has exactly one of `schema` or `artifact`; an
+    artifact output's name is a single segment.
+  - Bash: `rw_artifact <name> <path|->` and `$RW_ARTIFACTS_DIR`. Python bundle tasks can use
+    `ctx.artifacts`.
+  - The host uploads after the script exits, only for a task that otherwise succeeded, and only
+    regular files inside the request's scope (`E_ARTIFACT_PATH` otherwise).
+  - `validate` knows `rw_artifact` and `RW_ARTIFACTS_DIR`, and flags an undeclared artifact name.
+- `maxResultBytes`, `outputs` and `inputArtifacts` on the task-host request (`TaskHostRequest`).
+- Errors in `runwhen_capability.errors`: `ArtifactError` (with `.code`) and its subclasses
+  `ArtifactTooLargeError`, `ArtifactUndeclaredError`, `ArtifactExistsError`, `ArtifactQuotaError`,
+  `ArtifactLeaseLostError`, `ArtifactBusyError` and `ArtifactsUnavailableError`; and
+  `ResultTooLargeError`. A failure to talk to the relay raises `ArtifactError` with code
+  `E_ARTIFACT_TRANSPORT`. The SDK itself raises `ArtifactError` with `E_ARTIFACT_RESPONSE` (an
+  unexpected relay answer), `E_ARTIFACT_PATH` (a bad artifact name), `E_ARTIFACT_CORRUPT` (a
+  digest mismatch), `E_ARTIFACT_ABORTED` and `E_ARTIFACT_ENDED` (a writer that was aborted or whose
+  upload ended early). A bundle upload that fails with a transport error or an unrecognised status
+  reports `E_ARTIFACT_UPLOAD`.
+
+### Changed
+
+- **Behaviour change:** a result larger than the request's `maxResultBytes` is replaced by a small
+  failed result (`E_RESULT_TOO_LARGE: ... write large data with ctx.artifacts`). There is no limit
+  when the runner sends none.
+- `ctx.storage.put()` still raises `NotImplementedError`; the message is now `use ctx.artifacts`.
+- `urllib3>=2` is a required dependency.
+- **Behaviour change:** bundle scopes reserve `artifacts/` (emptied before every task), and
+  `rwtask run --local --workdir DIR` refuses a non-empty `DIR/artifacts/` it did not create.
+- **Behaviour change:** bundle output size caps are measured on compact JSON, so slightly more now
+  fits inline.
+- **Behaviour change:** when the platform declares spill, a large bundle output is stored as an
+  artifact instead of being truncated or failing with `E_OUTPUT_TOO_LARGE`.
+- **Behaviour change:** `rwtask serve` refuses the scopeId `.rw-artifact-cache`, the directory its
+  input-artifact cache uses.
+- **Behaviour change:** the result is posted as compact JSON with a timeout that grows with its
+  size, and a result that is not valid JSON (`NaN`, `Infinity`) is reported as a failed result
+  instead of being dropped.
+
 ## 0.3.0
 
 ### Fixed
