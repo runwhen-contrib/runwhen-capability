@@ -38,6 +38,11 @@ Semantic (errors unless noted)
   qualified parent of the extended platform.
 - E_FACET_SCHEMA_MISSING / E_AUTH_SCRIPT_MISSING -- a facet `schema` or an auth
   method `script` is not a file under integration/.
+- E_SCHEMA_FILE_INVALID -- a schema file an output, an object input or a facet
+  refers to is not a JSON object. E_INPUT_SCHEMA_MISSING -- an object input's
+  `./schemas/...` file is absent. A non-`./` string `schema` is compact notation
+  (E_SCHEMA_NOTATION when it does not compile).
+- E_SKILL_BODY_TOO_LONG -- a SKILL.md body is over 500 lines.
 - E_RULE_BUDGET -- more than 10 rules, or a rule body over 80 words (whitespace-
   separated tokens).
 """
@@ -77,10 +82,14 @@ E_TYPE_CHAIN = "E_TYPE_CHAIN"
 E_FACET_SCHEMA_MISSING = "E_FACET_SCHEMA_MISSING"
 E_AUTH_SCRIPT_MISSING = "E_AUTH_SCRIPT_MISSING"
 E_RULE_BUDGET = "E_RULE_BUDGET"
+E_SCHEMA_FILE_INVALID = "E_SCHEMA_FILE_INVALID"
+E_INPUT_SCHEMA_MISSING = "E_INPUT_SCHEMA_MISSING"
+E_SKILL_BODY_TOO_LONG = "E_SKILL_BODY_TOO_LONG"
 E_TASK_NAME_DUPLICATE = "E_TASK_NAME_DUPLICATE"
 
 MAX_RULES = 10
 MAX_RULE_WORDS = 80
+MAX_SKILL_BODY_LINES = 500
 
 _OUTPUT_SCHEMA_FILE = re.compile(r"schemas/[^/]+\.v[0-9]+\.json")
 _DEFAULT_INTEGRATION_FILE = "integration/integration.yaml"
@@ -292,13 +301,19 @@ class _Validator:
         file = self.key_file("facets")
         for i, facet in enumerate(_sequence(self.integration.get("facets"))):
             ref = _mapping(facet).get("schema")
-            if isinstance(ref, str) and self.integration_path(ref) not in self.tree.files:
+            if not isinstance(ref, str):
+                continue
+            where = _pointer("facets", i, "schema")
+            path = self.integration_path(ref)
+            if path not in self.tree.files:
                 self.add(
                     E_FACET_SCHEMA_MISSING,
                     file,
-                    _pointer("facets", i, "schema"),
+                    where,
                     f"facet schema {ref!r} is not a file under integration/",
                 )
+            else:
+                self.check_json_object(file, where, path)
 
     def check_auth_scripts(self) -> None:
         file = self.key_file("authMethods")
@@ -311,6 +326,14 @@ class _Validator:
                     _pointer("authMethods", name, "script"),
                     f"auth script {ref!r} is not a file under integration/",
                 )
+
+    def check_json_object(self, file: str, where: str, path: str) -> None:
+        try:
+            ok = isinstance(json.loads(self.tree.files[path].decode("utf-8")), dict)
+        except ValueError:
+            ok = False
+        if not ok:
+            self.add(E_SCHEMA_FILE_INVALID, file, where, f"{path} is not a JSON object")
 
     @staticmethod
     def integration_path(ref: str) -> str | None:
@@ -384,6 +407,14 @@ class _Validator:
                 )
             applies = _mapping(_mapping(skill.frontmatter.get("runwhen")).get("appliesTo"))
             self.check_types(md, "/runwhen/appliesTo/types", applies.get("types"))
+            lines = len(skill.body.splitlines())
+            if lines > MAX_SKILL_BODY_LINES:
+                self.add(
+                    E_SKILL_BODY_TOO_LONG,
+                    md,
+                    None,
+                    f"SKILL.md body is {lines} lines; the limit is {MAX_SKILL_BODY_LINES}",
+                )
         if skill.tasks is not None:
             self.check_tasks(name, skill)
 
@@ -449,6 +480,7 @@ class _Validator:
                 seen_names.add(name)
             self.check_script(skill_name, skill, file, i, task)
             self.check_outputs(skill_name, skill, file, i, task)
+            self.check_inputs(skill_name, skill, file, i, task)
             ref = f"{skill_name}/{name}" if isinstance(name, str) else None
             credentials = self.check_credentials(file, i, task, defaults, ref)
             self.check_permissions(file, i, task, credentials)
@@ -488,6 +520,34 @@ class _Validator:
                         where,
                         f"output schema {value!r} is not a file of skill {skill_name!r}",
                     )
+                else:
+                    self.check_json_object(file, where, f"skills/{skill_name}/{resolved}")
+            else:
+                try:
+                    compile_schema_notation(value)
+                except SchemaNotationError as exc:
+                    self.add(
+                        E_SCHEMA_NOTATION, file, where, f"compact schema does not compile: {exc}"
+                    )
+
+    def check_inputs(self, skill_name, skill, file, i, task) -> None:
+        """An object input's `schema`: a `./schemas/...` file or compact notation."""
+        for in_name, spec in _mapping(task.get("inputs")).items():
+            value = _mapping(spec).get("schema")
+            if not isinstance(value, str):
+                continue
+            where = _pointer("tasks", i, "inputs", in_name, "schema")
+            if value.startswith("./"):
+                resolved = _resolve("", value)
+                if resolved is None or resolved not in skill.files:
+                    self.add(
+                        E_INPUT_SCHEMA_MISSING,
+                        file,
+                        where,
+                        f"input schema {value!r} is not a file of skill {skill_name!r}",
+                    )
+                else:
+                    self.check_json_object(file, where, f"skills/{skill_name}/{resolved}")
             else:
                 try:
                     compile_schema_notation(value)

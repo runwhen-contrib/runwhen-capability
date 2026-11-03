@@ -10,6 +10,7 @@
     rwtask test <dir> [--task NAME]
     rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
     rwtask validate <dir>
+    rwtask compile <plugin-dir> [--out DIR]
 
 See serve.py, run_local.py, label.py, schemas.py, gitops.py and port/.
 """
@@ -276,6 +277,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "(has SKILL.md); prints file:path: CODE message, exit 1 on any error",
     )
     validate_p.add_argument("dir", help="plugin directory, or a skill directory")
+
+    compile_p = sub.add_parser(
+        "compile",
+        help="validate a V13 plugin directory, then write <out>/<name>-<version>.tar and "
+        ".compiled.json and print the archive's sha256",
+    )
+    compile_p.add_argument("dir", help="plugin directory (has plugin.yaml)")
+    compile_p.add_argument(
+        "--out", default="dist", help="directory to write the archive and compiled.json into"
+    )
 
     return parser
 
@@ -659,6 +670,37 @@ def main(argv: list[str] | None = None) -> int:
         warnings = len(diagnostics) - errors
         print(f"rwtask validate: {errors} error(s), {warnings} warning(s)", file=sys.stderr)
         return 1 if errors else 0
+
+    if args.command == "compile":
+        from .contracts import TreeEntry, archive
+        from .plugin import compile_tree, load_dir, validate_tree
+
+        directory = Path(args.dir)
+        if not (directory / "plugin.yaml").is_file():
+            print(f"rwtask compile: {directory} has no plugin.yaml", file=sys.stderr)
+            return 1
+        tree = load_dir(directory)
+        diagnostics = validate_tree(tree)
+        for diag in diagnostics:
+            print(_format_plugin_diagnostic(diag))
+        if any(d.severity == "error" for d in diagnostics):
+            return 1
+        compiled = compile_tree(tree)
+        try:
+            tar = archive.build(
+                TreeEntry(path, data, path in tree.executable) for path, data in tree.files.items()
+            )
+        except archive.ArchiveError as exc:
+            print(f"rwtask compile: {exc}", file=sys.stderr)
+            return 1
+        stem = f"{tree.plugin['name']}-{tree.plugin['version']}"
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{stem}.tar").write_bytes(tar)
+        text = json.dumps(compiled, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        (out / f"{stem}.compiled.json").write_bytes(text.encode("utf-8"))
+        print(archive.archive_sha256(tar))
+        return 0
 
     parser.error(f"unknown command {args.command!r}")
     return 2

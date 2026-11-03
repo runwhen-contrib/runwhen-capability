@@ -5,7 +5,8 @@
         print(d.file, d.path, d.code, d.message)
 
 `load_*` never raise for a content problem (see tree.py); `validate_*` return
-every `Diagnostic` (validate.py). `PluginInvalid` is what the library entry points
+every `Diagnostic` (validate.py); `compile_*` produce the compiled-plugin document
+(compile.py). `PluginInvalid` is what the library entry points
 that need a valid plugin raise.
 """
 
@@ -27,6 +28,7 @@ class PluginInvalid(ValueError):
         )
 
 
+from .compile import compile_entries, compile_tree  # noqa: E402
 from .tree import PluginTree, SkillTree, load_dir, load_entries, load_skill_dir  # noqa: E402
 from .validate import validate_entries, validate_tree  # noqa: E402
 
@@ -34,6 +36,8 @@ __all__ = [
     "PluginInvalid",
     "PluginTree",
     "SkillTree",
+    "compile_entries",
+    "compile_tree",
     "load_dir",
     "load_entries",
     "load_skill_dir",

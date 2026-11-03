@@ -458,3 +458,37 @@ def test_plugin_invalid_carries_the_error_diagnostics_only():
     assert isinstance(exc, ValueError)
     assert [d.code for d in exc.diagnostics] == ["E_UNKNOWN_PLATFORM"]
     assert "E_UNKNOWN_PLATFORM" in str(exc)
+
+
+def test_skill_body_is_at_most_500_lines():
+    body = "line\n" * 499
+    entries = edit(kube_entries(), HEALTH_SKILL, "`rollout-status` first.", body)
+    assert not found(entries, "E_SKILL_BODY_TOO_LONG")
+    entries = edit(kube_entries(), HEALTH_SKILL, "`rollout-status` first.", body + "one more\n")
+    d = only(entries, "E_SKILL_BODY_TOO_LONG")
+    assert d.file == HEALTH_SKILL and "501" in d.message
+
+
+def test_object_input_schema_file_must_exist_and_be_json():
+    inputs = "      v: { type: object, schema: ./schemas/filter.v1.json }\n"
+    since = "      since: { type: duration, default: 30m, description: Look-back window }\n"
+    entries = edit(kube_entries(), HEALTH_TASKS, since, inputs)
+    d = only(entries, "E_INPUT_SCHEMA_MISSING")
+    assert (d.file, d.path) == (HEALTH_TASKS, "/tasks/0/inputs/v/schema")
+    ok = put(entries, "skills/k8s-workload-health/schemas/filter.v1.json", "{}")
+    assert validate_entries(ok) == []
+    bad = put(entries, "skills/k8s-workload-health/schemas/filter.v1.json", "[1]")
+    assert only(bad, "E_SCHEMA_FILE_INVALID").path == "/tasks/0/inputs/v/schema"
+    compact = edit(
+        kube_entries(), HEALTH_TASKS, since, "      v: { type: object, schema: '{ x: nope' }\n"
+    )
+    assert only(compact, "E_SCHEMA_NOTATION").path == "/tasks/0/inputs/v/schema"
+
+
+def test_schema_files_must_be_json_objects():
+    entries = put(kube_entries(), "skills/k8s-workload-health/schemas/rollout.v1.json", "{nope")
+    d = only(entries, "E_SCHEMA_FILE_INVALID")
+    assert d.path == "/tasks/0/outputs/rollout/schema"
+    entries = put(kube_entries(), "integration/facets.yaml", FACETS)
+    entries = put(entries, "integration/schemas/replicas.v1.json", "42")
+    assert only(entries, "E_SCHEMA_FILE_INVALID").path == "/facets/0/schema"
