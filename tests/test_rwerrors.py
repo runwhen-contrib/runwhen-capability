@@ -69,8 +69,18 @@ def test_rw_command_error_validates_its_code_too():
 
 KUBECTL = ["kubectl", "get", "pods"]
 
+_EXEC_MISSING_BINARY = (
+    "error: Internal error occurred: error executing command in container: "
+    'failed to exec in container: failed to start exec "4b1c": OCI runtime exec failed: '
+    "exec failed: unable to start container process: "
+    'exec: "df": executable file not found in $PATH: unknown'
+)
+
 # One real-looking sample per rule, plus the precedence and fall-through cases.
 _CASES = [
+    # dependency: a binary missing inside `kubectl exec` (kubectl returns 1 or 126)
+    (["kubectl", "exec", "pvc-pod", "--", "df"], 1, _EXEC_MISSING_BINARY, "dependency"),
+    (["kubectl", "exec", "pvc-pod", "--", "df"], 126, _EXEC_MISSING_BINARY, "dependency"),
     # permission_denied
     (
         ["kubectl", "get", "pods", "-n", "kube-system"],
@@ -375,6 +385,25 @@ def test_matching_is_case_insensitive():
 def test_command_not_found_is_a_dependency_not_a_missing_resource():
     assert classify_command_error(["x"], 1, "sh: x: command not found") == "dependency"
     assert classify_command_error(["x"], 1, "x: Command Not Found") == "dependency"
+
+
+def test_exec_missing_binary_is_a_dependency_by_either_wording():
+    runtime = 'OCI runtime exec failed: exec: "df": executable file not found in $PATH'
+    assert classify_command_error(["x"], 1, runtime.upper()) == "dependency"
+    assert (
+        classify_command_error(
+            ["x"], 126, "failed to exec in container: fork/exec /bin/x: no such file or directory"
+        )
+        == "dependency"
+    )
+
+
+def test_a_plain_missing_file_is_not_taken_for_a_missing_binary():
+    # No "failed to exec": an ordinary command naming a missing path stays out of the new rule.
+    assert (
+        classify_command_error(["cat", "/data/x"], 1, "cat: /data/x: No such file or directory")
+        != "dependency"
+    )
 
 
 def test_not_found_at_returncode_127_is_a_missing_binary():

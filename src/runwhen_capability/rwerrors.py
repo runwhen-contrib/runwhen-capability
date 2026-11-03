@@ -100,8 +100,9 @@ _RATE_LIMITED = re.compile(r"\b429\b|too many requests|rate limit|throttling")
 def classify_command_error(argv: Sequence[str], returncode: int, stderr: str) -> str:
     """The error code for a failed command, from its stderr and exit status.
     First match wins, in this order: permission_denied, dependency (a
-    missing resource type), not_found, unreachable, timeout, rate_limited,
-    storage, dependency (a missing binary), else internal.
+    missing resource type, or a missing binary inside `kubectl exec`),
+    not_found, unreachable, timeout, rate_limited, storage, dependency (a
+    missing binary), else internal.
     Matching is case-insensitive. `argv` is accepted so a later rule can be
     tool-specific; no rule reads it today.
 
@@ -122,6 +123,12 @@ def classify_command_error(argv: Sequence[str], returncode: int, stderr: str) ->
     # A missing CRD or API (metrics.k8s.io): the tool works, the cluster lacks
     # what the task needs. Checked before not_found, whose wording it may share.
     if "doesn't have a resource type" in text:
+        return "dependency"
+    # A binary missing inside the container of `kubectl exec` (the runtime's
+    # wording; kubectl exits 1 or 126): a missing dependency whatever the status.
+    if "executable file not found" in text or (
+        "failed to exec" in text and "no such file or directory" in text
+    ):
         return "dependency"
     if returncode != 127 and (
         "notfound" in text or "not found" in text.replace("command not found", "")
