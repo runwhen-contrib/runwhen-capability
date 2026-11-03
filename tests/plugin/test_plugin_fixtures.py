@@ -370,3 +370,239 @@ def test_execute_only_takes_absolute_path_dirs_and_shim_names(tmp_path):
         _run_nothing(tmp_path, extra_env={"RW_SHIM_MODE": "replay"})
     with pytest.raises(ValueError, match="extra_env may not set"):
         _run_nothing(tmp_path, extra_env={"PATH": "/x"})
+
+
+# -- $contains / $containsWhere -------------------------------------------------------------
+
+ROWS = [{"name": "a", "n": 1, "tags": ["x"]}, {"name": "b", "n": 2, "tags": []}, 7, "s"]
+
+
+@pytest.mark.parametrize(
+    ("expected", "ok"),
+    [
+        # $contains: each item subset-matches some element, in any order
+        ({"$contains": [{"name": "b"}, {"name": "a"}]}, True),
+        ({"$contains": [{"name": "a"}, {"name": "a", "n": 1}]}, True),  # same element twice
+        ({"$contains": [{"name": "a"}, {"name": "zzz"}]}, False),
+        ({"$contains": [7, "s"]}, True),  # scalars whole
+        ({"$contains": [8]}, False),
+        ({"$contains": [{"tags": ["x"]}]}, True),  # a list inside an item is compared whole
+        ({"$contains": [{"tags": []}]}, True),
+        ({"$contains": [{"tags": ["y"]}]}, False),
+        ({"$contains": []}, True),
+        ({"$contains": [True]}, False),  # a bool is not the int 1/7
+        ({"$contains": [{"name": "a", "n": 2}]}, False),
+        # $containsWhere: some dict element subset-matches
+        ({"$containsWhere": {"name": "b"}}, True),
+        ({"$containsWhere": {"name": "b", "n": 2}}, True),
+        ({"$containsWhere": {"name": "b", "n": 1}}, False),  # one element must match all
+        ({"$containsWhere": {"name": "nope"}}, False),
+        ({"$containsWhere": {"tags": []}}, True),
+        # both on one dict: a conjunction
+        ({"$contains": [7], "$containsWhere": {"name": "a"}}, True),
+        ({"$contains": [7], "$containsWhere": {"name": "zzz"}}, False),
+    ],
+)
+def test_list_matchers(expected, ok):
+    problems = match_expect(
+        envelope(outputs={"rows": ROWS}), {"status": "ok", "outputs": {"rows": expected}}
+    )
+    assert (problems == []) is ok, problems
+
+
+def test_matcher_failure_lines_name_the_path_matcher_and_first_missing_item():
+    got = envelope(outputs={"a": {"rows": ROWS}})
+    problems = match_expect(
+        got,
+        {
+            "status": "ok",
+            "outputs": {"a": {"rows": {"$contains": [{"name": "a"}, {"name": "q"}, 9]}}},
+        },
+    )
+    assert problems == ["outputs.a.rows: $contains: no element matches {'name': 'q'}"]
+    problems = match_expect(
+        got, {"status": "ok", "outputs": {"a": {"rows": {"$containsWhere": {"name": "q"}}}}}
+    )
+    assert problems == ["outputs.a.rows: $containsWhere: no element matches {'name': 'q'}"]
+
+
+def test_matchers_need_a_list_to_look_in():
+    got = envelope(outputs={"x": {"a": 1}, "s": "text"})
+    problems = match_expect(
+        got,
+        {
+            "status": "ok",
+            "outputs": {"x": {"$contains": [1]}, "s": {"$containsWhere": {"a": 1}}},
+        },
+    )
+    assert problems == [
+        "outputs.x: $contains: expected a list, got {'a': 1}",
+        "outputs.s: $containsWhere: expected a list, got 'text'",
+    ]
+    assert match_expect(envelope(), {"status": "ok", "outputs": {"gone": {"$contains": [1]}}}) == [
+        "outputs.gone: missing"
+    ]
+
+
+def test_matchers_nest_at_any_depth_and_inside_items():
+    got = envelope(
+        outputs={"a": {"b": {"c": [{"k": [1, 2], "inner": [{"z": 1, "y": 2}]}], "d": 1}}}
+    )
+    expect = {
+        "status": "ok",
+        "outputs": {
+            "a": {
+                "b": {
+                    "c": {"$contains": [{"inner": [{"z": 1, "y": 2}]}]},
+                    "d": 1,
+                }
+            }
+        },
+    }
+    assert match_expect(got, expect) == []
+    # a matcher inside an item of $contains
+    nested = {"status": "ok", "outputs": {"a": {"b": {"c": {"$containsWhere": {"k": [1, 2]}}}}}}
+    assert match_expect(got, nested) == []
+    deeper = {
+        "status": "ok",
+        "outputs": {"a": {"b": {"c": {"$contains": [{"inner": {"$containsWhere": {"z": 1}}}]}}}},
+    }
+    assert match_expect(got, deeper) == []
+    deeper["outputs"]["a"]["b"]["c"]["$contains"][0]["inner"]["$containsWhere"] = {"z": 2}
+    assert len(match_expect(got, deeper)) == 1
+
+
+@pytest.mark.parametrize(
+    ("outputs", "needle"),
+    [
+        ({"x": {"$contians": [1]}}, "expect.outputs.x: unknown matcher $contians"),
+        ({"x": {"$": 1}}, "unknown matcher $"),
+        ({"x": {"a": {"$nope": 1}}}, "expect.outputs.x.a: unknown matcher $nope"),
+        ({"x": {"$contains": [1], "name": "a"}}, "expect.outputs.x: mixes"),
+        ({"x": {"name": "a", "$containsWhere": {"a": 1}}}, "expect.outputs.x: mixes"),
+        ({"x": {"$contains": 1}}, "expect.outputs.x: $contains wants a list"),
+        ({"x": {"$containsWhere": [1]}}, "expect.outputs.x: $containsWhere wants an object"),
+        ({"x": {"$containsWhere": {}}}, "expect.outputs.x: $containsWhere wants an object"),
+        ({"x": {"$contains": [{"a": {"$zzz": 1}}]}}, "expect.outputs.x[0].a: unknown matcher $zzz"),
+        ({"x": {"$containsWhere": {"a": {"$zzz": 1}}}}, "expect.outputs.x.a: unknown matcher $zzz"),
+        ({"x": [{"$contains": [1]}]}, "expect.outputs.x[0]: a matcher inside a list"),
+    ],
+)
+def test_a_bad_matcher_is_a_fixture_error(tmp_path, outputs, needle):
+    import yaml as _yaml
+
+    text = _yaml.safe_dump({"expect": {"status": "ok", "outputs": outputs}})
+    with pytest.raises(FixtureError) as exc:
+        load_scenario(write(tmp_path, text))
+    assert needle in "\n".join(exc.value.errors)
+
+
+def test_good_matchers_load(tmp_path):
+    text = (
+        "expect:\n  status: ok\n  outputs:\n    a: {$contains: [{x: 1}]}\n"
+        "    b: {c: {$containsWhere: {y: 2}}}\n"
+    )
+    assert load_scenario(write(tmp_path, text)).expect["outputs"]["a"] == {"$contains": [{"x": 1}]}
+
+
+# -- expect.artifacts -------------------------------------------------------------------------
+
+
+def check_artifacts(spec, texts, declared=None):
+    return match_expect(
+        envelope(),
+        {"status": "ok", "artifacts": spec},
+        artifacts=texts,
+        artifact_outputs=declared if declared is not None else list(texts),
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "ok"),
+    [
+        ({"contains": ["alpha", "beta"]}, True),
+        ({"contains": ["alpha", "gamma"]}, False),
+        ({"notContains": ["gamma"]}, True),
+        ({"notContains": ["alpha"]}, False),
+        ({"lines": {"min": 3, "max": 3}}, True),
+        ({"lines": {"min": 4}}, False),
+        ({"lines": {"max": 2}}, False),
+        ({"lines": {"max": 10}}, True),
+        ({"contains": ["alpha"], "notContains": ["zzz"], "lines": {"min": 1}}, True),
+        ({}, True),  # just: it exists
+    ],
+)
+def test_artifact_assertions(spec, ok):
+    assert (check_artifacts({"dump": spec}, {"dump": "alpha\nbeta\nlast"}) == []) is ok
+
+
+def test_artifact_failure_lines_say_what_and_where():
+    texts = {"dump": "alpha\nbeta\n"}
+    assert check_artifacts({"dump": {"contains": ["alpha", "gamma", "delta"]}}, texts) == [
+        "artifacts.dump: missing text 'gamma'",
+        "artifacts.dump: missing text 'delta'",
+    ]
+    assert check_artifacts({"dump": {"notContains": ["beta"]}}, texts) == [
+        "artifacts.dump: contains forbidden text 'beta'"
+    ]
+    assert check_artifacts({"dump": {"lines": {"min": 5}}}, texts) == [
+        "artifacts.dump: 2 lines, expected at least 5"
+    ]
+    assert check_artifacts({"dump": {"lines": {"max": 1}}}, texts) == [
+        "artifacts.dump: 2 lines, expected at most 1"
+    ]
+
+
+def test_a_declared_artifact_the_task_did_not_produce_fails():
+    assert check_artifacts({"dump": {}}, {}, declared=["dump"]) == [
+        "artifacts.dump: the task did not produce this artifact"
+    ]
+
+
+def test_a_name_that_is_not_an_artifact_output_fails():
+    assert check_artifacts({"nope": {}}, {"dump": "x"}, declared=["dump"]) == [
+        "artifacts.nope: not an artifact output of this task (artifact outputs: dump)"
+    ]
+    assert check_artifacts({"nope": {}}, {}, declared=[]) == [
+        "artifacts.nope: not an artifact output of this task (artifact outputs: none)"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("artifacts", "needle"),
+    [
+        ({"a": {"contains": "x"}}, "expect.artifacts.a.contains"),
+        ({"a": {"nope": []}}, "unknown key(s) nope"),
+        ({"a": {"lines": {"min": -1}}}, "expect.artifacts.a.lines.min"),
+        ({"a": {"lines": {"low": 1}}}, "unknown key(s) low"),
+        ({"a": {"lines": {"min": 5, "max": 2}}}, "expect.artifacts.a.lines: min 5 is above max 2"),
+        ({"a": []}, "expect.artifacts.a"),
+    ],
+)
+def test_a_bad_artifact_assertion_is_a_fixture_error(tmp_path, artifacts, needle):
+    import yaml as _yaml
+
+    text = _yaml.safe_dump({"expect": {"status": "ok", "artifacts": artifacts}})
+    with pytest.raises(FixtureError) as exc:
+        load_scenario(write(tmp_path, text))
+    assert needle in "\n".join(exc.value.errors)
+
+
+def test_artifact_text_is_compared_as_given_even_for_unicode():
+    assert check_artifacts({"d": {"contains": ["é"]}}, {"d": "café\n"}) == []
+
+
+# -- dryRun ---------------------------------------------------------------------------------------
+
+
+def test_dry_run_loads_dumps_and_defaults_false(tmp_path):
+    assert load_scenario(write(tmp_path, "expect: {status: ok}\n")).dry_run is False
+    scenario = load_scenario(write(tmp_path, "dryRun: true\nexpect: {status: ok}\n", "d.yaml"))
+    assert scenario.dry_run is True
+    with pytest.raises(FixtureError, match="dryRun"):
+        load_scenario(write(tmp_path, "dryRun: yes-please\nexpect: {status: ok}\n", "e.yaml"))
+    kw = dict(resource=None, inputs={}, settings={}, identity={}, calls=[], expect={"status": "ok"})
+    assert "dryRun" not in dump_scenario(**kw)
+    text = dump_scenario(**kw, dry_run=True)
+    assert "dryRun: true\n" in text
+    assert load_scenario(write(tmp_path, text, "f.yaml")).dry_run is True
