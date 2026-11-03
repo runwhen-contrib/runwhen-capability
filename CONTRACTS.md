@@ -354,6 +354,15 @@ evidence?}`; `partial` requires `scope` in the integration's own terms
 (namespaces for Kubernetes). papi asks with the union of rules declared by the
 installed skills (CON-3) and stores the verdicts on the connection.
 
+**Entry-point inputs.** What the platform passes when it runs an integration's
+entry-point tasks (agreed with lanes C and F, 2026-11-04):
+
+| Entry point | Lease `inputs` the platform sends | The task declares | Output |
+|---|---|---|---|
+| `permissionCheck` | `{"rules": [<permission>, …]}`: the deduplicated union of the rules the workspace's installed skills declare for this integration, at most 500 per run (papi batches beyond that), any order | a required input `rules` (`type: object[]`); integration-specific extras must be optional with defaults (Kubernetes: `namespaces`, empty = every namespace the identity can list), and the platform never sends them | `access` of `kind: rw.access.v1`: exactly one entry per input rule, in input order, `hash = permission_hash(rule)`, `rule` echoed; a rule the task cannot evaluate is `unverified`, never dropped. papi recomputes each hash and matches by it |
+| `discovery` | `{}`: discovery is driven by settings and the connection's root | settings only (e.g. Kubernetes `namespaces`) | `summary` of `kind: rw.discovery.summary.v1`; resources go through the sync API |
+| `cli` | `{"command": "<arguments>"}` | a required input `command` (`type: string`); allowlists live in settings | the integration's own output (text or artifact) |
+
 ## Hashing
 
 All in `runwhen_capability.contracts.hashing`, with vectors in `contracts/vectors/`:
