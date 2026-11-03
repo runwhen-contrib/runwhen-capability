@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/rw.discovery.summary.v1/v1.json",
+  "title": "DiscoverySummary",
+  "description": "Output kind of a discovery task and the `summary` of its sync commit: counts, coverage, discovered types, per-step errors.",
+  "type": "object",
+  "properties": {
+    "counts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "propertyNames": {
+        "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeName"
+      }
+    },
+    "partitions": {
+      "type": "object",
+      "properties": {
+        "complete": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "forbidden": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excluded": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "discoveredTypes": {
+      "type": "array",
+      "items": {
+        "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeName"
+      },
+      "uniqueItems": true
+    },
+    "durationMs": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "https://schemas.runwhen.com/error/v1.json"
+      }
+    }
+  },
+  "required": [
+    "counts"
+  ],
+  "additionalProperties": false
+}

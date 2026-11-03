@@ -24,52 +24,23 @@ import re
 from pathlib import Path
 
 import pytest
-import yaml
 
 from runwhen_capability.contracts import SCHEMA_NAMES, validate
+from runwhen_capability.contracts._yaml12 import load_yaml, split_frontmatter
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "contracts" / "examples"
 
-# Schemas that are still being written, or that are shared definitions only.
-NO_EXAMPLE_NEEDED = {"common", "rw.discovery.v1", "rw.discovery.summary.v1"}
+# Shared definitions only, no document of their own.
+NO_EXAMPLE_NEEDED = {"common"}
 
 # Valid fixtures that fail today: path relative to contracts/examples -> the
 # exact violation. strict xfail, so fixing the schema or the wiki flips it red.
-KNOWN_FAILURES: dict[str, str] = {
-    "types/41a-kubernetes.yaml": (
-        "YAML 1.1 reads the unquoted alias `no` (kubectl's short name for nodes, "
-        "`aliases: [no]` on the `node` line) as boolean false; the schema reports "
-        "/types/node/aliases/0: False is not of type 'string'. The wiki block needs "
-        '`"no"`, or the loader needs a YAML 1.2 boolean rule.'
-    ),
-}
-
-
-class _Loader(yaml.SafeLoader):
-    """SafeLoader that leaves `2026-11-03T09:14:02Z` a string (schemas use
-    `format: date-time` on strings), instead of resolving it to a datetime."""
-
-
-_Loader.yaml_implicit_resolvers = {
-    first: [(tag, regexp) for tag, regexp in resolvers if tag != "tag:yaml.org,2002:timestamp"]
-    for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
-}
-
-
-def _load_yaml(text: str):
-    return yaml.load(text, Loader=_Loader)  # noqa: S506 - a SafeLoader subclass
-
-
-def _frontmatter(text: str) -> str:
-    lines = text.splitlines()
-    start = lines.index("---")
-    end = lines.index("---", start + 1)
-    return "\n".join(lines[start + 1 : end])
+KNOWN_FAILURES: dict[str, str] = {}
 
 
 def _load(path: Path):
     text = path.read_text(encoding="utf-8")
-    return _load_yaml(_frontmatter(text) if path.suffix == ".md" else text)
+    return split_frontmatter(text)[0] if path.suffix == ".md" else load_yaml(text)
 
 
 def _fixtures(*, invalid: bool) -> list[Path]:
@@ -112,7 +83,7 @@ def _expectation(path: Path) -> tuple[str, str]:
 
 
 def test_loader_keeps_timestamps_as_strings():
-    doc = _load_yaml("at: 2026-11-03T09:14:02Z\nmode: '0600'\nnext: on\n")
+    doc = load_yaml("at: 2026-11-03T09:14:02Z\nmode: '0600'\nnext: on\n")
     assert doc["at"] == "2026-11-03T09:14:02Z"
     assert doc["mode"] == "0600"
 

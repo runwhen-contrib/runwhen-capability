@@ -1,0 +1,5 @@
+# expect: /open/mode 'full' was expected
+apiVersion: rw.discovery.v1
+open: { source: k8s-base/discover, scopePath: kubernetes/clusters/prod-east, mode: incremental }
+batches: [{ seq: 1, items: [{ identity: { platform: kubernetes, chain: [{ type: cluster, name: prod-east }] }, document: {} }] }]
+commit: { partitions: [] }

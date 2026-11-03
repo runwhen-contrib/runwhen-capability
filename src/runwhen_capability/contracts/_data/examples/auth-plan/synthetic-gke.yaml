@@ -3,8 +3,8 @@ connection: prod-east
 integration: kubernetes@1.4.0
 authMethod: gke
 credentialType: kubernetes/kubeconfig
-reference: { kind: vault, ref: secret/data/rw/gcp-prod-sa, format: gcp-sa-key }
-step:
+reference: { kind: vault, ref: secret/data/rw/gcp-prod-sa, content: gcp-sa-key }
+method:
   script:
     path: auth/gke.py
     archive:

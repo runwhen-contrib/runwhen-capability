@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.runwhen.com/auth-plan/v1.json",
   "title": "AuthPlan",
-  "description": "Compiled by papi per run from the connection's pinned auth method (D67); executed by the runner as the init step.",
+  "description": "Compiled by papi per run from the connection's pinned auth method (D67); executed before the task script: native methods by the runner, script methods by the SDK host as a pre-step.",
   "type": "object",
   "properties": {
     "connection": {
@@ -20,7 +20,7 @@
     "reference": {
       "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialRef"
     },
-    "step": {
+    "method": {
       "oneOf": [
         {
           "type": "object",
@@ -111,8 +111,61 @@
   "required": [
     "credentialType",
     "reference",
-    "step",
+    "method",
     "materialize"
   ],
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "materializedCredential": {
+      "type": "object",
+      "properties": {
+        "credentialType": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialTypeName"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "env": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+              },
+              "mode": {
+                "type": "string",
+                "pattern": "^0[0-7]{3}$"
+              },
+              "content": {
+                "type": "string"
+              },
+              "encoding": {
+                "enum": [
+                  "utf-8",
+                  "base64"
+                ]
+              }
+            },
+            "required": [
+              "env",
+              "content"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "propertyNames": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+          }
+        }
+      },
+      "required": [
+        "credentialType"
+      ],
+      "additionalProperties": false,
+      "description": "runner -> executor (`/v1/tasks/next` `materialized[]`): the result of a native plan. Secret; never logged, never leaves the pod."
+    }
+  }
 }

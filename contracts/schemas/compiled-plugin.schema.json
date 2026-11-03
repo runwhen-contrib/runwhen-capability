@@ -28,9 +28,6 @@
       ],
       "additionalProperties": false
     },
-    "contentHash": {
-      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/sha256"
-    },
     "plugin": {
       "$ref": "https://schemas.runwhen.com/plugin/v1.json"
     },
@@ -441,7 +438,6 @@
   "required": [
     "apiVersion",
     "compiler",
-    "contentHash",
     "plugin",
     "integration",
     "skills",

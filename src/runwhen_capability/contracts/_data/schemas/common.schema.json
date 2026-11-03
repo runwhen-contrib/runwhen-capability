@@ -32,17 +32,22 @@
     },
     "qualifiedType": {
       "type": "string",
-      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*$",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+([.-][a-z0-9]+)*$",
       "description": "<integration>/<type>"
     },
     "typeRef": {
       "type": "string",
-      "pattern": "^([a-z0-9]+(-[a-z0-9]+)*/)?[a-z0-9]+(-[a-z0-9]+)*$",
+      "pattern": "^([a-z0-9]+(-[a-z0-9]+)*/)?[a-z0-9]+([.-][a-z0-9]+)*$",
       "description": "a type of this integration (`deployment`) or a qualified one (`kubernetes/namespace`)"
     },
     "credentialTypeName": {
       "type": "string",
       "pattern": "^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "typeName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "maxLength": 255
     },
     "resourcePath": {
       "type": "string",
@@ -261,7 +266,7 @@
           },
           "description": "generic/env: variable -> key inside the referenced secret"
         },
-        "format": {
+        "content": {
           "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
         }
       },

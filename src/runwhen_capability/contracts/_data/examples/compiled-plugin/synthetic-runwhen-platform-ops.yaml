@@ -1,7 +1,6 @@
 # source: synthetic (no wiki example); consistent with 42b-example-papi-skill.md (trimmed to one task)
 apiVersion: runwhen.com/compiled-plugin/v1
 compiler: { name: rwtask, version: 0.5.0 }
-contentHash: "sha256:cb78b5176eb19284332da18adbb275ee6eb5cc2943810842e07f54a688bb8290"
 plugin:
   name: runwhen-platform-ops
   version: 0.1.0
