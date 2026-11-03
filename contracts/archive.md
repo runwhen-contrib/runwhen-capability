@@ -113,6 +113,13 @@ Every consumer (papi on install, the runner on fetch, the registry on import) mu
    directory entries from older tools, ignored), reject absolute paths, `..`, symlinks, hardlinks
    and devices, and ignore `uid`/`gid`/`mtime`. Never trust the tar to be well-formed because the
    hash matched: the hash proves origin, the rules prove safety.
+   **Reject every extension header** (pax `x`/`g`, GNU `L`/`K`/`S`, sparse maps): a generic tar
+   library folds a pax global header into the next member, so a member that looks like a regular
+   file can carry another path and a declared size far beyond its bytes (a 47 KiB archive expanded
+   to 480 MiB in lane D's review). Parse plain ustar headers directly, or with a library check that
+   every member's data starts 512 bytes after its own header and right where the previous member's
+   padded data ended, with no pax headers and no sparse map. The size limits (§4) apply to the
+   declared sizes as well as the bytes. Vectors: `contracts/vectors/archive/invalid/`.
 3. Cache by `sha256`; a cached archive is never re-validated against a different hash and never
    mutated (the runner extracts into `<cache>/sha256/<hex>/` and treats it as read-only).
 

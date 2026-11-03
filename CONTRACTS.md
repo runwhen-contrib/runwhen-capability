@@ -19,11 +19,14 @@ pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen
 ```
 
 ```python
-from runwhen_capability.contracts import validate, check, load_yaml, permission_hash
-from runwhen_capability.contracts import archive    # build / read / verify the plugin archive
-violations = validate("tasks", load_yaml(text))   # [] when valid; each has .path (JSON pointer) and .message
-check("result-envelope", envelope)                # raises ContractError
-from runwhen_capability.contracts.models.lease import Lease   # pydantic v2, generated from the schema
+from runwhen_capability.contracts import archive, check, load_yaml, validate
+from runwhen_capability.contracts.models.lease import Lease
+
+# [] when valid; each violation has .path (JSON pointer) and .message
+violations = validate("tasks", load_yaml(text))
+check("result-envelope", envelope)  # raises ContractError
+lease = Lease.model_validate(doc)  # pydantic v2, generated from the schema
+tar = archive.build(entries)  # build / read / verify the plugin archive
 ```
 
 Other languages read the same files at the tag: `contracts/schemas/*.schema.json`
