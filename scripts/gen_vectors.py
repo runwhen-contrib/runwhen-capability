@@ -42,6 +42,11 @@ CANONICAL_JSON_INPUTS: list[tuple[str, Any]] = [
     ("empty containers", {"a": [], "b": {}}),
     ("list order is preserved", {"xs": [3, 1, 2, "b", "a"]}),
     ("top-level string", "just a string"),
+    ("integral floats are integers", [1.0, -0.0, 0.0, -3.0, 100.0, 1e20]),
+    ("fractional floats", {"a": 0.5, "b": 1.25, "c": -2.5, "d": 0.1, "e": 123.456}),
+    ("small floats are positional", [1e-6, 1.5e-5, 0.0001, 0.00025]),
+    ("large integral float keeps shortest digits", [1.2345678901234568e20, 9007199254740993.0]),
+    ("floats in a document", {"params": {"threshold": 0.75, "retries": 3.0, "name": "x"}}),
 ]
 
 PERMISSION_INPUTS: list[tuple[str, dict[str, Any]]] = [
@@ -155,6 +160,34 @@ TASK_INPUTS: list[tuple[str, dict[str, Any]]] = [
     ),
     ("empty file", {"task": {"name": "t"}, "files": [_file("lib/__init__.py", b"", None)]}),
     (
+        "float defaults are canonicalized",
+        {
+            "task": {"name": "t", "inputs": {"ratio": {"type": "number", "default": 0.5}}},
+            "files": [],
+        },
+    ),
+    (
+        "integral float equals the integer",
+        {
+            "task": {"name": "t", "inputs": {"ratio": {"type": "number", "default": 2.0}}},
+            "files": [],
+        },
+    ),
+    (
+        "integer default",
+        {
+            "task": {"name": "t", "inputs": {"ratio": {"type": "number", "default": 2}}},
+            "files": [],
+        },
+    ),
+    (
+        "small float default",
+        {
+            "task": {"name": "t", "inputs": {"ratio": {"type": "number", "default": 0.00002}}},
+            "files": [],
+        },
+    ),
+    (
         "unicode in task and file",
         {
             "task": {"name": "naïve", "description": "café"},
@@ -181,7 +214,11 @@ def build() -> dict[str, dict[str, Any]]:
         "canonical-json.json": {
             "description": (
                 "canonical_json(input) as a UTF-8 string: sorted keys, no whitespace, "
-                "non-ASCII kept as UTF-8. Vectors contain no floats."
+                "non-ASCII kept as UTF-8, floats per RFC 8785 (an integral float with abs < 1e21 "
+                "is written as an integer, e.g. 1.0 -> 1 and -0.0 -> 0; other floats with "
+                "1e-6 <= abs < 1e21 use the shortest round-trip digits in positional form, "
+                "never exponent form; floats outside that range are an error and have no "
+                "vector)."
             ),
             "cases": [
                 {"name": name, "input": value, "expected": canonical_json(value).decode("utf-8")}
@@ -219,7 +256,8 @@ def build() -> dict[str, dict[str, Any]]:
         "task-hash.json": {
             "description": (
                 "task_hash(input.task, files): sha256 of the canonical JSON of "
-                "{task: input.task minus 'hash', files: {path: sha256(data)}}. "
+                "{task: input.task minus 'hash', files: {path: sha256(data)}}, with the task "
+                "serialized by the canonical-json rules (including floats). "
                 "input.files is a list of {path, dataBase64}."
             ),
             "cases": [

@@ -51,6 +51,44 @@ def test_canonical_json_rejects_non_finite_floats(bad):
         canonical_json({"x": bad})
 
 
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (1.0, "1"),
+        (-0.0, "0"),
+        (0.0, "0"),
+        (-3.0, "-3"),
+        (0.5, "0.5"),
+        (1.25, "1.25"),
+        (0.1, "0.1"),
+        (-2.5, "-2.5"),
+        (1e-6, "0.000001"),
+        (1.5e-5, "0.000015"),
+        (1e20, "100000000000000000000"),
+        (1.2345678901234568e20, "123456789012345680000"),
+        (9007199254740993.0, "9007199254740992"),
+    ],
+)
+def test_canonical_json_formats_floats_per_rfc_8785(value, text):
+    assert canonical_json(value) == text.encode()
+    assert canonical_json({"x": [value]}) == f'{{"x":[{text}]}}'.encode()
+
+
+@pytest.mark.parametrize("bad", [1e-7, -1e-7, 1e21, -1e21, 1e300, 5e-324])
+def test_canonical_json_rejects_floats_outside_the_accepted_range(bad):
+    with pytest.raises(ValueError, match="not canonicalizable"):
+        canonical_json({"x": bad})
+
+
+def test_canonical_json_rejects_non_string_keys():
+    with pytest.raises(TypeError):
+        canonical_json({1: "a"})
+
+
+def test_canonical_json_bool_is_not_an_int():
+    assert canonical_json([True, 1, False, 0]) == b"[true,1,false,0]"
+
+
 def test_canonical_json_rejects_unserialisable_types():
     with pytest.raises(TypeError):
         canonical_json({"x": object()})

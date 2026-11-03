@@ -1,5 +1,5 @@
 {
-  "description": "canonical_json(input) as a UTF-8 string: sorted keys, no whitespace, non-ASCII kept as UTF-8. Vectors contain no floats.",
+  "description": "canonical_json(input) as a UTF-8 string: sorted keys, no whitespace, non-ASCII kept as UTF-8, floats per RFC 8785 (an integral float with abs < 1e21 is written as an integer, e.g. 1.0 -> 1 and -0.0 -> 0; other floats with 1e-6 <= abs < 1e21 use the shortest round-trip digits in positional form, never exponent form; floats outside that range are an error and have no vector).",
   "cases": [
     {
       "name": "key order",
@@ -85,6 +85,58 @@
       "name": "top-level string",
       "input": "just a string",
       "expected": "\"just a string\""
+    },
+    {
+      "name": "integral floats are integers",
+      "input": [
+        1.0,
+        -0.0,
+        0.0,
+        -3.0,
+        100.0,
+        1e+20
+      ],
+      "expected": "[1,0,0,-3,100,100000000000000000000]"
+    },
+    {
+      "name": "fractional floats",
+      "input": {
+        "a": 0.5,
+        "b": 1.25,
+        "c": -2.5,
+        "d": 0.1,
+        "e": 123.456
+      },
+      "expected": "{\"a\":0.5,\"b\":1.25,\"c\":-2.5,\"d\":0.1,\"e\":123.456}"
+    },
+    {
+      "name": "small floats are positional",
+      "input": [
+        1e-06,
+        1.5e-05,
+        0.0001,
+        0.00025
+      ],
+      "expected": "[0.000001,0.000015,0.0001,0.00025]"
+    },
+    {
+      "name": "large integral float keeps shortest digits",
+      "input": [
+        1.2345678901234568e+20,
+        9007199254740992.0
+      ],
+      "expected": "[123456789012345680000,9007199254740992]"
+    },
+    {
+      "name": "floats in a document",
+      "input": {
+        "params": {
+          "threshold": 0.75,
+          "retries": 3.0,
+          "name": "x"
+        }
+      },
+      "expected": "{\"params\":{\"name\":\"x\",\"retries\":3,\"threshold\":0.75}}"
     }
   ]
 }

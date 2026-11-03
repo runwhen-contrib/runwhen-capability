@@ -5,8 +5,8 @@ These are contracts, not conveniences: the registry, the executor and the SDK
 spelled out here and replayed from contracts/vectors/*.json by the tests.
 
 - `canonical_json`: the RFC 8785 subset V13 documents use -- sorted keys, no
-  whitespace, UTF-8 with non-ASCII kept as-is, no NaN/Infinity. Documents hashed
-  this way must not contain floats; use integers or strings.
+  whitespace, UTF-8 with non-ASCII kept as-is, floats in ECMAScript form, no
+  NaN/Infinity.
 - `permission_hash`: identity of one permission rule, insensitive to list order,
   duplicates and keys that are absent, None or an empty list.
 - `tree_hash`: identity of a file tree (path, content and exec bit).
@@ -17,17 +17,58 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 
 def canonical_json(obj: Any) -> bytes:
     """`obj` as canonical UTF-8 JSON: sorted keys, no whitespace, non-ASCII
-    kept, NaN/Infinity rejected (ValueError); other non-JSON types TypeError."""
-    return json.dumps(
-        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
-    ).encode("utf-8")
+    kept, floats written per RFC 8785 (see `_float`). Dict keys must be
+    strings (TypeError otherwise); NaN/Infinity and floats outside
+    1e-6 <= abs < 1e21 (zero aside) raise ValueError; other non-JSON types
+    raise TypeError."""
+    return _render(obj).encode("utf-8")
+
+
+def _render(value: Any) -> str:
+    # Pre-walk: floats are rendered here, everything else by json.dumps, so
+    # ensure_ascii=False string handling is exactly the standard library's.
+    if isinstance(value, float):
+        return _float(value)
+    if isinstance(value, Mapping):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("canonical JSON object keys must be strings")
+        members = (f"{_string(key)}:{_render(value[key])}" for key in sorted(value))
+        return "{" + ",".join(members) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_render(item) for item in value) + "]"
+    return json.dumps(value, ensure_ascii=False, allow_nan=False)
+
+
+def _string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _float(value: float) -> str:
+    """RFC 8785 (ECMAScript Number::toString) for the range V13 accepts: a
+    finite float with an integral value and abs < 1e21 is an integer (`1.0` ->
+    `1`, `-0.0` -> `0`); any other finite float with 1e-6 <= abs < 1e21 is its
+    shortest round-trip digits, always positional (Python's repr switches to
+    exponent form below 1e-4, ECMAScript does not until 1e-6). Anything else
+    is ValueError."""
+    if not math.isfinite(value):
+        raise ValueError(f"not canonicalizable: {value!r} is not finite")
+    if value == 0:
+        return "0"
+    if not 1e-6 <= abs(value) < 1e21:
+        raise ValueError(f"not canonicalizable: float {value!r} is outside 1e-6 <= abs < 1e21")
+    digits = Decimal(repr(value))
+    if value == int(value):
+        digits = digits.to_integral_value()
+    return format(digits, "f")
 
 
 def normalize_permission(rule: Mapping[str, Any]) -> dict[str, Any]:

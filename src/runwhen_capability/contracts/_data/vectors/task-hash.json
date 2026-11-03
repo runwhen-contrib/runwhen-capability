@@ -1,5 +1,5 @@
 {
-  "description": "task_hash(input.task, files): sha256 of the canonical JSON of {task: input.task minus 'hash', files: {path: sha256(data)}}. input.files is a list of {path, dataBase64}.",
+  "description": "task_hash(input.task, files): sha256 of the canonical JSON of {task: input.task minus 'hash', files: {path: sha256(data)}}, with the task serialized by the canonical-json rules (including floats). input.files is a list of {path, dataBase64}.",
   "cases": [
     {
       "name": "task with no files",
@@ -124,6 +124,70 @@
         ]
       },
       "expected": "sha256:40b3b3f78406b28312a6e69da245864c279f8a2c31d725e532268afd7f55b253"
+    },
+    {
+      "name": "float defaults are canonicalized",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 0.5
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:060363e86a595ce81a1b213d43cef7958d9c3ab0b62bc82cb2dbbf6a3e3056cf"
+    },
+    {
+      "name": "integral float equals the integer",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 2.0
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:b0d5f9de631220d817cbc8302f54a6984b23990860c383b45ea580817c78a52e"
+    },
+    {
+      "name": "integer default",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 2
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:b0d5f9de631220d817cbc8302f54a6984b23990860c383b45ea580817c78a52e"
+    },
+    {
+      "name": "small float default",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 2e-05
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:a7056e3ae668a21878c26536d55acfd7f8dee2e5af51ffd5d07992a713749325"
     },
     {
       "name": "unicode in task and file",
