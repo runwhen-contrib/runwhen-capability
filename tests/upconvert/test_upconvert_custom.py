@@ -99,9 +99,10 @@ def test_pgbouncer_health_findings():
     assert sorted(d.path for d in lossy) == ["appliesTo[0].where.namespace", "inputs.target"]
     assert {d.file for d in result.diagnostics} == {"capability.yaml", "scripts/pool_errors.sh"}
     [script] = [d for d in result.diagnostics if d.file == "scripts/pool_errors.sh"]
-    assert (
-        "$SINCE -> $RW_INPUT_SINCE" in script.message
-    )  # the script reads inputs as custom tasks did
+    # the script reads inputs the way custom tasks did
+    assert script.message == (
+        "reads $MAX_WAIT, $SINCE as bare variables; use RW_INPUT_MAX_WAIT, RW_INPUT_SINCE"
+    )
     [setup] = with_code(result, "W_UPCONVERT_SETUP_DROPPED")
     assert setup.path == "setup"
     credentials = with_code(result, "W_UPCONVERT_CREDENTIAL")
@@ -339,3 +340,44 @@ def test_the_result_is_not_written_by_the_converter(tmp_path):
     upconvert_custom(BUNDLES / "testable")
     assert sorted(p.name for p in BUNDLES.iterdir()) == before
     assert load_yaml("a: 1") == {"a": 1}
+
+
+def test_review_findings_are_one_per_file_and_name():
+    result = upconvert_custom(BUNDLES / "artifacts")
+    reviews = with_code(result, "W_UPCONVERT_REVIEW")
+    # one for the whole skill's missing descriptions, one for titles, one per write task, ...
+    assert len([d for d in reviews if "have no description" in d.message]) == 1
+    assert len([d for d in reviews if "titles" in d.message or "title of" in d.message]) == 1
+    assert len([d for d in reviews if "destructive" in d.message]) == 27
+    assert len(reviews) == 31
+    scripts = [d.file for d in reviews if d.file and d.file.startswith("scripts/")]
+    assert len(scripts) == len(set(scripts))
+
+
+def test_a_script_shared_by_tasks_and_a_name_used_by_tasks_are_reported_once(tmp_path):
+    manifest = """\
+apiVersion: runwhen.com/custom-capability/v1
+name: shared
+description: d
+inputs:
+  max_wait: {type: integer, default: 3}
+tasks:
+  - name: one
+    file: tasks/s.sh
+    description: One
+    readOnly: true
+    outputs: {errors: {schema: integer}}
+  - name: two
+    file: tasks/s.sh
+    description: Two
+    readOnly: true
+    outputs: {errors: {schema: integer}}
+"""
+    root = write_tree(
+        tmp_path / "shared",
+        {"capability.yaml": manifest, "tasks/s.sh": "echo $MAX_WAIT $MAX_WAIT\n"},
+    )
+    reviews = with_code(upconvert_custom(root), "W_UPCONVERT_REVIEW")
+    assert len([d for d in reviews if "'errors' is renamed" in d.message]) == 1
+    assert len([d for d in reviews if "'max_wait' is renamed" in d.message]) == 1
+    assert len([d for d in reviews if d.file == "scripts/s.sh"]) == 1

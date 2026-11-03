@@ -241,3 +241,11 @@ def test_a_directory_without_a_manifest_or_tasks_py_is_refused(tmp_path):
     root = write_tree(tmp_path / "x", {"manifest.yaml": "capability: x\ntasks: []\n"})
     with pytest.raises(UpconvertError, match="tasks.py"):
         upconvert_packaged(root)
+
+
+def test_missing_task_descriptions_are_one_finding():
+    result = upconvert_packaged(CAPABILITIES / "skips")
+    found = [
+        d for d in with_code(result, "W_UPCONVERT_REVIEW") if "have no description" in d.message
+    ]
+    assert len(found) == 1

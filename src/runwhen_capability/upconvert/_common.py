@@ -62,16 +62,27 @@ class UpconvertResult:
 
 
 class Diagnostics:
-    """Collects findings, dropping an exact repeat (same code, file, path, message)."""
+    """Collects findings, dropping an exact repeat (same code, file, path, message), or a
+    repeat of a `once` key."""
 
     def __init__(self, file: str) -> None:
         self.file = file
         self.items: list[Diagnostic] = []
         self._seen: set[tuple] = set()
 
-    def add(self, code: str, path: str | None, message: str, *, file: str | None = None) -> None:
+    def add(
+        self,
+        code: str,
+        path: str | None,
+        message: str,
+        *,
+        file: str | None = None,
+        once: object = None,
+    ) -> None:
+        """`once` names what the finding is about: a second finding of the same code, file
+        and `once` is dropped whatever its path (one per file and name, not per use)."""
         where = file or self.file
-        key = (code, where, path, message)
+        key = (code, where, path, message) if once is None else (code, where, "once", once)
         if key in self._seen:
             return
         self._seen.add(key)
@@ -139,6 +150,7 @@ def v13_name(
             path,
             f"{what} {name!r} is renamed {candidate!r} (V13 names are camelCase and may not be "
             "status or errors); update the script to the new name",
+            once=(what, name),
         )
     return candidate
 
@@ -167,17 +179,40 @@ def note_generated_titles(diags: Diagnostics, count: int) -> None:
 
 
 def description_or(
-    value: str | None, fallback: str, diags: Diagnostics, path: str, what: str
+    value: str | None,
+    fallback: str,
+    diags: Diagnostics,
+    path: str,
+    what: str,
+    *,
+    missing: list[str] | None = None,
 ) -> str:
+    """`value`, or `fallback` when it is empty. The stand-in is a W_UPCONVERT_REVIEW at
+    `path`, unless `missing` is given: then `what` is appended to it for
+    `note_missing_descriptions` to report once."""
     text = (value or "").strip()
     if not text:
-        diags.add(
-            W_UPCONVERT_REVIEW,
-            path,
-            f"{what} has no description; {fallback!r} stands in (V13 requires one)",
-        )
+        if missing is not None:
+            missing.append(what)
+        else:
+            diags.add(
+                W_UPCONVERT_REVIEW,
+                path,
+                f"{what} has no description; {fallback!r} stands in (V13 requires one)",
+            )
         return fallback
     return text[:_MAX_DESCRIPTION]
+
+
+def note_missing_descriptions(diags: Diagnostics, missing: list[str]) -> None:
+    """One W_UPCONVERT_REVIEW per skill for every task description that is missing."""
+    if missing:
+        diags.add(
+            W_UPCONVERT_REVIEW,
+            "tasks",
+            f"{len(missing)} task(s) have no description ({', '.join(missing)}); the title "
+            "stands in (V13 requires one)",
+        )
 
 
 # -- appliesTo ---------------------------------------------------------------------

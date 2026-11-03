@@ -54,6 +54,7 @@ from ._common import (
     input_type,
     merge_credentials,
     note_generated_titles,
+    note_missing_descriptions,
     render_skill_md,
     slug,
     title_case,
@@ -82,7 +83,11 @@ def upconvert_custom(src: Path, *, name: str | None = None) -> UpconvertResult:
 
     # -- copied trees ------------------------------------------------------------
     schemas = SchemaFiles(files, diags)
-    task_docs, credential_groups = _convert_tasks(manifest, files, diags, schemas)
+    missing: list[str] = []
+    reviews: dict[str, dict[str, set[str]]] = {}
+    task_docs, credential_groups = _convert_tasks(manifest, files, diags, schemas, missing, reviews)
+    note_missing_descriptions(diags, missing)
+    _flush_script_reviews(diags, reviews)
     for path, data in sorted(files.items()):
         if path in (MANIFEST, "README.md") or path in schemas.moved:
             continue
@@ -188,7 +193,12 @@ def _parse_manifest(data: bytes) -> Manifest:
 
 
 def _convert_tasks(
-    manifest: Manifest, files: dict[str, bytes], diags: Diagnostics, schemas: SchemaFiles
+    manifest: Manifest,
+    files: dict[str, bytes],
+    diags: Diagnostics,
+    schemas: SchemaFiles,
+    missing: list[str],
+    reviews: dict[str, dict[str, set[str]]],
 ) -> tuple[list[dict], list[list[str | dict]]]:
     task_docs: list[dict] = []
     groups: list[list[str | dict]] = []
@@ -197,7 +207,7 @@ def _convert_tasks(
             raise UpconvertError(f"task {task.name!r}: {task.file} is not in the bundle")
         if not task.file.startswith("tasks/"):
             raise UpconvertError(f"task {task.name!r}: {task.file} is not under tasks/")
-        doc, group = _convert_task(manifest, task, index, files, diags, schemas)
+        doc, group = _convert_task(manifest, task, index, files, diags, schemas, missing, reviews)
         task_docs.append(doc)
         groups.append(group)
     return task_docs, groups
@@ -210,6 +220,8 @@ def _convert_task(
     files: dict[str, bytes],
     diags: Diagnostics,
     schemas: SchemaFiles,
+    missing: list[str],
+    reviews: dict[str, dict[str, set[str]]],
 ) -> tuple[dict, list[str | dict]]:
     here = f"tasks[{index}]"
     name = slug(task.name)
@@ -221,7 +233,12 @@ def _convert_task(
         "name": name,
         "title": title,
         "description": description_or(
-            task.description, title, diags, f"{here}.description", f"task {name!r}"
+            task.description,
+            title,
+            diags,
+            f"{here}.description",
+            name,
+            missing=missing,
         ),
         "script": script,
         "readOnly": task.readOnly,
@@ -278,7 +295,7 @@ def _convert_task(
     if outputs:
         doc["outputs"] = outputs
 
-    _review_script(diags, script, files[task.file].decode("utf-8", "replace"), dropped, kept)
+    _scan_script(reviews, script, files[task.file].decode("utf-8", "replace"), dropped, kept)
     return doc, merge_credentials(credentials)
 
 
@@ -324,51 +341,59 @@ def _convert_input(
 # -- scripts ----------------------------------------------------------------------
 
 
-def _review_script(
-    diags: Diagnostics, script: str, text: str, dropped: dict[str, str], kept: dict[str, str]
+def _scan_script(
+    reviews: dict[str, dict[str, set[str]]],
+    script: str,
+    text: str,
+    dropped: dict[str, str],
+    kept: dict[str, str],
 ) -> None:
-    """W_UPCONVERT_REVIEW for a script that reads inputs the way a custom task did: a Python
-    `main` that takes a dropped input as an argument, a bash script reading a dropped
-    resource input or any kept input as a bare `$NAME` (V13 delivers `RW_INPUT_<NAME>`).
-    Looked up by pattern; nothing is rewritten."""
+    """Record what a script reads the way a custom task did, into `reviews[script]`: a Python
+    `main` that takes a dropped input as an argument (`args`), a bash script reading a dropped
+    resource input (`resource`) or any kept input as a bare `$NAME` (`bare`; V13 delivers
+    `RW_INPUT_<NAME>`). Looked up by pattern; nothing is rewritten. `_flush_script_reviews`
+    turns each script's record into one finding."""
+    found = reviews.setdefault(script, {"args": set(), "resource": set(), "bare": set()})
     if script.endswith(".py"):
         match = re.search(r"def\s+main\s*\(([^)]*)\)", text, re.S)
         signature = match.group(1) if match else ""
-        hits = [n for n in dropped if re.search(rf"\b{python_kwarg_name(n)}\b", signature)]
-        if hits:
-            diags.add(
-                W_UPCONVERT_REVIEW,
-                None,
-                f"main() takes {', '.join(sorted(hits))}, which V13 no longer passes (the target "
-                "is ctx.resource; credentials come from the connection's standard environment)",
-                file=script,
-            )
+        found["args"] |= {
+            n for n in dropped if re.search(rf"\b{python_kwarg_name(n)}\b", signature)
+        }
         return
-    resource_hits = [
+    found["resource"] |= {
         n
         for n, kind in dropped.items()
         if kind == "resource" and _reads_env(text, n, allow_prefixed=True)
-    ]
-    if resource_hits:
-        diags.add(
-            W_UPCONVERT_REVIEW,
-            None,
-            f"reads the dropped resource input {', '.join(sorted(resource_hits))}; use "
-            "RW_RESOURCE_* instead",
-            file=script,
-        )
-    bare = {n: new for n, new in kept.items() if _reads_env(text, n, allow_prefixed=False)}
-    if bare:
-        names = ", ".join(
-            f"${input_env_name(n)} -> $RW_INPUT_{input_env_name(new)}"
-            for n, new in sorted(bare.items())
-        )
-        diags.add(
-            W_UPCONVERT_REVIEW,
-            None,
-            f"reads inputs as bare variables ({names}); V13 delivers RW_INPUT_<NAME>",
-            file=script,
-        )
+    }
+    found["bare"] |= {
+        input_env_name(new) for n, new in kept.items() if _reads_env(text, n, allow_prefixed=False)
+    }
+
+
+def _flush_script_reviews(diags: Diagnostics, reviews: dict[str, dict[str, set[str]]]) -> None:
+    """One W_UPCONVERT_REVIEW per script file, listing every variable it reads."""
+    for script, found in sorted(reviews.items()):
+        parts = []
+        if found["args"]:
+            parts.append(
+                f"main() takes {', '.join(sorted(found['args']))}, which V13 no longer passes "
+                "(the target is ctx.resource; credentials come from the connection's "
+                "standard environment)"
+            )
+        if found["resource"]:
+            parts.append(
+                f"reads the dropped resource input {', '.join(sorted(found['resource']))}; "
+                "use RW_RESOURCE_* instead"
+            )
+        if found["bare"]:
+            names = sorted(found["bare"])
+            parts.append(
+                f"reads {', '.join('$' + n for n in names)} as bare variables; "
+                f"use {', '.join('RW_INPUT_' + n for n in names)}"
+            )
+        if parts:
+            diags.add(W_UPCONVERT_REVIEW, None, "; ".join(parts), file=script)
 
 
 def _reads_env(text: str, input_name: str, *, allow_prefixed: bool) -> bool:

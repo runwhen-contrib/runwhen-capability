@@ -41,6 +41,7 @@ from ._common import (
     input_type,
     merge_credentials,
     note_generated_titles,
+    note_missing_descriptions,
     render_skill_md,
     slug,
     title_case,
@@ -93,11 +94,13 @@ def upconvert_packaged(src: Path, *, name: str | None = None) -> UpconvertResult
 
     # -- tasks -------------------------------------------------------------------
     task_docs: list[dict] = []
+    missing: list[str] = []
     for index, task in enumerate(manifest.get("tasks") or []):
-        doc, fn = _convert_task(task, index, diags, schemas)
+        doc, fn = _convert_task(task, index, diags, schemas, missing)
         task_docs.append(doc)
         out[doc["script"]] = _shim(fn)
     note_generated_titles(diags, len(task_docs))
+    note_missing_descriptions(diags, missing)
     doc: dict[str, Any] = {
         "apiVersion": TASKS_API_VERSION,
         "runtime": credential_runtime([credentials]),
@@ -241,7 +244,7 @@ def _convert_execution(execution: dict, diags: Diagnostics) -> dict:
 
 
 def _convert_task(
-    task: dict, index: int, diags: Diagnostics, schemas: SchemaFiles
+    task: dict, index: int, diags: Diagnostics, schemas: SchemaFiles, missing: list[str]
 ) -> tuple[dict, str]:
     here = f"tasks[{index}]"
     original = str(task.get("name"))
@@ -261,7 +264,12 @@ def _convert_task(
         "name": name,
         "title": title,
         "description": description_or(
-            task.get("description"), title, diags, f"{here}.description", f"task {name!r}"
+            task.get("description"),
+            title,
+            diags,
+            f"{here}.description",
+            name,
+            missing=missing,
         ),
         "script": f"scripts/{fn}.py",
     }
