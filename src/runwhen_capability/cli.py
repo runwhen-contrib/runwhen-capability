@@ -8,8 +8,9 @@
     rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]
     rwtask export <dir> [--name NAME ...] [--force]
     rwtask test <dir> [--task NAME]
+    rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
 
-See serve.py, run_local.py, label.py, schemas.py and gitops.py.
+See serve.py, run_local.py, label.py, schemas.py, gitops.py and port/.
 """
 
 from __future__ import annotations
@@ -245,7 +246,90 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run only the test for this task name, across every capability that has one",
     )
 
+    port_p = sub.add_parser(
+        "port",
+        help="draft a V13 skill and a porting brief from a classic rw-cli Robot bundle",
+    )
+    port_p.add_argument("bundle_dir", help="the classic codebundle directory")
+    port_p.add_argument("--plugin", required=True, help="the plugin the skill is for")
+    port_p.add_argument(
+        "--inventory",
+        default=None,
+        metavar="FILE",
+        help="a YAML list of bundle inventory entries (asserts, readOnly, permissions, ...)",
+    )
+    port_p.add_argument("--skill", default=None, help="the skill name; default: the bundle name")
+    port_p.add_argument(
+        "--into", required=True, help="the plugin's skills directory; writes <into>/<skill>/"
+    )
+    port_p.add_argument(
+        "--brief",
+        default=None,
+        help="where to write the porting brief; default: <into>/../porting/briefs/<bundle>.md",
+    )
+    port_p.add_argument("--force", action="store_true", help="overwrite files that already exist")
+
     return parser
+
+
+def _port(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    import yaml
+
+    from .port.draft import draft_skill, load_inventory_entry
+    from .port.robot_model import PortDependencyError, read_bundle
+
+    bundle_dir = Path(args.bundle_dir)
+    if not bundle_dir.is_dir():
+        print(f"rwtask port: {bundle_dir} is not a directory", file=sys.stderr)
+        return 1
+    try:
+        bundle = read_bundle(bundle_dir)
+        inventory = None
+        if args.inventory:
+            inventory = load_inventory_entry(Path(args.inventory), bundle.name)
+        draft = draft_skill(
+            bundle,
+            args.plugin,
+            inventory=inventory,
+            skill_name=args.skill,
+            inventory_missing=bool(args.inventory) and inventory is None,
+        )
+    except PortDependencyError as exc:
+        print(f"rwtask port: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        print(f"rwtask port: {exc}", file=sys.stderr)
+        return 1
+
+    into = Path(args.into).resolve()
+    skill_dir = into / draft.skill_name
+    if args.brief:
+        brief_path = Path(args.brief).resolve()
+    else:
+        brief_path = into.parent / "porting" / "briefs" / f"{bundle.name}.md"
+    if brief_path == skill_dir or skill_dir in brief_path.parents:
+        print(
+            f"rwtask port: the brief must live outside the skill directory {skill_dir}",
+            file=sys.stderr,
+        )
+        return 1
+
+    targets = {skill_dir / name: text for name, text in draft.files.items()}
+    targets[brief_path] = draft.brief
+    existing = [str(p) for p in targets if p.exists()]
+    if existing and not args.force:
+        print(
+            "rwtask port: refusing to overwrite " + ", ".join(existing) + "; use --force",
+            file=sys.stderr,
+        )
+        return 1
+    for path, text in targets.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        print(f"wrote {path}")
+    for warning in draft.warnings:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
 
 
 def _gitops_config(parser: argparse.ArgumentParser, args: argparse.Namespace, command: str):
@@ -321,6 +405,9 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "port":
+        return _port(parser, args)
 
     if args.command == "serve":
         from .serve import serve

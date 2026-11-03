@@ -5,6 +5,12 @@ with the wheel and sdist attached to the GitHub Release.
 
 ## Unreleased
 
+### Added
+
+- `rwtask port <bundle-dir> --plugin <name> --into <skills-dir>` drafts a V13 `SKILL.md` and
+  `tasks.yaml`, plus a porting brief, from a classic rw-cli Robot bundle. It never copies classic
+  script bodies. Needs the new `port` extra (`robotframework>=7`).
+
 ### Fixed
 
 - A custom bundle's `lib/` is now usable from its tasks, as the skill spec promises. A Python task
