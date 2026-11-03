@@ -251,7 +251,12 @@ the runtime (`name`, `major`, mirror-rewritten `image`, `digest`), the code
 they would build, for a small workspace skill; archive.md §8), one credential entry per credential type
 (`{type, connection, authPlan}`, or `{type: runwhen/sync, minted}`), `limits`
 (`timeout`, `resources`, `maxResultBytes`) and the compiled `outputs` (so the
-runner validates and spills without the index).
+runner validates and spills without the index). The runner materializes a
+`runwhen/sync` entry to the executor as an ordinary `materialized[]` entry,
+`{credentialType: runwhen/sync, files: [{env: RW_SYNC_CREDENTIAL, mode: "0600", content: <the sync credential JSON>}]}`;
+`RW_SYNC_CREDENTIAL` is the one RW_* name a credential may set, and only as a file of a
+`runwhen/sync` entry (locally, `rwtask run` / `rwtask test --record` pass the caller's own
+`$RW_SYNC_CREDENTIAL` to a task that declares `runwhen/sync`).
 
 **Dry run.** Optional top-level `dryRun: true` asks for a dry-run execution: the
 runner runs the task with `RW_DRY_RUN=1` (`ctx.dry_run`) and the envelope carries

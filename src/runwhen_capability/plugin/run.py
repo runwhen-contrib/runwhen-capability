@@ -29,7 +29,11 @@ What the script is given, beyond the host's own environment:
   reference time, taken once when the run starts unless `RunSpec.now` carries one
   (`rwtask test` replays a scenario at the time it was recorded at); `ctx.now()` reads it;
 - whatever the caller passes as `extra_env` (materialized credentials), which may not
-  name a reserved variable (RW_*, HOME, PATH, ...) or a host-only one.
+  name a reserved variable (RW_*, HOME, PATH, ...) or a host-only one -- except the names of
+  PLATFORM_MINTED_FILE_ENV (`RW_SYNC_CREDENTIAL`), which a lease passes in `allow_env` when
+  they came as a file of their own credential type, and which `inherit_home` (`rwtask run`,
+  `rwtask test --record`) takes from the caller's own environment for a task that declares
+  the credential.
 
 Bash tasks run under `set -euo pipefail` with `rw.sh` already loaded (wiki 42b: "run with
 set -euo pipefail"; the scripts call `rw_output_append` without sourcing anything).
@@ -72,7 +76,7 @@ import shutil
 import signal
 import tempfile
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -397,11 +401,64 @@ def _env_field(name: str) -> str:
     return input_env_name(re.sub(r"[^A-Za-z0-9_]", "_", name))
 
 
-def check_extra_env(extra_env: Mapping[str, str]) -> dict[str, str]:
+#: Credential types the platform mints per run, each handed to the script as ONE file whose
+#: path is in the named variable: the only RW_* names a credential may set. On a runner it is
+#: a `files[].env` of that credential type's `materialized[]` entry (plugin/lease.py); locally
+#: (`rwtask run`, `rwtask test --record`) it is the caller's own variable, passed to a task that
+#: declares the type. Nowhere else is any RW_* name allowed.
+PLATFORM_MINTED_FILE_ENV: dict[str, str] = {"runwhen/sync": "RW_SYNC_CREDENTIAL"}
+
+
+def check_extra_env(extra_env: Mapping[str, str], *, allow: Collection[str] = ()) -> dict[str, str]:
+    """Refuses a reserved (RW_*, HOME, PATH, ...) or host-only name. `allow` lifts that for the
+    names of PLATFORM_MINTED_FILE_ENV only (a name outside it stays refused, whatever is
+    passed): it is for a caller that has checked where the name came from."""
+    permitted = set(allow) & set(PLATFORM_MINTED_FILE_ENV.values())
     for key in extra_env:
+        if key in permitted:
+            continue
         if is_reserved_env_name(key) or key in bundle._HOST_ONLY_ENV or "=" in key or not key:
             raise ValueError(f"extra_env may not set {key!r}")
     return dict(extra_env)
+
+
+def task_declares_credential(task: Mapping[str, Any], credential_type: str) -> bool:
+    return any(
+        isinstance(c, Mapping) and c.get("type") == credential_type
+        for c in task.get("credentials") or []
+    )
+
+
+def _callers_minted_credentials(
+    task: Mapping[str, Any], environ: Mapping[str, str]
+) -> tuple[dict[str, str], list[str]]:
+    """`rwtask run` / `rwtask test --record` have no runner to mint a credential: the caller's
+    own PLATFORM_MINTED_FILE_ENV variable is passed to a task that declares the type, made
+    absolute against the caller's directory (the child runs in its scope). Returns the
+    variables to set, and the token values in the files (best effort) for redaction."""
+    env: dict[str, str] = {}
+    secrets: list[str] = []
+    for credential_type, name in PLATFORM_MINTED_FILE_ENV.items():
+        value = environ.get(name)
+        if not value or not task_declares_credential(task, credential_type):
+            continue
+        path = _absolute_path(value, os.getcwd(), environ.get("HOME"))
+        env[name] = path
+        secrets.extend(
+            minted_file_secrets(Path(path).read_bytes() if os.path.isfile(path) else b"")
+        )
+    return env, secrets
+
+
+def minted_file_secrets(data: bytes) -> list[str]:
+    """The secret strings inside a platform-minted credential file (JSON with a `token`), so
+    a script that prints just the token is scrubbed as well as one that prints the file."""
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return []
+    token = doc.get("token") if isinstance(doc, dict) else None
+    return [token] if isinstance(token, str) and token else []
 
 
 def _check_shims(path_prepend: Sequence[str], shim_env: Mapping[str, str]) -> None:
@@ -556,6 +613,7 @@ def execute(
     *,
     scope_dir: Path,
     extra_env: Mapping[str, str] | None = None,
+    allow_env: Collection[str] = (),
     inherit_home: bool = False,
     redact: Sequence[str] = (),
     artifact_uploader: ArtifactUploader | None = None,
@@ -566,8 +624,9 @@ def execute(
     """Runs `spec.task` and returns its envelope. Never raises for a problem with the run
     itself: a bad input, a script that crashes, a timeout and an unreadable output are
     all a `failed` (or `partial`) envelope. `extra_env` is added to the child's
-    environment (it may not name a reserved or host-only variable: ValueError), and its
-    values are redacted from what comes back. `inherit_home` runs the child with the
+    environment (it may not name a reserved or host-only variable: ValueError, except the
+    PLATFORM_MINTED_FILE_ENV names the caller lists in `allow_env`), and its values are
+    redacted from what comes back. `inherit_home` runs the child with the
     caller's own HOME instead of a private one, for `rwtask run` on a developer's
     machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner. It
     also makes relative credential paths in the caller's environment (KUBECONFIG, ...:
@@ -584,7 +643,11 @@ def execute(
     _check_shims(path_prepend, shim_env or {})
     scope_dir = Path(scope_dir)
     task = spec.task
-    caller_env = check_extra_env(extra_env or {})
+    caller_env = check_extra_env(extra_env or {}, allow=allow_env)
+    minted_env, minted_secrets = (
+        _callers_minted_credentials(task, os.environ) if inherit_home else ({}, [])
+    )
+    redact = [*redact, *minted_secrets]
     started_at = datetime.now(UTC)
     # The run's reference time (RW_NOW), taken once here unless the spec carries one.
     run_started_at = current_now()
@@ -669,6 +732,7 @@ def execute(
     caller_paths = resolve_credential_paths(os.environ) if inherit_home else {}
     env = {
         **caller_paths,
+        **minted_env,
         **caller_env,
         **_v13_env(spec, inputs, settings, language, run_started_at),
     }
@@ -930,6 +994,7 @@ def _collect_artifacts(
 
 __all__ = [
     "CREDENTIAL_PATH_VARS",
+    "PLATFORM_MINTED_FILE_ENV",
     "ArtifactUploadError",
     "RunOutcome",
     "RunSpec",

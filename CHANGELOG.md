@@ -7,6 +7,15 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- The platform-minted `runwhen/sync` credential reaches a task as the JSON file at
+  `$RW_SYNC_CREDENTIAL` (lanes B, C): a lease's `materialized[]` entry
+  `{credentialType: runwhen/sync, files: [{env: RW_SYNC_CREDENTIAL, ...}]}` is accepted. That one
+  name is allowed only as a file of a `runwhen/sync` entry (`plugin.run.PLATFORM_MINTED_FILE_ENV`;
+  `check_extra_env(..., allow=)`, `execute(..., allow_env=)`); as an `env{}` key, under another
+  credential type, in caller `extra_env`, and every other RW_* name stay refused. Its token is
+  redacted on its own as well as with the file. `rwtask run` and `rwtask test --record` pass the
+  caller's own `$RW_SYNC_CREDENTIAL` (made absolute) to a task that declares `runwhen/sync`;
+  a replay does not.
 - `rwtask serve` fetches a V13 lease's plugin code archive from the runner relay when it is not in
   the local cache (DLV-9; it used to fail with a `dependency` error). `RelayClient.open_code()`
   streams `GET /v1/tasks/{requestId}/code`; the body must be exactly the lease's `code.archive.size`
