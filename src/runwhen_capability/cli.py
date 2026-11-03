@@ -17,6 +17,7 @@
     rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
     rwtask validate <dir> [--with SPEC ...]
     rwtask compile <plugin-dir> [--out DIR] [--with SPEC ...]
+    rwtask pull [--plugin-dir DIR] [--from SOURCE | --registry URL] [--frozen] [name[@range] ...]
     rwtask upconvert <src-dir> --into <skills-dir> [--name NAME] [--force]
 
 See serve.py, run_local.py, label.py, schemas.py, gitops.py, port/ and upconvert/.
@@ -438,6 +439,43 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out", default="dist", help="directory to write the archive and compiled.json into"
     )
 
+    pull_p = sub.add_parser(
+        "pull",
+        help="pull the integrations a plugin requires/extends into the plugin cache, pin them "
+        "in runwhen.lock and write offline editor schemas to .runwhen/schemas/",
+    )
+    pull_p.add_argument(
+        "names",
+        nargs="*",
+        metavar="name[@range]",
+        help="plugins to pull (default: every requires/extends entry of plugin.yaml); a range "
+        "here replaces plugin.yaml's for the resolution and must still satisfy it",
+    )
+    pull_p.add_argument("--plugin-dir", default=".", help="the plugin directory (default: .)")
+    pull_p.add_argument(
+        "--from",
+        dest="source",
+        default=None,
+        metavar="SOURCE",
+        help="where to pull from: git+<url> (tags <name>/v<semver>, plugin at plugins/<name>) "
+        "or a directory; default: the source runwhen.lock recorded, else "
+        "git+https://github.com/runwhen-contrib/runwhen-plugins",
+    )
+    pull_p.add_argument(
+        "--registry", default=None, metavar="URL", help="pull from a plugin registry's API"
+    )
+    pull_p.add_argument(
+        "--token",
+        default=None,
+        help="a bearer token for --registry; default: the RUNWHEN_REGISTRY_TOKEN env var",
+    )
+    pull_p.add_argument(
+        "--frozen",
+        action="store_true",
+        help="install exactly the versions in runwhen.lock and fail if it is missing or out of "
+        "date with plugin.yaml (CI)",
+    )
+
     upconvert_p = sub.add_parser(
         "upconvert",
         help="up-convert a custom-capability/v1 bundle or a capability/v1 directory to a V13 "
@@ -455,6 +493,124 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def _pull(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    import yaml
+
+    from .contracts import load_yaml
+    from .plugin.editor import write_editor_schemas
+    from .plugin.lock import (
+        LockedPlugin,
+        LockError,
+        cached_archive_matches,
+        declared_dependencies,
+        lock_problems,
+        read_lock,
+        write_lock,
+    )
+    from .plugin.pull import DEFAULT_SOURCE, PullError, parse_source, pull
+    from .plugin.semver import satisfies
+
+    who = "rwtask pull"
+    if args.source and args.registry:
+        parser.error("pull: --from and --registry are mutually exclusive")
+    directory = Path(args.plugin_dir)
+    if not (directory / "plugin.yaml").is_file():
+        print(f"{who}: {directory} has no plugin.yaml (see --plugin-dir)", file=sys.stderr)
+        return 1
+    try:
+        plugin = load_yaml((directory / "plugin.yaml").read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        print(f"{who}: cannot read {directory / 'plugin.yaml'}: {exc}", file=sys.stderr)
+        return 1
+    declared = declared_dependencies(plugin) if isinstance(plugin, dict) else {}
+    try:
+        old_lock = read_lock(directory)
+    except LockError as exc:
+        print(f"{who}: {exc}", file=sys.stderr)
+        return 2
+
+    wanted: dict[str, str] = {}  # name -> the range to resolve it at
+    for item in args.names:
+        name, sep, range_ = item.partition("@")
+        if name not in declared:
+            print(
+                f"{who}: {name!r} is not in plugin.yaml's requires or extends; add it there first",
+                file=sys.stderr,
+            )
+            return 2
+        if sep and not range_:
+            print(f"{who}: {item!r} has an empty range", file=sys.stderr)
+            return 2
+        wanted[name] = range_ if sep else declared[name]
+    if not args.names:
+        wanted = dict(declared)
+
+    if args.frozen:
+        problem = lock_problems(old_lock, declared)
+        if problem:
+            print(f"{who}: --frozen: {problem}; run `rwtask pull` and commit it", file=sys.stderr)
+            return 2
+
+    token = args.token or os.environ.get("RUNWHEN_REGISTRY_TOKEN")
+    explicit = f"registry+{args.registry}" if args.registry else args.source
+    sources: dict[str, object] = {}
+
+    def source_for(name: str):
+        locked = (old_lock or {}).get(name)
+        spec = explicit or (locked.source if locked else DEFAULT_SOURCE)
+        if spec not in sources:
+            sources[spec] = parse_source(spec, token=token)
+        return sources[spec]
+
+    locked_now = dict(old_lock or {})
+    for name in sorted(wanted):
+        range_ = wanted[name]
+        try:
+            if args.frozen:
+                entry = old_lock[name]
+                if cached_archive_matches(name, entry):
+                    print(f"{name} {entry.version} {entry.archive_sha256} (cached)")
+                    continue
+                pulled = pull(name, f"={entry.version}", source=source_for(name))
+                if pulled.archive_sha256 != entry.archive_sha256:
+                    print(
+                        f"{who}: {name}@{entry.version} from {pulled.source_ref} hashes to "
+                        f"{pulled.archive_sha256}, runwhen.lock has {entry.archive_sha256}",
+                        file=sys.stderr,
+                    )
+                    return 2
+            else:
+                source = source_for(name)
+                pulled = pull(name, range_, source=source)
+                if not satisfies(pulled.version, declared[name]):
+                    print(
+                        f"{who}: {name}@{pulled.version} (from {range_!r}) does not satisfy "
+                        f"plugin.yaml's {declared[name]!r}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                locked_now[name] = LockedPlugin(
+                    declared[name], pulled.version, pulled.archive_sha256, source.spec
+                )
+        except PullError as exc:
+            print(f"{who}: {name}: {exc}", file=sys.stderr)
+            return 1
+        print(f"{pulled.name} {pulled.version} {pulled.archive_sha256} ({pulled.source_ref})")
+
+    if not args.frozen and (old_lock is not None or locked_now):
+        locked_now = {n: e for n, e in locked_now.items() if n in declared}
+        if write_lock(directory, locked_now):
+            print(f"wrote {directory / 'runwhen.lock'}")
+    schemas = write_editor_schemas(directory)
+    print(f"wrote {schemas} (editor schemas; see {schemas.parent / 'README'})", file=sys.stderr)
+    print(
+        f"hint: add {schemas.parent.name}/ to .gitignore, or commit it so CI and every editor "
+        "share the same schemas",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def _upconvert(args: argparse.Namespace) -> int:
@@ -1406,6 +1562,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "upconvert":
         return _upconvert(args)
+
+    if args.command == "pull":
+        return _pull(parser, args)
 
     if args.command == "validate":
         from .plugin import load_dir, load_skill_dir, validate_tree
