@@ -1,0 +1,19 @@
+# source: synthetic (no wiki example); consistent with 41a-integration-spec.md (D68 verdicts)
+checkedAt: 2026-11-03T09:00:00Z
+rules:
+  - hash: "sha256:6e45f55209f85736fb3b9e9c49c72b2ed467bd48a3e861098bbde55a325185e0"
+    rule: { apiGroups: [apps], resources: [deployments], verbs: [get, list] }
+    verdict: granted
+    evidence: "kubectl auth can-i list deployments.apps --all-namespaces: yes"
+  - hash: "sha256:35a8b4c916aef9580e414dd3f1341e25d8ac68576bfdaf333b49c69941c4bbcf"
+    rule: { apiGroups: [""], resources: [pods], verbs: [get, list] }
+    verdict: partial
+    scope: [payments, checkout]
+    evidence: "kubectl auth can-i list pods: yes in payments and checkout, no elsewhere"
+  - hash: "sha256:dfec48246cdfff1a65e5e3782e301b12cf3a640b1cd4c50038d82666b005afd7"
+    rule: { apiGroups: [""], resources: [secrets], verbs: [get] }
+    verdict: denied
+    evidence: "kubectl auth can-i get secrets: no"
+  - hash: "sha256:de6447f283b70bbb0cf502628fed4b52d85768151b21045702ab3c1eb57af1d2"
+    rule: { nonResourceURLs: [/version], verbs: [get] }
+    verdict: unverified

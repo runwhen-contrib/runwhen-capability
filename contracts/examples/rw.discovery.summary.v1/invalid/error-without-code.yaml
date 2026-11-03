@@ -1,0 +1,3 @@
+# expect: /errors/0 'code' is a required property
+counts: { cluster: 1 }
+errors: [{ message: "pods is forbidden" }]

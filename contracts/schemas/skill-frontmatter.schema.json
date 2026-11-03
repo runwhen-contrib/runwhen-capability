@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/skill-frontmatter/v1.json",
+  "title": "SkillFrontmatter",
+  "description": "SKILL.md frontmatter: Agent Skills keys plus one `runwhen:` key (D65, D70, D71).",
+  "type": "object",
+  "properties": {
+    "name": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "compatibility": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "allowed-tools": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "disable-model-invocation": {
+      "type": "boolean"
+    },
+    "runwhen": {
+      "type": "object",
+      "properties": {
+        "role": {
+          "oneOf": [
+            {
+              "enum": [
+                "discovery",
+                "cli",
+                "permission-check",
+                "health"
+              ]
+            },
+            {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "discovery",
+                  "cli",
+                  "permission-check",
+                  "health"
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          ]
+        },
+        "appliesTo": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/appliesTo"
+        },
+        "tags": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/tags"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "name",
+    "description"
+  ],
+  "additionalProperties": false
+}

@@ -16,7 +16,7 @@ dependencies = [
     "requests>=2.31",
     # An early 413/503 relay response is only readable mid-upload on urllib3 2.x.
     "urllib3>=2",
-    "jsonschema>=4.18",
+    "jsonschema[format-nongpl]>=4.23,<5",
 ]
 
 [project.urls]
@@ -28,9 +28,12 @@ rwtask = "runwhen_capability.cli:main"
 [project.optional-dependencies]
 dev = [
     "build>=1",
+    # Generates contracts/models; the pin is exact because the output is committed.
+    "datamodel-code-generator==0.88.0",
+    "openapi-spec-validator==0.9.0",
     "pytest>=8",
     "responses>=0.25",
-    "ruff>=0.16",
+    "ruff==0.17.3",
 ]
 
 [tool.setuptools.dynamic]
@@ -38,6 +41,10 @@ version = { attr = "runwhen_capability.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The packaged copy of contracts/ (see scripts/sync_contracts.py).
+[tool.setuptools.package-data]
+"runwhen_capability.contracts" = ["_data/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/rw.access.v1/v1.json",
+  "title": "AccessReport",
+  "description": "Output kind of an integration's permissionCheck task (D68): a verdict per declared rule.",
+  "type": "object",
+  "properties": {
+    "checkedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "hash": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/sha256"
+          },
+          "rule": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/permissionRule"
+          },
+          "verdict": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/verdictName"
+          },
+          "scope": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "hash",
+          "rule",
+          "verdict"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "verdict": {
+                  "const": "partial"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "scope"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "rules"
+  ],
+  "additionalProperties": false
+}

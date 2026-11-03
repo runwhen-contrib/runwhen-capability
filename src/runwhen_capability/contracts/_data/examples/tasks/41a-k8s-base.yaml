@@ -1,0 +1,40 @@
+# source: 41a-integration-spec.md "## The base skill"
+# skills/k8s-base/tasks.yaml
+apiVersion: runwhen.com/tasks/v1
+runtime: kubernetes@1
+defaults: { credentials: kubernetes/kubeconfig }
+tasks:
+  - name: discover
+    title: Discover cluster resources
+    description: Enumerates resources in scope, computes rollups, and syncs them to the platform.
+    script: scripts/discover.py
+    readOnly: true
+    credentials: [kubernetes/kubeconfig, runwhen/sync]        # runwhen/sync is platform-minted per run by the lease, not a connection
+    permissions:                                              # + get, list on each type it is asked to cover
+      - { nonResourceURLs: [/version], verbs: [get] }
+      - { apiGroups: [""], resources: [namespaces], verbs: [get, list] }
+    settings:
+      namespaces: { type: "string[]", default: [], description: Empty = all readable namespaces }
+    outputs:
+      summary:    { kind: rw.discovery.summary.v1 }           # counts, coverage, discovered types; a section of the rw.discovery.v1 sync payload
+      podRollups: { schema: ./schemas/podRollups.v1.json }    # consumed by the k8sPods facet
+  - name: check-permissions
+    title: Check permissions
+    description: Tests every declared permission against this connection and reports what it can do.
+    script: scripts/check_permissions.py                       # kubectl auth can-i per native rule
+    readOnly: true
+    outputs:
+      access: { kind: rw.access.v1 }                           # per rule: granted | partial (+ scope) | denied | unverified, with evidence
+  - name: kubectl
+    title: kubectl (read-only)
+    description: Run a read-only kubectl command against this cluster.
+    script: scripts/kubectl.sh
+    readOnly: true
+    permissions: [{ apiGroups: ["*"], resources: ["*"], verbs: [get, list, watch] }]   # secrets are still excluded by deniedResources
+    settings:
+      allowedVerbs: { type: "string[]", default: [get, describe, logs, top, events, explain, api-resources] }
+      deniedResources: { type: "string[]", default: [secrets], description: "Resource kinds the task refuses, whatever the verbs and flags allow; configmaps are not denied" }
+      allowedFlags: { type: "string[]", default: [n, A, l, o, since, tail, previous, container, show-labels, sort-by] }
+      maxOutputLines: { type: integer, default: 2000 }
+    inputs:
+      command: { type: string, description: "kubectl arguments, e.g. get pods -o wide" }

@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/dependencies/v1.json",
+  "title": "DependenciesFile",
+  "description": "integration/dependencies.yaml: dependency rules and integration-declared edge types (D66, IN7).",
+  "type": "object",
+  "properties": {
+    "edgeTypes": {
+      "$ref": "#/$defs/edgeTypes"
+    },
+    "rules": {
+      "$ref": "#/$defs/rules"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "edgeTypes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "required": [
+          "title"
+        ],
+        "additionalProperties": false
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      }
+    },
+    "rule": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "maxLength": 255
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "edgeType": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "from": {
+          "type": "object",
+          "properties": {
+            "platform": {
+              "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+            },
+            "types": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
+                  },
+                  {
+                    "const": "*"
+                  }
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "types"
+          ],
+          "additionalProperties": false
+        },
+        "to": {
+          "type": "object",
+          "properties": {
+            "platform": {
+              "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+            },
+            "types": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
+                  },
+                  {
+                    "const": "*"
+                  }
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "types"
+          ],
+          "additionalProperties": false
+        },
+        "strategy": {
+          "enum": [
+            "reference",
+            "owner_reference",
+            "label_selector",
+            "field_join",
+            "path_template",
+            "dns_reference"
+          ]
+        },
+        "params": {
+          "type": "object"
+        },
+        "direction": {
+          "enum": [
+            "forward",
+            "reverse"
+          ]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "id",
+        "edgeType",
+        "from",
+        "to",
+        "strategy"
+      ],
+      "additionalProperties": false
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/rule"
+      }
+    }
+  }
+}

@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/common/v1.json",
+  "title": "Common",
+  "description": "Shared definitions for every RunWhen V13 plugins contract.",
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "maxLength": 64
+    },
+    "camelName": {
+      "type": "string",
+      "pattern": "^[a-z][A-Za-z0-9]*$",
+      "maxLength": 64
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "semverRange": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[0-9A-Za-z.*^~<>=|+ -]+$",
+      "description": "npm-style range: ^1.4, ~0.3.1, >=1.2 <2, 1.x; `platform` uses CalVer >=2026.11"
+    },
+    "pinnedPlugin": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*@(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+      "description": "<plugin>@<exact semver>, e.g. kubernetes@1.4.0"
+    },
+    "qualifiedType": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+([.-][a-z0-9]+)*$",
+      "description": "<integration>/<type>"
+    },
+    "typeRef": {
+      "type": "string",
+      "pattern": "^([a-z0-9]+(-[a-z0-9]+)*/)?[a-z0-9]+([.-][a-z0-9]+)*$",
+      "description": "a type of this integration (`deployment`) or a qualified one (`kubernetes/namespace`)"
+    },
+    "credentialTypeName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*$"
+    },
+    "typeName": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
+      "maxLength": 255
+    },
+    "resourcePath": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*(/[^/\\s]+)+$",
+      "maxLength": 2048,
+      "description": "platform/<plural>/<name>/\u2026, e.g. kubernetes/clusters/prod-east/namespaces/payments"
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^([0-9]+(ms|s|m|h|d))+$",
+      "description": "30s, 15m, 1h30m"
+    },
+    "quantity": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$"
+    },
+    "envVarName": {
+      "type": "string",
+      "pattern": "^[A-Z_][A-Z0-9_]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "relPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[^/\\\\][^\\\\]*$",
+      "description": "POSIX path relative to its file's directory; no leading /, no `..` (checked by the SDK)"
+    },
+    "taskRef": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*$",
+      "description": "<skill>/<task> inside one plugin"
+    },
+    "fullTaskRef": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*:[a-z0-9]+(-[a-z0-9]+)*(/[a-z0-9]+(-[a-z0-9]+)*)?$",
+      "description": "<plugin>:<skill>[/<task>]; workspace skills use the plugin name `workspace`"
+    },
+    "valueType": {
+      "type": "string",
+      "pattern": "^(string|integer|number|boolean|duration|datetime|enum|object)(\\[\\])?$"
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "maxLength": 64
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/tag"
+      },
+      "uniqueItems": true
+    },
+    "paramBase": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/valueType"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "default": true,
+        "enum": {
+          "type": "array",
+          "minItems": 1
+        },
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "pattern": {
+          "type": "string",
+          "format": "regex"
+        },
+        "examples": {
+          "type": "array"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "schema": {
+          "oneOf": [
+            {
+              "type": "object"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "enum"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "enum"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "object"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "schema"
+            ]
+          }
+        }
+      ]
+    },
+    "inputSpec": {
+      "$ref": "#/$defs/paramBase",
+      "unevaluatedProperties": false
+    },
+    "settingSpec": {
+      "$ref": "#/$defs/paramBase",
+      "required": [
+        "type",
+        "default"
+      ],
+      "unevaluatedProperties": false
+    },
+    "authInputSpec": {
+      "$ref": "#/$defs/paramBase",
+      "properties": {
+        "derived": {
+          "type": "boolean"
+        }
+      },
+      "unevaluatedProperties": false
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "appliesTo": {
+      "type": "object",
+      "properties": {
+        "types": {
+          "type": "array",
+          "items": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/qualifiedType"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "labels": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/labels"
+        }
+      },
+      "required": [
+        "types"
+      ],
+      "additionalProperties": false
+    },
+    "credentialRefKind": {
+      "enum": [
+        "k8s-secret",
+        "vault",
+        "file",
+        "in-cluster-sa",
+        "cloud-identity"
+      ]
+    },
+    "credentialRef": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialRefKind"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "keys": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          },
+          "propertyNames": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+          },
+          "description": "generic/env: variable -> key inside the referenced secret"
+        },
+        "content": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "k8s-secret",
+                  "vault",
+                  "file"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "kind",
+              "ref"
+            ]
+          }
+        }
+      ]
+    },
+    "verdictName": {
+      "enum": [
+        "granted",
+        "partial",
+        "denied",
+        "unverified"
+      ]
+    },
+    "verdict": {
+      "oneOf": [
+        {
+          "enum": [
+            "granted",
+            "denied",
+            "unverified"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "verdict": {
+              "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/verdictName"
+            },
+            "scope": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          },
+          "required": [
+            "verdict"
+          ],
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "verdict": {
+                    "const": "partial"
+                  }
+                }
+              },
+              "then": {
+                "required": [
+                  "scope"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "artifactRef": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "pattern": "^art_[A-Za-z0-9_-]+$"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "contentType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "artifact"
+      ],
+      "additionalProperties": false
+    },
+    "permissionRule": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "one permission in the source system's own terms (D68); validated against the integration's permissions.schema"
+    },
+    "resources": {
+      "type": "object",
+      "properties": {
+        "cpu": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/quantity"
+        },
+        "memory": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/quantity"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

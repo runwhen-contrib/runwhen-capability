@@ -1,0 +1,19 @@
+# source: 41a-integration-spec.md "## dependencies.yaml"
+edgeTypes:                                     # additions to the platform's core set (owns, routes_to, uses, runs_as, mounts, calls, hosted_by, exposed_by …)
+  scales: { title: Scales, description: An autoscaler targets a workload }
+rules:
+  - id: k8s.service-routes-to-workload
+    description: Service selector matches a workload's pod-template labels
+    edgeType: routes_to
+    from: { types: [service] }
+    to:   { types: [deployment, statefulset, daemonset] }
+    strategy: label_selector
+    params: { selector: spec.selector, targetLabels: spec.template.metadata.labels, scope: sameParent }
+    confidence: 0.9
+  - id: k8s.serviceaccount-assumes-aws-iam-role          # cross-integration (D49): dangles until aws is installed
+    edgeType: runs_as
+    from: { types: [serviceaccount] }
+    to:   { platform: aws, types: [iam-role] }
+    strategy: reference
+    params: { field: "metadata.annotations.\"eks.amazonaws.com/role-arn\"" }
+    confidence: 1.0
