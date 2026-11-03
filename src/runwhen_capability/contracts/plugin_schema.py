@@ -210,7 +210,7 @@ def _is_regex(instance: object) -> bool:
 def _format_checker() -> FormatChecker:
     checker = FormatChecker([])
     checker.checkers = dict(Draft202012Validator.FORMAT_CHECKER.checkers)
-    checker.checks("regex", raises=re2.error)(_is_regex)
+    checker.checks("regex", raises=(re2.error, UnicodeEncodeError))(_is_regex)
     return checker
 
 
@@ -294,6 +294,9 @@ def _pattern_problem(pattern: Any) -> str | None:
         return f"pattern must be a string, got {type(pattern).__name__}"
     try:
         _compile(pattern)
+    except UnicodeEncodeError:
+        # JSON allows a lone surrogate; RE2 compiles UTF-8 and cannot encode it.
+        return f"pattern {pattern!r} is not valid UTF-8"
     except re2.error as exc:
         reason = exc.args[0] if exc.args else exc
         if isinstance(reason, bytes):

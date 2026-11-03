@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -214,3 +215,16 @@ def test_the_contract_schemas_patterns_are_all_re2_compilable():
     for name in contracts.SCHEMA_NAMES:
         found = [p for p in iter_schema_problems(contracts.schema(name)) if p[1] == "pattern"]
         assert found == [], name
+
+
+def test_a_lone_surrogate_pattern_is_reported_not_raised():
+    # JSON allows "\ud800"; RE2 compiles UTF-8 and cannot encode it.
+    schema = json.loads('{"type": "string", "pattern": "\\ud800"}')
+    problems = check_plugin_schema(schema)
+    assert problems and "not valid UTF-8" in problems[0]
+
+
+def test_a_lone_surrogate_regex_format_is_a_format_error():
+    validator = validator_for_plugin_schema({"type": "string", "format": "regex"})
+    errors = list(validator.iter_errors(json.loads('"\\ud800"')))
+    assert errors and errors[0].validator == "format"
