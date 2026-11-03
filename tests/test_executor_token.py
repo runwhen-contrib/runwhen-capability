@@ -24,6 +24,7 @@ import runwhen_capability.serve as serve_mod
 from runwhen_capability import bundle
 from runwhen_capability.custom.hashing import content_hash
 from runwhen_capability.plugin import run as plugin_run
+from runwhen_capability.relay import TokenNotPresent
 from runwhen_capability.serve import (
     DEFAULT_TOKEN_FILE,
     _load_executor_token,
@@ -130,19 +131,71 @@ def test_an_unlink_that_fails_with_erofs_is_tolerated_and_logged_once(
 
 
 @pytest.mark.parametrize("content", ["", "  \n\t\n"])
-def test_an_empty_token_file_is_a_clear_startup_error(tmp_path, content):
+def test_an_empty_token_file_is_pending_not_an_error(tmp_path, caplog, content):
     path = tmp_path / "token"
     path.write_text(content)
-    with pytest.raises(SystemExit) as excinfo:
-        _load_executor_token(path, LOG)
-    assert "empty" in str(excinfo.value)
-    assert str(path) in str(excinfo.value)
+    with caplog.at_level(logging.INFO, logger=LOG.name):
+        tokens = _load_executor_token(path, LOG)
+    assert tokens.pending
+    assert path.exists()  # nothing to unlink yet
+    assert caplog.text.count(f"executor token not present yet at {path}; waiting for it") == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    with pytest.raises(TokenNotPresent):
+        tokens.get()
 
 
-def test_a_missing_token_file_is_a_clear_startup_error(tmp_path):
-    with pytest.raises(SystemExit) as excinfo:
-        _load_executor_token(tmp_path / "nope", LOG)
-    assert "could not read executor token" in str(excinfo.value)
+def test_a_missing_token_file_is_pending_not_an_error(tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger=LOG.name):
+        tokens = _load_executor_token(tmp_path / "nope", LOG)
+    assert tokens.pending
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    with pytest.raises(TokenNotPresent):
+        tokens.get()
+    assert caplog.text.count("executor token not present yet") == 1  # waiting is not re-logged
+
+
+def test_a_pending_source_adopts_the_token_when_the_file_appears_and_unlinks_it(tmp_path, caplog):
+    path = tmp_path / "token"
+    tokens = _load_executor_token(path, LOG)
+    path.write_text("")
+    with pytest.raises(TokenNotPresent):
+        tokens.get()  # still empty: still pending
+    path.write_text(" late-token\n")
+
+    with caplog.at_level(logging.INFO, logger=LOG.name):
+        assert tokens.get() == "late-token"
+
+    assert not path.exists()
+    assert not tokens.pending
+    assert not tokens.rereads_file
+    assert caplog.text.count("executor token mode:") == 1
+    assert "held in memory only" in caplog.text
+    path.write_text("other")  # whatever happens to the file next changes nothing
+    assert tokens.get() == "late-token"
+    assert caplog.text.count("executor token mode:") == 1
+
+
+def test_a_pending_source_that_cannot_unlink_becomes_a_re_reading_one(
+    tmp_path, monkeypatch, caplog
+):
+    path = tmp_path / "token"
+    tokens = _load_executor_token(path, LOG)
+    path.write_text("late-token")
+    monkeypatch.setattr(serve_mod.os, "unlink", _erofs)
+
+    with caplog.at_level(logging.INFO, logger=LOG.name):
+        assert tokens.get() == "late-token"
+        path.write_text("rotated")
+        assert tokens.get() == "rotated"
+
+    assert path.exists()
+    assert tokens.rereads_file
+    assert caplog.text.count("executor token mode:") == 1
+    assert caplog.text.count("left in place (read-only mount)") == 1
+
+
+def _erofs(_path):
+    raise OSError(errno.EROFS, "Read-only file system")
 
 
 # -- serve(): read once -------------------------------------------------------------------
@@ -186,6 +239,47 @@ def test_serve_keeps_working_when_the_file_is_deleted_after_start(tmp_path):
     assert not token_file.exists()  # serve unlinked it ...
     assert len(responses.calls) == 2  # ... and still polled with the in-memory token
     assert responses.calls[1].request.headers["Authorization"] == "Bearer token-a"
+
+
+@responses.activate
+def test_serve_skips_polls_while_pending_then_reads_unlinks_and_uses_a_late_token(
+    tmp_path, monkeypatch, caplog
+):
+    token_file = tmp_path / "late" / "token"
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:  # the token turns up while serve is waiting
+            token_file.parent.mkdir()
+            token_file.write_text("late-token\n")
+
+    monkeypatch.setattr(serve_mod.time, "sleep", sleep)
+    responses.add(responses.POST, f"{RELAY}/v1/tasks/next", status=204)
+
+    with caplog.at_level(logging.INFO):
+        _serve(tmp_path, token_file, max_iterations=4)
+
+    assert len(sleeps) == 2  # the first two iterations were skipped
+    assert [c.request.headers["Authorization"] for c in responses.calls] == [
+        "Bearer late-token"
+    ] * 2
+    assert not token_file.exists()  # read once, then unlinked
+    assert caplog.text.count("executor token not present yet") == 1
+    assert caplog.text.count("held in memory only") == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@responses.activate
+def test_an_empty_token_file_keeps_serve_waiting(tmp_path, monkeypatch):
+    token_file = tmp_path / "token"
+    token_file.write_text("\n")
+    monkeypatch.setattr(serve_mod.time, "sleep", lambda _s: None)
+
+    _serve(tmp_path, token_file, max_iterations=2)
+
+    assert len(responses.calls) == 0
+    assert token_file.exists()
 
 
 def _refuse_unlink(monkeypatch):
@@ -655,6 +749,59 @@ def test_a_task_cannot_read_the_token_from_the_file_or_from_the_serve_process(
     else:
         # every relay call was authenticated with the in-memory token
         assert auth == {"Bearer super-secret-executor-token"}, stderr
+
+
+@linux_only
+def test_serve_with_no_token_file_loads_its_capability_and_picks_the_token_up_later(
+    relay_server, tmp_path
+):
+    """What an image smoke test sees: `rwtask serve` with no token file gets as far as
+    loading its capability, logs no error, and when a token appears it polls with it and
+    removes the file."""
+    from relay_server import Response
+
+    token_file = tmp_path / "executor" / "token"
+    token_file.parent.mkdir()
+    relay_server.default = Response(204)
+    serve_proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "runwhen_capability.cli",
+            "serve",
+            "--relay",
+            relay_server.url,
+            "--pool",
+            "pool-1",
+            "--workdir",
+            str(tmp_path / "work"),
+            "--capability-dir",
+            str(FIXTURES / "echo"),
+            "--token-file",
+            str(token_file),
+        ],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(1.5)  # long enough to have loaded the capability and tried a poll
+        assert serve_proc.poll() is None, "serve exited without a token"
+        assert relay_server.requests == []  # nothing sent without a token
+        token_file.write_text("late-executor-token\n")
+        _wait_for(lambda: relay_server.requests, "serve never polled with the late token", 30)
+    finally:
+        serve_proc.terminate()
+        _, stderr = serve_proc.communicate(timeout=30)
+
+    assert {r.header("Authorization") for r in relay_server.requests} == {
+        "Bearer late-executor-token"
+    }
+    assert not token_file.exists()
+    assert "serving capability" in stderr
+    assert "executor token not present yet" in stderr
+    assert " ERROR " not in stderr, stderr
 
 
 def _wait_for(condition, message: str, timeout: float = 60.0) -> None:

@@ -76,8 +76,10 @@ with the wheel and sdist attached to the GitHub Release.
   `/var/run/executor/token`. If the unlink worked the token lives in memory only. If it is refused
   (a read-only Secret mount, as on today's runner) the file stays and is re-read before every relay
   call, so a Secret rotated in place is still picked up (the last token read is the fallback when a
-  re-read fails). Which mode is active is logged once. A missing, unreadable or empty token file is a
-  start-up error (exit), not a logged retry loop. `serve` also makes itself non-dumpable
+  re-read fails). Which mode is active is logged once. The token file need not exist at start-up (an image
+  smoke test, a pod that starts before its mount): `serve` warns once ("executor token not present
+  yet at <path>; waiting for it"), loads its capability, skips polls (never unauthenticated) until
+  the file holds a token, then applies the rule above once. `serve` also makes itself non-dumpable
   (`prctl(PR_SET_DUMPABLE, 0)`, Linux) in both modes so a task cannot read the token from
   `/proc/<pid>/mem` or `environ`. `RW_EXECUTOR_TOKEN_FILE` is host-only like `EXECUTOR_TOKEN_FILE`.
   `RelayClient` takes `token=`, `token_source=` (new `relay.TokenSource`) or a `token_file`, which it
