@@ -45,16 +45,17 @@ see bundle.py) is run only when this executor was started with
 failed result. Packaged-capability images never set it.
 
 A `request` whose JSON has `apiVersion: runwhen.com/lease/v1` is a V13 lease (see
-plugin/lease.py): it needs no `--allow-bundles`, because what it runs is plugin code the
-lease pins by sha256 (inline files are rebuilt into the archive and hashed; an archive must
-be in the cache), not code the request is free to choose. It is validated against the
-`lease` contract and run through the same child runner as a bundle, in its own scope, which
-is always wiped. The poll response's `materialized[]` (secret files and variables the
-runner produced) is written under `$RW_CREDENTIALS_DIR`, exported to the task and deleted
-at its end (plugin/lease.py). The result POSTed is `{"status": "ok", "result": <the bare D64 result
-envelope>}` -- not the classic `{version, setup, tasks}` -- including when the envelope's
-own status is `failed`; `status: failed` is only for a request this executor could not
-process at all.
+plugin/lease.py). It needs the same opt-in as a bundle: hash verification proves the code
+is what the lease names, not that it is trustworthy, and papi sends workspace skills inline
+as arbitrary code. Without `--allow-bundles` (or RW_ALLOW_BUNDLES=1) it completes as a
+failed envelope with `invalid_input` (PLUGIN_CODE_NOT_ALLOWED) and nothing is written or
+run. Otherwise it is validated against the `lease` contract and run through the same child
+runner as a bundle, in its own scope, which is always wiped. The poll response's
+`materialized[]` (secret files and variables the runner produced) is written under
+`$RW_CREDENTIALS_DIR`, exported to the task and deleted at its end. The result POSTed is
+`{"status": "ok", "result": <the bare D64 result envelope>}` -- not the classic
+`{version, setup, tasks}` -- including when the envelope's own status is `failed`;
+`status: failed` is only for a request this executor could not process at all.
 
 `scopeId` must be a single path segment (see _is_safe_scope_id): the loop
 creates and later deletes <workdir>/<scopeId>/, so anything else -- empty,
@@ -101,7 +102,7 @@ from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
 from .models import BundleRequestEnvelope, TaskHostRequest, V13LeaseRequest
-from .plugin.lease import run_lease, wipe_stale_credentials
+from .plugin.lease import failed_envelope, run_lease, wipe_stale_credentials
 from .relay import RelayClient
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
@@ -109,6 +110,10 @@ RESULT_TIMEOUT = 30  # seconds
 RETRY_DELAY = 5  # seconds, on a poll/post transport failure
 
 DEFAULT_TOKEN_FILE = "/var/run/executor/token"
+
+PLUGIN_CODE_NOT_ALLOWED = (
+    "this executor does not run plugin code (start with --allow-bundles, or RW_ALLOW_BUNDLES=1)"
+)
 
 BUNDLES_NOT_ALLOWED = (
     "this executor does not run bundle requests: it was started without --allow-bundles "
@@ -149,7 +154,8 @@ def serve(
     carries arbitrary code, and only an image built to run custom
     capabilities should ever execute one. With it off, a bundle request
     is refused with a failed result before anything touches the
-    filesystem."""
+    filesystem. A V13 lease (plugin code carried inline or by archive) needs the
+    same opt-in and is refused the same way, as a failed envelope."""
     log = log or logging.getLogger("runwhen_capability.serve")
     session = session or requests.Session()
     workdir = Path(workdir)
@@ -457,6 +463,19 @@ def _poll_once(
             token,
             log,
         )
+        return
+
+    if is_lease and not allow_bundles:
+        # Refused as an envelope, like every other lease that cannot run: the runner and
+        # papi learn why nothing ran. Nothing has been written, and no code looked at.
+        log.error(
+            "request %s: refusing a V13 lease -- this executor was not started with "
+            "--allow-bundles",
+            task_request.requestId,
+        )
+        envelope = failed_envelope("invalid_input", PLUGIN_CODE_NOT_ALLOWED)
+        body = _encode_result({"status": "ok", "result": envelope}, log)
+        _post_result(session, relay, task_request.requestId, body, token_file, token, log)
         return
 
     scope_dir = workdir / task_request.scopeId

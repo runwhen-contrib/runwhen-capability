@@ -94,7 +94,7 @@ def poll(tmp_path, monkeypatch):
     monkeypatch.setenv("RW_ARCHIVE_CACHE", str(tmp_path / "archives"))
     monkeypatch.setenv("RW_CREDENTIALS_DIR", str(tmp_path / "creds"))
 
-    def go(request, **extra):
+    def go(request, *, allow_bundles=True, **extra):
         with responses.RequestsMock() as rsps:
             rsps.add(
                 responses.POST,
@@ -116,6 +116,7 @@ def poll(tmp_path, monkeypatch):
                 capability_dir=ECHO,
                 token_file=token,
                 max_iterations=1,
+                allow_bundles=allow_bundles,
             )
             assert len(rsps.calls) == 2
             body = json.loads(rsps.calls[1].request.body)
@@ -149,16 +150,32 @@ def test_an_inline_python_lease_runs_end_to_end_and_completes_with_the_bare_enve
     assert not (poll.workdir / "scope-1").exists()  # a lease's scope is always wiped
 
 
-def test_an_inline_bash_lease_runs_with_a_base64_file_and_needs_no_allow_bundles(poll):
+def test_an_inline_bash_lease_runs_with_a_base64_file(poll):
     script = TASKS["sh-ok"]["script"]
     lease = make_lease(
         "sh-ok", code=inline_code(base64_path=script), inputs={"count": 1, "note": "hi"}
     )
-    envelope = envelope_of(poll(lease))  # serve() was started without allow_bundles
+    envelope = envelope_of(poll(lease))
     assert envelope["status"] == "ok"
     assert envelope["outputs"]["probe"] == [
         {"namespace": "runwhen", "name": "runwhen-papi", "threshold": 1500, "note": "hi"}
     ]
+
+
+def test_a_lease_is_refused_unless_plugin_code_is_allowed(poll):
+    """Hash verification proves integrity, not trust: the same opt-in as a bundle."""
+    body = poll(make_lease("py-ok"), allow_bundles=False, materialized=materialized())
+    envelope = envelope_of(body)
+    assert envelope["status"] == "failed"
+    [error] = envelope["errors"]
+    assert error["code"] == "invalid_input"
+    assert error["message"] == (
+        "this executor does not run plugin code (start with --allow-bundles, or RW_ALLOW_BUNDLES=1)"
+    )
+    assert envelope["outputs"] == {}
+    # nothing was written or run: no scope, no credential directory
+    assert not (poll.workdir / "scope-1").exists()
+    assert not poll.creds.exists()
 
 
 def test_a_task_that_fails_is_a_failed_envelope_in_an_ok_request(poll):
@@ -299,7 +316,7 @@ def test_a_classic_bundle_request_is_unchanged_next_to_leases(poll):
         "inputs": {"since": "30m", "maxWait": 20},
         "target": {"urn": "urn:resource:pgbouncer"},
     }
-    body = poll(request)  # allow_bundles is off: refused exactly as before
+    body = poll(request, allow_bundles=False)  # refused exactly as before
     assert body["status"] == "failed"
     assert "--allow-bundles" in body["error"]
 
