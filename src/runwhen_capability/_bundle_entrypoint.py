@@ -21,10 +21,12 @@ value with a `model_dump`, such as the ArtifactRef `ctx.artifacts` returns, is
 written as its JSON form). Whether `main()` returns or raises, a writer it left
 open is then aborted, with a warning on stderr: its partial file is removed,
 never left in RW_ARTIFACTS_DIR for the host to upload as if it were whole.
-Any other exception is left to propagate: this
-process's non-zero exit code (and its stderr, captured by bundle.py as part of
-the task's log) is how bundle.py learns the task failed -- there is no
-separate error channel.
+An uncaught RwError (RwCommandError included) is recorded in the error side
+channel (`ctx.error`, so one JSON line in $RW_ERRORS_FILE), its message is
+printed to stderr, and the process exits 1: the host reads its code from the
+side channel. Any other exception is left to propagate: this process's
+non-zero exit code (and its stderr, captured by bundle.py as part of the
+task's log) is how bundle.py learns the task failed.
 
 Everything this process needs arrives by environment variable -- see
 bundle.py's _execute() for exactly what it sets:
@@ -45,6 +47,11 @@ bundle.py's _execute() for exactly what it sets:
                          read and deleted before the task's code runs
     RW_ALLOW_ANONYMOUS   "1" to degrade unresolved credentials (rwtask
                          run --allow-anonymous only)
+    RW_ERRORS_FILE       the error side channel `ctx.error` appends to
+    RW_OUT               a per-task writable directory (left to the task)
+    RW_RESOURCE_JSON, RW_SETTINGS_JSON, RW_DRY_RUN
+                         what `ctx.resource`, `ctx.settings` and `ctx.dry_run`
+                         read (set by the host when it has them)
 
 The variables only this wrapper needs are removed from os.environ before the
 task's module is even imported, so nothing the task starts inherits them.
@@ -63,6 +70,7 @@ from pathlib import Path
 from .artifacts import ArtifactsClient, LocalArtifactSink
 from .context import Context
 from .errors import SkipTask
+from .rwerrors import RwError
 
 
 def _json_default(value):
@@ -159,6 +167,10 @@ def main() -> int:
         reason = str(exc.args[0]) if exc.args else ""
         _write_event(output_fd, {"op": "skip", "reason": reason})
         return 0
+    except RwError as exc:
+        ctx.error(exc.code, exc.message, scope=exc.scope, hint=exc.hint, details=exc.details)
+        print(f"{exc.code}: {exc.message}", file=sys.stderr)
+        return 1
     finally:
         ctx.artifacts._abort_unclosed()
 

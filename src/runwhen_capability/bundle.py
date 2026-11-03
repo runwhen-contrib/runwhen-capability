@@ -117,6 +117,7 @@ from .custom.manifest import (
 )
 from .custom.schema_features import regex_keyword_paths
 from .custom.yaml_lines import safe_load
+from .envelope import errors_from_jsonl
 from .errors import ArtifactError, ArtifactsUnavailableError
 from .models import (
     BundleRequestEnvelope,
@@ -431,6 +432,7 @@ def _run_invocation(
             # this task's artifact. (The request's first check, which refuses a
             # directory that is not ours, is in _prepare_scope.)
             _reset_artifacts_dir(scope_dir)
+            _reset_task_channels(scope_dir)
             exit_code, stream, log_tail, timed_out = _execute(
                 files_dir=files_dir,
                 file_path=file_path,
@@ -511,7 +513,15 @@ def _run_invocation(
             }
 
         errors: list[str] = [missing_error] if missing_error else []
-        if exit_code != 0:
+        # The structured errors the task recorded (ctx.error, an uncaught RwError,
+        # rw_error), folded in as "<code>: <message>" so a classic consumer reads
+        # them like any other entry. They are notes, not failures: the exit code
+        # still decides the status. A task that failed with one has said why, so the
+        # generic "process exited N" (which an uncaught RwError's code replaces) is
+        # left out.
+        structured = errors_from_jsonl(scope_dir / _ERRORS_FILE)
+        errors.extend(f"{e['code']}: {e['message']}" for e in structured)
+        if exit_code != 0 and not structured:
             errors.append(f"process exited {exit_code}")
         if stream.overflowed:
             errors.append(
@@ -1255,6 +1265,10 @@ def _execute(
         "RW_WORKDIR": str(scope_dir),
         # Not inherited (every RW_* is stripped): set here, for bash and Python alike.
         "RW_ARTIFACTS_DIR": str(scope_dir / _ARTIFACTS_DIR),
+        # The error side channel (a file the task appends JSON lines to: see
+        # envelope.errors_from_jsonl) and a directory the task may use freely.
+        "RW_ERRORS_FILE": str(scope_dir / _ERRORS_FILE),
+        "RW_OUT": str(scope_dir / _OUT_DIR),
         "RW_CAPABILITY": capability,
         "RW_OPERATION": operation,
         # The bundle's lib/ (it may not exist): importable from Python tasks,
@@ -1405,6 +1419,8 @@ def _inherited_env() -> dict[str, str]:
 _HOME_DIR = ".rw-home"
 _TMP_DIR = ".rw-tmp"
 _ARTIFACTS_DIR = "artifacts"
+_OUT_DIR = ".rw-out"
+_ERRORS_FILE = ".rw-errors.jsonl"
 
 
 def _prepare_scope(scope_dir: Path) -> None:
@@ -1447,6 +1463,16 @@ def _reset_artifacts_dir(scope_dir: Path) -> None:
     whatever is there now is this request's own (a task may have replaced it)."""
     _fresh_dir(scope_dir / _ARTIFACTS_DIR)
     _write_private_file(scope_dir / _ARTIFACTS_DIR, _ARTIFACTS_MARKER, "")
+
+
+def _reset_task_channels(scope_dir: Path) -> None:
+    """Fresh for the next task: an empty `$RW_OUT`, and an empty error side
+    channel (`$RW_ERRORS_FILE`) -- what an earlier task wrote there is never this
+    task's."""
+    _fresh_dir(scope_dir / _OUT_DIR)
+    errors_file = scope_dir / _ERRORS_FILE
+    errors_file.unlink(missing_ok=True)
+    _write_private_file(scope_dir, _ERRORS_FILE, "")
 
 
 def _fresh_dir(path: Path, marker: str | None = None, what: str = "a bundle directory") -> None:

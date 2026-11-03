@@ -1408,3 +1408,163 @@ def _token(tmp_path: Path) -> Path:
     token_file = tmp_path / "token"
     token_file.write_text("tok-1")
     return token_file
+
+
+# -- CAP-5: structured errors through the side channel --------------------------------
+
+
+def _show(task_file: str, body: str) -> dict:
+    return _lib_bundle(task_file, body, {})
+
+
+def _only_task(files, tmp_path):
+    result = _run(files, ["show"], tmp_path)
+    [task] = result.tasks
+    return task
+
+
+def test_an_uncaught_rw_error_becomes_the_errors_code_not_a_generic_failure(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "from runwhen_capability import RwError\n"
+            "def main(ctx):\n"
+            "    raise RwError('not_found', 'no such deployment', scope='ns/web')\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "failed"
+    assert task.errors == ["not_found: no such deployment"]
+    assert task.error == "not_found: no such deployment"
+    assert not any("process exited" in e for e in task.errors)
+    assert "not_found" in task.logTail  # also on stderr, for a human reading the log
+
+
+def test_an_uncaught_rw_command_error_carries_the_classified_code(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "def main(ctx):\n"
+            "    ctx.run(['sh', '-c', 'echo \"Error from server (Forbidden): pods\" >&2; exit 1'],"
+            " check=True)\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "failed"
+    assert len(task.errors) == 1
+    assert task.errors[0].startswith("permission_denied: sh exited 1: ")
+
+
+def test_ctx_error_with_a_clean_exit_is_folded_into_errors_and_the_status_stays_ok(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "def main(ctx):\n"
+            "    ctx.error('timeout', 'node n1 did not answer', scope='n1')\n"
+            "    ctx.error('rate_limited', 'slow down')\n"
+            "    return {'seen': 'partial data'}\n",
+        ),
+        tmp_path,
+    )
+    # The classic wire shape: no `partial` status. The envelope derives it later.
+    assert task.status == "ok"
+    assert task.outputs == {"seen": "partial data"}
+    assert task.errors == ["timeout: node n1 did not answer", "rate_limited: slow down"]
+
+
+def test_ctx_error_then_a_crash_keeps_the_error_and_fails(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "def main(ctx):\n"
+            "    ctx.error('unreachable', 'db down')\n"
+            "    raise RuntimeError('boom')\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "failed"
+    assert task.errors == ["unreachable: db down"]
+    assert "RuntimeError: boom" in task.logTail
+
+
+def test_a_bash_rw_error_is_folded_and_the_exit_code_decides_the_status(tmp_path):
+    ok = _only_task(
+        _show("tasks/show.sh", 'source "$RW_SDK/rw.sh"\nrw_error not_found "no pod" ns/a\n'),
+        tmp_path / "ok",
+    )
+    assert ok.status == "ok"
+    assert ok.errors == ["not_found: no pod"]
+
+    failed = _only_task(
+        _show("tasks/show.sh", 'source "$RW_SDK/rw.sh"\nrw_error storage "disk full"\nexit 3\n'),
+        tmp_path / "failed",
+    )
+    assert failed.status == "failed"
+    assert failed.errors == ["storage: disk full"]
+
+
+def test_a_bash_rw_error_with_an_invalid_code_is_folded_as_internal(tmp_path):
+    task = _only_task(
+        _show("tasks/show.sh", 'source "$RW_SDK/rw.sh"\nrw_error E_NOPE "x"\nexit 1\n'),
+        tmp_path,
+    )
+    assert task.errors == ["internal: x"]
+
+
+def test_a_forged_side_channel_line_is_one_internal_error(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.sh",
+            'echo \'{"code": "bogus", "message": "m"}\' >> "$RW_ERRORS_FILE"\n'
+            "echo 'not json' >> \"$RW_ERRORS_FILE\"\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "ok"
+    assert len(task.errors) == 2
+    assert all(e.startswith("internal: ") for e in task.errors)
+
+
+def test_a_failed_task_with_no_structured_errors_keeps_the_generic_prefix(tmp_path):
+    task = _only_task(_show("tasks/show.sh", "exit 4\n"), tmp_path)
+    assert task.errors == ["process exited 4"]
+
+
+def test_the_side_channel_is_fresh_for_every_task(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nrw_error timeout "first"\n',
+        {},
+    )
+    files["capability.yaml"] += "  - name: second\n    file: tasks/second.sh\n    readOnly: true\n"
+    files["tasks/second.sh"] = "true\n"
+    result = _run(files, ["show", "second"], tmp_path)
+    first, second = result.tasks
+    assert first.errors == ["timeout: first"]
+    assert second.errors == []
+
+
+@pytest.mark.parametrize("language", ["py", "sh"])
+def test_rw_out_is_a_fresh_writable_directory_inside_the_scope(tmp_path, language):
+    if language == "py":
+        body = (
+            "import os\n"
+            "def main(ctx):\n"
+            "    d = os.environ['RW_OUT']\n"
+            "    before = sorted(os.listdir(d))\n"
+            "    open(os.path.join(d, 'x.txt'), 'w').write('hi')\n"
+            "    inside = d.startswith(os.environ['RW_WORKDIR'])\n"
+            "    return {'seen': repr((before, os.path.isdir(d), inside))}\n"
+        )
+    else:
+        body = (
+            'source "$RW_SDK/rw.sh"\n'
+            'printf hi > "$RW_OUT/x.txt"\n'
+            'rw_set seen "\\"$(ls "$RW_OUT")|$([[ $RW_OUT == "$RW_WORKDIR"/* ]] && echo in)\\""\n'
+        )
+    task = _only_task(_show(f"tasks/show.{language}", body), tmp_path)
+    assert task.status == "ok", task
+    if language == "py":
+        assert task.outputs["seen"] == "([], True, True)"
+    else:
+        assert task.outputs["seen"] == "x.txt|in"

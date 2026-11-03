@@ -219,8 +219,8 @@ def _blank_single_quoted(text: str) -> str:
 # `${`, quadratic on crafted input.
 _VAR_REF_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))")
 _RW_INPUT_RE = re.compile(r"\brw_input\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
-_RW_APPEND_RE = re.compile(r"\brw_append\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
-_RW_SET_RE = re.compile(r"\brw_set\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
+_RW_APPEND_RE = re.compile(r"\brw_(?:output_)?append\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
+_RW_SET_RE = re.compile(r"\brw_(?:output_)?set\s+[\"']?([A-Za-z_][A-Za-z0-9_-]*)[\"']?")
 # The first argument of rw_artifact, as one shell word written out literally: bare,
 # "double-quoted" or 'single-quoted', with no expansion in it ("$name" is for the
 # runtime to check). It is taken whole and then judged by is_valid_artifact_name, so
@@ -376,7 +376,7 @@ def bash_rw_input_reads(text: str) -> list[tuple[int, str]]:
 
 
 def bash_output_writes(text: str) -> list[tuple[int, str]]:
-    """(line, output name) for every `rw_append`/`rw_set` call. Comments and
+    """(line, output name) for every `rw_append`/`rw_set` (or `rw_output_*`) call. Comments and
     heredoc bodies are never scanned -- a comment mentioning either by name
     (documentation, an example) is not a call."""
     text = _strip_comments_and_heredocs(text)
@@ -578,7 +578,16 @@ def python_data_as_code(source: str) -> list[tuple[int, str]]:
 
 #: The public helpers rw.sh defines; any other `rw_*` command is a typo or an
 #: invented helper that bash reports as "command not found" and carries on.
-RW_SH_HELPERS = ("rw_input", "rw_append", "rw_set", "rw_skip", "rw_artifact")
+RW_SH_HELPERS = (
+    "rw_input",
+    "rw_append",
+    "rw_set",
+    "rw_skip",
+    "rw_artifact",
+    "rw_output_append",
+    "rw_output_set",
+    "rw_error",
+)
 
 # An rw_* word in command position: _COMMAND_START, plus a backtick
 # substitution. Not followed by `=`/`+=` (an assignment to a variable that
