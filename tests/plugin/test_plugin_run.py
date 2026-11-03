@@ -474,7 +474,7 @@ def test_the_documented_api_probe_script_runs_with_the_documented_names(run, tmp
     _stub(
         tmp_path / "bin",
         "kubectl",
-        f'echo "$@" >> {calls}\n'
+        f'printf "%s\\n" "$*" >> {calls}\n'
         'case "$*" in\n'
         "  *healthz) echo ok ;;\n"
         "  *livez) echo 'Error from server (ServiceUnavailable)' >&2; exit 1 ;;\n"
