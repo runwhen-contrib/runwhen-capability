@@ -174,7 +174,7 @@ def load_entries(entries: Iterable[TreeEntry]) -> PluginTree:
             continue
         folded[key] = path
         parts = path.split("/")
-        if parts[0] == "tests" and len(parts) > 1:
+        if (parts[0] in ("tests", ".runwhen") and len(parts) > 1) or path == LOCK_FILE:
             continue  # excluded from the archive (archive.md section 2)
         if not layout_allows(path):
             diags.append(
