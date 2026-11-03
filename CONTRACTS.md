@@ -382,7 +382,9 @@ path reaches the cluster). papi then:
    no automatic subtree merge: both roots may carry children, issues and
    memories.
 
-`rootKey` stays the key until one is reported.
+`rootKey` stays the key until one is reported. A report whose `name` differs
+from the root type's declared `canonicalKey`, or for a root type that declares
+none, is ignored and logged: papi never re-keys a root on an undeclared name.
 
 ## Hashing
 
