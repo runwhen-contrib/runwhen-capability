@@ -25,6 +25,12 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 # $RW_OUT is a directory, fresh for this task, that the task may write to freely;
 # nothing in it is read by the host.
 #
+# $RW_NOW is the run's reference time (RFC 3339, UTC, milliseconds, e.g.
+# 2026-11-04T09:14:02.123Z) and $RW_NOW_EPOCH the same instant in integer seconds: use
+# them, not `date`, for anything that ends up in a command or an output, so that
+# `rwtask test` replays the argv it recorded. Use $SECONDS or `date +%s` only to
+# measure a duration. (Unset in a classic bundle.)
+#
 # rw_error records "the task could not look at something" (never a finding): <code> is
 # one of permission_denied, not_found, unreachable, timeout, rate_limited, storage,
 # invalid_input, dependency, internal (any other is recorded as internal, with a hint),

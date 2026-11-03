@@ -213,3 +213,13 @@ tasks:
     dryRun: true
     outputs:
       result: { schema: "{ dry: boolean }" }
+  - name: kube-annotate
+    title: Stamp a deployment (bash, kubectl)
+    description: Annotates the deployment with the run's reference time; what a replay must reproduce.
+    script: scripts/kube_annotate.sh
+    readOnly: false
+    effects: ["Annotates the deployment"]
+    destructive: false
+    idempotent: true
+    outputs:
+      result: { schema: "{ stamped: string }" }

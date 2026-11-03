@@ -5,7 +5,10 @@ replay without it, and every way a replay can fail. The plugin is a tmp copy of 
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -26,6 +29,7 @@ echo "$*" >> "$FAKE_KUBECTL_LOG"
 case "$*" in
   *"get pods"*) printf '{\\n  "items": [{}, {}, {}]\\n}\\n' ;;
   *"get events"*) echo "Error: events is Forbidden" >&2; exit 1 ;;
+  *"annotate"*) echo "deployment.apps/runwhen-papi annotated" ;;
   *"rollout restart"*"--dry-run=server"*) echo "deployment.apps/runwhen-papi restarted (dry run)" ;;
   *"rollout restart"*) echo "deployment.apps/runwhen-papi restarted" ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
@@ -507,3 +511,89 @@ def test_replaying_a_dry_run_scenario_of_a_task_without_dry_run_fails(rwtask, pl
 def test_dry_run_only_applies_with_record(rwtask):
     with pytest.raises(SystemExit):
         rwtask("probe/kube-restart", "--dry-run")
+
+
+# -- the run's reference time (RW_NOW) -------------------------------------------------------------
+
+
+def record_annotate(rwtask, scenario="stamp"):
+    return rwtask(
+        "probe/kube-annotate", "--record", "--resource", DEPLOYMENT, "--scenario", scenario,
+        "--allow-write", expect=0,
+    )  # fmt: skip
+
+
+def test_record_stores_the_reference_time_the_run_used(rwtask, plugin, kubectl):
+    before = datetime.now(UTC).replace(microsecond=0)
+    record_annotate(rwtask)
+    doc = load_yaml(fixture_path(plugin, "kube-annotate", "stamp").read_text())
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", doc["now"]), doc["now"]
+    assert before <= datetime.fromisoformat(doc["now"]) <= datetime.now(UTC)
+    # the time the task put in its command line is the one that was recorded
+    assert doc["calls"][0]["argv"][-2:] == [f"restarted-at={doc['now']}", "--overwrite"]
+    assert kubectl.calls() == [
+        f"-n runwhen annotate deployment/runwhen-papi restarted-at={doc['now']} --overwrite"
+    ]
+
+
+def test_replay_reproduces_an_argv_that_carries_the_time(rwtask, plugin, kubectl):
+    record_annotate(rwtask)
+    path = fixture_path(plugin, "kube-annotate", "stamp")
+    stamp = load_yaml(path.read_text())["now"]
+    add_outputs(path, f"  outputs:\n    result: {{stamped: '{stamp}'}}\n")
+    kubectl.remove()
+    time.sleep(0.01)  # a fresh clock reading would differ from the recorded one
+    _, out, _ = rwtask("probe/kube-annotate", expect=0)
+    assert "PASS probe/kube-annotate/stamp" in out
+
+
+def test_a_scenario_without_now_replays_with_a_fresh_time(rwtask, plugin, kubectl):
+    record_annotate(rwtask)
+    path = fixture_path(plugin, "kube-annotate", "stamp")
+    path.write_text(re.sub(r"(?m)^now: .*\n", "", path.read_text()))
+    kubectl.remove()
+    code, out, _ = rwtask("probe/kube-annotate")
+    assert code == 1  # the recorded argv names a time the fresh run does not have
+    assert "E_FIXTURE_MISMATCH call 1" in out
+    assert "restarted-at=" in out
+
+
+@needs_jq
+def test_an_old_scenario_without_now_still_passes(rwtask, plugin, kubectl):
+    record(rwtask)
+    path = fixture_path(plugin)
+    text = path.read_text()
+    assert "\nnow: " in text  # every recording carries one now
+    path.write_text(
+        re.sub(r"(?m)^now: .*\n", "", text)
+        + "  outputs:\n    pods: {namespace: runwhen, count: 3}\n"
+    )
+    kubectl.remove()
+    _, out, _ = rwtask("probe/kube-count", expect=0)
+    assert "PASS probe/kube-count/basic" in out
+
+
+def test_replay_runs_the_task_at_the_scenarios_now(rwtask, plugin, kubectl):
+    path = fixture_path(plugin, "kube-annotate", "fixed")
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "resource: " + DEPLOYMENT + "\n"
+        "now: '2020-02-29T23:59:58.500Z'\n"
+        "calls:\n"
+        "  - argv: [kubectl, -n, runwhen, annotate, deployment/runwhen-papi,\n"
+        "           'restarted-at=2020-02-29T23:59:58.500Z', --overwrite]\n"
+        "expect:\n"
+        "  status: ok\n"
+        "  outputs: {result: {stamped: '2020-02-29T23:59:58.500Z'}}\n"
+    )
+    _, out, _ = rwtask("probe/kube-annotate", expect=0)
+    assert "PASS probe/kube-annotate/fixed" in out
+
+
+def test_a_malformed_now_in_a_scenario_is_reported_with_the_file(rwtask, plugin):
+    path = fixture_path(plugin, "kube-annotate", "bad")
+    path.parent.mkdir(parents=True)
+    path.write_text("now: yesterday\nexpect: {status: ok}\n")
+    code, out, _ = rwtask("probe/kube-annotate")
+    assert code == 1
+    assert "FAIL probe/kube-annotate/bad" in out and "now" in out

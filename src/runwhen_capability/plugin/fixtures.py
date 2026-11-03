@@ -7,6 +7,8 @@ A scenario is one YAML file, `skills/<skill>/tests/<task>/<scenario>.yaml`:
     settings: {label: x}                  # optional
     identity: {cluster: kind}             # optional, overrides the path-derived identity
     dryRun: true                          # optional: RW_DRY_RUN=1; the task must declare dryRun
+    now: "2026-11-04T09:14:02.123Z"       # optional: the run's reference time (RW_NOW, ctx.now());
+                                          # --record writes it; absent: a fresh time
     calls:                                # the CLI calls the task makes, in order
       - argv: [kubectl, get, pods]        # argv[0] is the tool's basename
         stdin: "..."                      # optional; asserted only when present
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +39,12 @@ import jsonschema
 import yaml
 
 from ..contracts import load_yaml
+from ..reftime import format_now, parse_now
 from ..rwerrors import ERROR_CODES
 
 STATUSES = ("ok", "partial", "failed", "skipped")
+
+_NOW_PATTERN = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$"
 
 _STRING_MAP = {"type": "object", "additionalProperties": {"type": "string"}}
 
@@ -54,6 +60,7 @@ SCENARIO_SCHEMA: dict[str, Any] = {
         "settings": {"type": "object"},
         "identity": _STRING_MAP,
         "dryRun": {"type": "boolean"},
+        "now": {"type": "string", "pattern": _NOW_PATTERN},
         "calls": {
             "type": "array",
             "items": {
@@ -124,6 +131,8 @@ class Scenario:
     identity: dict = field(default_factory=dict)
     calls: list[dict] = field(default_factory=list)
     dry_run: bool = False
+    #: the run's reference time (`now:`), or None: replay with a fresh one
+    now: datetime | None = None
 
 
 def _path(parts) -> str:
@@ -160,6 +169,10 @@ def load_scenario(path: Path) -> Scenario:
         problems = _expectation_problems(doc["expect"])
     if problems:
         raise FixtureError(path, problems)
+    try:
+        now = parse_now(doc["now"]) if "now" in doc else None
+    except ValueError as exc:  # matches the pattern but is no date: 2026-13-45T...
+        raise FixtureError(path, [f"now: {exc}"]) from None
     calls = [
         {"argv": list(c["argv"]), "rc": 0, "stdout": "", "stderr": "", **_without_argv(c)}
         for c in doc.get("calls") or []
@@ -174,6 +187,7 @@ def load_scenario(path: Path) -> Scenario:
         identity=doc.get("identity") or {},
         calls=calls,
         dry_run=bool(doc.get("dryRun", False)),
+        now=now,
     )
 
 
@@ -283,8 +297,10 @@ def dump_scenario(
     expect: dict,
     header: str = "",
     dry_run: bool = False,
+    now: datetime | None = None,
 ) -> str:
-    """The YAML text of a scenario (the `--record` output)."""
+    """The YAML text of a scenario (the `--record` output). `now` is the reference time
+    the run used, written as a quoted RFC 3339 string."""
     doc: dict[str, Any] = {}
     if resource is not None:
         doc["resource"] = resource
@@ -293,6 +309,8 @@ def dump_scenario(
             doc[key] = value
     if dry_run:
         doc["dryRun"] = True
+    if now is not None:
+        doc["now"] = format_now(now)
     doc["calls"] = calls
     doc["expect"] = expect
     body = yaml.dump(doc, Dumper=_Dumper, sort_keys=False, allow_unicode=True, width=100)

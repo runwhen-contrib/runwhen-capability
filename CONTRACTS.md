@@ -130,6 +130,7 @@ What a script sees (the runner and `rwtask run` set the same names):
 | Credential | the tool reads its standard form (`$KUBECONFIG`, `PG*`, `REDIS_URL`) | same |
 | Dry run | `ctx.dry_run` | `RW_DRY_RUN=1` |
 | Contract | `RW_TASK_CONTRACT=v13` | `RW_TASK_CONTRACT=v13` |
+| Reference time | `ctx.now()` (aware UTC `datetime`) | `$RW_NOW` (`2026-11-04T09:14:02.123Z`), `$RW_NOW_EPOCH` (integer seconds) |
 | Outputs | the returned dict; `ctx.error(code, msg, scope=, hint=, details=)`; `raise RwError(code, msg)` | `rw_output_append <name> <json>`; `rw_output_set <name> <json>`; `rw_error <code> <msg> [scope]`; files in `$RW_OUT` |
 | Files | `$RW_OUT` (scratch and artifact files), `$RW_LIB_DIR` | `$RW_OUT`, `$RW_LIB_DIR` |
 
@@ -138,6 +139,18 @@ bundle's, and both the runner and `rwtask run` set it. Under it `ctx.run` raises
 `RwCommandError` (an `RwError` whose code comes from the command's stderr) on a
 non-zero exit by default; classic bundles keep returning the exit status unless
 `check=True`. An explicit `check=` always wins.
+
+**The run's reference time.** The executor takes one instant when a run starts and
+gives it to the script as `RW_NOW` (RFC 3339, UTC, millisecond precision, `Z`) and
+`RW_NOW_EPOCH` (the same instant in integer seconds); `ctx.now()` returns `RW_NOW`
+parsed (without it, in a classic bundle or a plain unit test, it is the wall clock).
+Use it for anything that ends up in a command or an output
+(`kubectl annotate ... restarted-at="$RW_NOW"`, "events in the last hour"), so a
+replay is reproducible: `rwtask test --record` stores it as the scenario's `now:`
+and replay runs the task at that time, so the recorded argv matches exactly (a
+scenario without `now` replays with a fresh time). Use `time.monotonic()` (bash:
+`$SECONDS`) for durations. A lease carries no reference time: the runner uses the
+start of the run. `RW_*` stays reserved: a credential or `extra_env` cannot set it.
 
 **bash.** A task runs under `set -euo pipefail` with `rw.sh` already loaded: call
 the helpers without sourcing anything.
