@@ -16,6 +16,7 @@ from typing import Any
 
 import yaml
 
+from ..contracts import load_yaml
 from .robot_model import ClassicBundle, ClassicTask, UserVar
 
 KUBERNETES = "kubernetes"
@@ -557,7 +558,7 @@ def draft_skill(
 def load_inventory_entry(path: Path, bundle_name: str) -> dict | None:
     """The entry for `bundle_name` in an inventory file (a YAML list of bundle
     entries, or a mapping with a `bundles` list); None when absent."""
-    doc = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    doc = load_yaml(Path(path).read_text(encoding="utf-8"))  # F19: YAML 1.2, so `no` stays a string
     entries = doc.get("bundles") if isinstance(doc, dict) else doc
     if entries is not None and not isinstance(entries, list):
         raise ValueError(
