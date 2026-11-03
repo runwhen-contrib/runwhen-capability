@@ -7,6 +7,16 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `rwtask serve` fetches a V13 lease's plugin code archive from the runner relay when it is not in
+  the local cache (DLV-9; it used to fail with a `dependency` error). `RelayClient.open_code()`
+  streams `GET /v1/tasks/{requestId}/code`; the body must be exactly the lease's `code.archive.size`
+  bytes (never more than 64 MiB, enforced while reading), carry a matching `X-RW-Sha256` when sent,
+  and hash to the lease's sha256. Only verified bytes are cached, at `<cache>/<hex>.tar`, written to
+  a unique temporary file and renamed into place, so concurrent fetches of one archive in a pod both
+  succeed. A failed or mismatched fetch is a `dependency` envelope that names the archive (not the
+  relay URL or token); with no relay (`rwtask run`) a missing archive stays a `dependency` error.
+  `.archives`, the cache directory, is refused as a `scopeId`. `load_code` and
+  `runspec_from_lease` take an optional `relay`.
 - `rwtask pull [--plugin-dir DIR] [--from git+URL|DIR | --registry URL] [--frozen] [name[@range] ...]`
   (AUT-1) resolves a plugin's `requires`/`extends` (not `platform`) to exact versions and fills the
   plugin cache (`<name>/<version>.compiled.json` + `.tar`, written atomically; a cached archive that

@@ -68,7 +68,8 @@ the filesystem is touched. So is ".rw-artifact-cache", the one directory of
 <workdir> that is not a scope: the cache of input artifacts that
 `ctx.artifacts.input_path` fills (see _artifact_cache.py). It sits beside the
 scopes, not in one, so that a stateless scope's wipe does not empty it, and
-every request is told where it is.
+every request is told where it is. And ".archives", the cache of plugin code
+archives a V13 lease fetches from the relay (plugin/lease.py).
 
 Per request: create <workdir>/<scopeId>/, chdir there, run setup then each
 task in request.tasks order (host.run_request), aggregate into the result
@@ -109,6 +110,7 @@ from .host import run_request
 from .loader import discover_capability_dir, load_capability
 from .models import BundleRequestEnvelope, TaskHostRequest, V13LeaseRequest
 from .plugin.lease import (
+    ARCHIVE_CACHE_DIR,
     attach_provenance,
     failed_envelope,
     run_lease,
@@ -317,8 +319,12 @@ def _is_safe_scope_id(scope_id: str) -> bool:
 
     The name of the input-artifact cache, a directory of `workdir` too, is
     refused as well: a scope called that would be wiped after its request and
-    take every cached artifact with it."""
-    return scope_id not in ("", ".", "..", ARTIFACT_CACHE_DIR) and scope_id == Path(scope_id).name
+    take every cached artifact with it. So is the plugin archive cache
+    (`/work/.archives` by default, see plugin/lease.py)."""
+    return (
+        scope_id not in ("", ".", "..", ARTIFACT_CACHE_DIR, ARCHIVE_CACHE_DIR)
+        and scope_id == Path(scope_id).name
+    )
 
 
 def _encode_result(payload: dict, log, max_result_bytes: int | None = None) -> bytes:
