@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/auth-plan/v1.json",
+  "title": "AuthPlan",
+  "description": "Compiled by papi per run from the connection's pinned auth method (D67); executed by the runner as the init step.",
+  "type": "object",
+  "properties": {
+    "connection": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+    },
+    "integration": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/pinnedPlugin"
+    },
+    "authMethod": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+    },
+    "credentialType": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialTypeName"
+    },
+    "reference": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialRef"
+    },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "native": {
+              "enum": [
+                "passthrough",
+                "in-cluster-token"
+              ]
+            }
+          },
+          "required": [
+            "native"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/relPath"
+                },
+                "archive": {
+                  "$ref": "https://schemas.runwhen.com/lease/v1.json#/$defs/archive"
+                }
+              },
+              "required": [
+                "path",
+                "archive"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "script"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean",
+          "array"
+        ]
+      }
+    },
+    "materialize": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "object",
+          "properties": {
+            "env": {
+              "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+            },
+            "mode": {
+              "type": "string",
+              "pattern": "^0[0-7]{3}$"
+            }
+          },
+          "required": [
+            "env"
+          ],
+          "additionalProperties": false
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 1
+    }
+  },
+  "required": [
+    "credentialType",
+    "reference",
+    "step",
+    "materialize"
+  ],
+  "additionalProperties": false
+}

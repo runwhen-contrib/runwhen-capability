@@ -16,7 +16,7 @@ dependencies = [
     "requests>=2.31",
     # An early 413/503 relay response is only readable mid-upload on urllib3 2.x.
     "urllib3>=2",
-    "jsonschema>=4.23,<5",
+    "jsonschema[format-nongpl]>=4.23,<5",
 ]
 
 [project.urls]
