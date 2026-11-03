@@ -44,6 +44,16 @@ see bundle.py) is run only when this executor was started with
 `--allow-bundles` (or RW_ALLOW_BUNDLES=1); otherwise it is refused with a
 failed result. Packaged-capability images never set it.
 
+A `request` whose JSON has `apiVersion: runwhen.com/lease/v1` is a V13 lease (see
+plugin/lease.py): it needs no `--allow-bundles`, because what it runs is plugin code the
+lease pins by sha256 (inline files are rebuilt into the archive and hashed; an archive must
+be in the cache), not code the request is free to choose. It is validated against the
+`lease` contract and run through the same child runner as a bundle, in its own scope, which
+is always wiped. The result POSTed is `{"status": "ok", "result": <the bare D64 result
+envelope>}` -- not the classic `{version, setup, tasks}` -- including when the envelope's
+own status is `failed`; `status: failed` is only for a request this executor could not
+process at all.
+
 `scopeId` must be a single path segment (see _is_safe_scope_id): the loop
 creates and later deletes <workdir>/<scopeId>/, so anything else -- empty,
 absolute, containing "/" or ".." -- is refused as a failed request before
@@ -88,7 +98,8 @@ from .artifacts import ARTIFACT_CACHE_DIR
 from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
-from .models import BundleRequestEnvelope, TaskHostRequest
+from .models import BundleRequestEnvelope, TaskHostRequest, V13LeaseRequest
+from .plugin.lease import run_lease
 from .relay import RelayClient
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
@@ -423,6 +434,7 @@ def _poll_once(
         )
         return
 
+    is_lease = isinstance(task_request.request, V13LeaseRequest)
     is_bundle = isinstance(task_request.request, BundleRequestEnvelope)
     if is_bundle and not allow_bundles:
         # Refused, not ignored: the runner must learn why nothing ran.
@@ -450,7 +462,19 @@ def _poll_once(
     # are scoped to, and re-reads the token file on every call.
     relay_client = RelayClient(relay, token_file, task_request.requestId, session)
     try:
-        if is_bundle:
+        if is_lease:
+            # A V13 lease: plugin code pinned by hash, the same hardened child runner
+            # as a bundle, and the bare result envelope as the result.
+            os.chmod(scope_dir, 0o700)
+            envelope = run_lease(
+                task_request.request.doc,
+                scope_dir=scope_dir,
+                credentials=task_request.credentials,
+                deadline_s=task_request.deadlineMs / 1000,
+                log=log.getChild(task_request.requestId),
+            )
+            payload = {"status": "ok", "result": envelope}
+        elif is_bundle:
             # A bundle's code travels with the request, not baked into this
             # pod's image -- see bundle.py's module docstring. Bundle mode
             # enforces deadlineMs as one budget shared by the request's setup
@@ -481,13 +505,14 @@ def _poll_once(
                 artifact_cache_dir=workdir / ARTIFACT_CACHE_DIR,
                 deadline_seconds=task_request.deadlineMs / 1000,
             )
-        payload = {"status": "ok", "result": result.model_dump(mode="json")}
+        if not is_lease:
+            payload = {"status": "ok", "result": result.model_dump(mode="json")}
     except Exception as exc:  # noqa: BLE001 -- one request must never take down the loop
         log.exception("request %s failed", task_request.requestId)
         payload = {"status": "failed", "error": str(exc)}
     finally:
-        if is_bundle:
-            # No execution.mode concept applies to a bundle request -- it
+        if is_bundle or is_lease:
+            # No execution.mode concept applies to a bundle or a lease -- it
             # never shares a scope with a later request, so it is always
             # wiped, exactly like a stateless packaged capability.
             shutil.rmtree(scope_dir, ignore_errors=True)

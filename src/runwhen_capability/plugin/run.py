@@ -315,7 +315,7 @@ def _env_field(name: str) -> str:
     return input_env_name(re.sub(r"[^A-Za-z0-9_]", "_", name))
 
 
-def _check_extra_env(extra_env: Mapping[str, str]) -> dict[str, str]:
+def check_extra_env(extra_env: Mapping[str, str]) -> dict[str, str]:
     for key in extra_env:
         if is_reserved_env_name(key) or key in bundle._HOST_ONLY_ENV or "=" in key or not key:
             raise ValueError(f"extra_env may not set {key!r}")
@@ -361,6 +361,13 @@ def _validator(schema: dict) -> jsonschema.Validator:
     return cls(schema, registry=referencing.Registry(), format_checker=cls.FORMAT_CHECKER)
 
 
+def _validate_output(schema: dict, value: Any) -> list[str]:
+    """The problems `value` has against an output's JSON Schema, [] if none. The one
+    place output schemas are evaluated, so the engine can be swapped (S13: a
+    plugin-authored `pattern` is a regex the host runs)."""
+    return _problems(_validator(schema), value)
+
+
 def _json_path(parts) -> str:
     return "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in parts)
 
@@ -381,6 +388,8 @@ def _problems(validator: jsonschema.Validator, value: Any, limit: int = 5) -> li
 def _resolve_inputs(task: dict, provided: Mapping[str, Any]) -> tuple[dict, list[dict]]:
     """(inputs, invalid_input errors): defaults overlaid by `provided`, checked against
     the task's compiled `inputSchema`."""
+    if "inputSchema" not in task:  # a lease: its inputs are already resolved
+        return dict(provided), []
     inputs = {
         name: copy.deepcopy(spec["default"])
         for name, spec in (task.get("inputs") or {}).items()
@@ -405,6 +414,8 @@ def _resolve_inputs(task: dict, provided: Mapping[str, Any]) -> tuple[dict, list
 
 
 def _resolve_settings(task: dict, provided: Mapping[str, Any]) -> tuple[dict, list[dict]]:
+    if "settings" not in task:  # a lease: its settings are already resolved
+        return dict(provided), []
     declared: dict[str, dict] = task.get("settings") or {}
     settings = {name: copy.deepcopy(spec.get("default")) for name, spec in declared.items()}
     errors = []
@@ -457,6 +468,7 @@ def execute(
     scope_dir: Path,
     extra_env: Mapping[str, str] | None = None,
     inherit_home: bool = False,
+    redact: Sequence[str] = (),
     log: logging.Logger | None = None,
     path_prepend: Sequence[str] = (),
     shim_env: Mapping[str, str] | None = None,
@@ -472,12 +484,13 @@ def execute(
     `CREDENTIAL_PATH_VARS`) absolute against the caller's working directory.
     `path_prepend` (absolute directories, put first on the child's PATH) and `shim_env`
     (only the RW_SHIM_* names of shims.SHIM_ENV_NAMES) are how `rwtask test` puts its
-    shims in front of the real tools; ValueError for anything else."""
+    shims in front of the real tools; ValueError for anything else.
+    `redact` is further secret values (file contents the caller materialized) to scrub."""
     log = log or _log
     _check_shims(path_prepend, shim_env or {})
     scope_dir = Path(scope_dir)
     task = spec.task
-    caller_env = _check_extra_env(extra_env or {})
+    caller_env = check_extra_env(extra_env or {})
     started_at = datetime.now(UTC)
 
     def finish(
@@ -531,7 +544,7 @@ def execute(
     if timeout_s is None:
         timeout_s = float(bundle.DEFAULT_REQUEST_DEADLINE)
 
-    redactor = Redactor([v for v in caller_env.values() if v])
+    redactor = Redactor([v for v in (*caller_env.values(), *redact) if v])
     files_dir = scope_dir / _PLUGIN_DIR
     rw_sdk_dir = scope_dir / ".rw-sdk"
     try:
@@ -672,7 +685,7 @@ def _check_outputs(task: dict, raw: dict[str, Any]) -> tuple[dict[str, Any], lis
                 )
             )
         elif "jsonSchema" in spec:
-            problems = _problems(_validator(spec["jsonSchema"]), value)
+            problems = _validate_output(spec["jsonSchema"], value)
             if problems:
                 errors.append(
                     _error(
