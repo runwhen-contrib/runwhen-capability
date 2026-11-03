@@ -26,7 +26,7 @@ from runwhen_capability.errors import (
     ArtifactUndeclaredError,
     ResultTooLargeError,
 )
-from runwhen_capability.relay import RelayClient
+from runwhen_capability.relay import RelayClient, TokenSource
 
 CREATED = {
     "artifactRef": "art_abc",
@@ -253,13 +253,49 @@ def test_a_client_built_from_a_token_string_never_touches_a_file(relay_server):
     assert [r.header("Authorization") for r in relay_server.requests] == ["Bearer tok-mem"]
 
 
-def test_a_relay_client_needs_a_token_or_a_token_file(relay_server, tmp_path):
-    with pytest.raises(ValueError, match="token or a token_file"):
+def test_a_relay_client_needs_exactly_one_token_source(relay_server, tmp_path):
+    with pytest.raises(ValueError, match="needs a token"):
         RelayClient(relay_server.url, None, "req-1", requests.Session())
     token_file = tmp_path / "token"
     token_file.write_text("x")
-    with pytest.raises(ValueError, match="not both"):
+    with pytest.raises(ValueError, match="one of"):
         RelayClient(relay_server.url, token_file, "req-1", requests.Session(), token="y")
+
+
+def test_a_client_built_from_a_re_reading_token_source_follows_the_file(relay_server, tmp_path):
+    relay_server.script("PUT", "/", Response(201, json=CREATED), Response(201, json=CREATED))
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-old")
+    client = RelayClient(
+        relay_server.url,
+        None,
+        "req-1",
+        requests.Session(),
+        token_source=TokenSource("tok-old", token_file),
+    )
+
+    _put(client, [b"a"])
+    token_file.write_text("tok-new\n")
+    _put(client, [b"b"])
+
+    assert [r.header("Authorization") for r in relay_server.requests] == [
+        "Bearer tok-old",
+        "Bearer tok-new",
+    ]
+
+
+def test_a_token_source_keeps_the_last_token_when_the_file_goes_bad(tmp_path, caplog):
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    source = TokenSource("tok-1", token_file)
+
+    token_file.write_text(" \n")
+    assert source.get() == "tok-1"
+    token_file.write_text("tok-2")
+    assert source.get() == "tok-2"
+    token_file.unlink()
+    assert source.get() == "tok-2"
+    assert TokenSource("fixed").get() == "fixed"
 
 
 def test_put_artifact_maps_413_to_too_large(relay_server, tmp_path):

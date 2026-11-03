@@ -13,17 +13,24 @@ Relay HTTP contract (this is the wire the runner must implement to match):
         body: {"status": "ok"|"failed"|"timeout", "result": {...}, "error": "..."}
            ("result" is a ResultEnvelope, present only on status "ok")
 
-Every relay call carries `Authorization: Bearer <token>`. The token is read ONCE, at
-start-up, from the executor token file, kept in memory, and the file is then unlinked
-(S1 / SEC-2): task processes run as the same uid in the same pod, so a token that stays
-on disk is a token any task can `cat`. The path comes from --token-file, else the
-RW_EXECUTOR_TOKEN_FILE env var, else the legacy EXECUTOR_TOKEN_FILE, else
-DEFAULT_TOKEN_FILE. A file on a read-only mount cannot be unlinked; that is logged once
-and tolerated. A missing, unreadable or empty token file is a start-up error (the
-process exits; a restarted container gets a fresh pod and token), never a poll without
-a token. Before it reads the token the process also makes itself non-dumpable
-(`_make_non_dumpable`), so a task cannot read the in-memory copy out of /proc either.
-A rotated token means a new pod; nothing re-reads a file.
+Every relay call carries `Authorization: Bearer <token>`. The token is read at start-up
+from the executor token file -- --token-file, else the RW_EXECUTOR_TOKEN_FILE env var, else
+the legacy EXECUTOR_TOKEN_FILE, else DEFAULT_TOKEN_FILE -- and the file is then unlinked
+(S1 / SEC-2): task processes run as the same uid in the same pod, so a token that stays on
+disk is a token any task can `cat`. What happens next depends on whether the unlink worked,
+and is logged once:
+
+- It worked (the runner's own tmpfs copy, which the runner never rotates in place; a
+  restart is a new pod): the token lives in memory only and is never read again.
+- It was refused (a read-only Secret volume, EACCES -- today's runner): the file cannot be
+  hidden anyway, and the kubelet refreshes a mounted Secret in place when it rotates, so
+  the file is re-read right before every relay call. If that re-read fails or finds the
+  file empty, the last token read is used, and logged, rather than dropping a result
+  already computed (see relay.TokenSource).
+
+A missing, unreadable or empty token file at start-up is an error (the process exits), never
+a poll without a token. Before it reads the token the process also makes itself non-dumpable
+(`_make_non_dumpable`), in both modes, so a task cannot read the in-memory copy out of /proc.
 
 A request may carry `maxResultBytes`. The result body is serialised (compact
 JSON) before it is posted, and an `ok` result whose body is larger than that
@@ -107,7 +114,7 @@ from .plugin.lease import (
     run_lease,
     wipe_stale_credentials,
 )
-from .relay import RelayClient
+from .relay import RelayClient, TokenSource
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
@@ -167,7 +174,7 @@ def serve(
     log = log or logging.getLogger("runwhen_capability.serve")
     # First, before the token is in memory: see _make_non_dumpable.
     _make_non_dumpable(log)
-    token = _load_executor_token(_resolve_token_file(token_file), log)
+    tokens = _load_executor_token(_resolve_token_file(token_file), log)
 
     session = session or requests.Session()
     workdir = Path(workdir)
@@ -199,7 +206,7 @@ def serve(
             pool_id,
             workdir,
             capability,
-            token,
+            tokens,
             log,
             stateful_scopes,
             max_stateful_scopes,
@@ -255,13 +262,13 @@ def _resolve_token_file(token_file: Path | None) -> Path:
     )
 
 
-def _load_executor_token(path: Path, log) -> str:
-    """Reads the executor token (whitespace stripped) once and tries to unlink the file.
+def _load_executor_token(path: Path, log) -> TokenSource:
+    """Reads the executor token (whitespace stripped) and tries to unlink the file; returns
+    the `TokenSource` every relay call uses (see the module docstring for the two modes).
     A missing, unreadable or empty file ends the process with a clear message
-    (SystemExit): serving without a token would only fail every poll. An unlink that is
-    refused (a read-only Secret volume, EACCES) is logged once and ignored -- the file
-    then stays where it is, as it does on pods that predate the runner's copy-to-emptyDir
-    change."""
+    (SystemExit): serving without a token would only fail every poll. Unlink worked: a
+    fixed, in-memory token. Unlink refused (a read-only Secret volume, EACCES): logged, and
+    a source that re-reads the file on every call, so a rotation in place is picked up."""
     try:
         token = Path(path).read_text().strip()
     except OSError as exc:
@@ -274,7 +281,10 @@ def _load_executor_token(path: Path, log) -> str:
         os.unlink(path)
     except OSError:
         log.info("executor token file left in place (read-only mount): %s", path)
-    return token
+        log.info("executor token mode: re-reading %s on every relay call (rotation in place)", path)
+        return TokenSource(token, path, log)
+    log.info("executor token mode: held in memory only; the token file was removed")
+    return TokenSource(token, None, log)
 
 
 def _wipe_stale_bundle_scopes(workdir: Path, log) -> None:
@@ -365,11 +375,14 @@ def _post_result(
     relay: str,
     request_id: str,
     body: bytes,
-    token: str,
+    tokens: TokenSource,
     log,
 ) -> None:
-    """POSTs one PutResult; `body` is the JSON that `_encode_result` made, `token` the
-    executor token held in memory since start-up (see the module docstring).
+    """POSTs one PutResult; `body` is the JSON that `_encode_result` made. The token comes
+    from `tokens.get()` immediately before posting: in the re-reading mode a request can
+    run up to the manifest's requestTimeoutSeconds before this runs, long enough for the
+    mounted Secret to rotate, and a stale token would lose a result already computed to a
+    401. If that re-read fails, `get()` falls back to the last token read, and says so.
 
     The timeout grows by a second per MiB of body: a result near the cap
     takes real time to upload, and the flat RESULT_TIMEOUT is sized for a
@@ -379,7 +392,7 @@ def _post_result(
     lease expiry is what recovers the request -- but it is never treated as
     a delivered result: an unlogged 401/500 here is a result that vanished
     with nothing to explain it."""
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {tokens.get()}", "Content-Type": "application/json"}
 
     try:
         resp = session.post(
@@ -434,13 +447,13 @@ def _poll_once(
     pool_id: str,
     workdir: Path,
     capability,
-    token: str,
+    tokens: TokenSource,
     log,
     stateful_scopes: OrderedDict[str, None],
     max_stateful_scopes: int,
     allow_bundles: bool = False,
 ) -> None:
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {tokens.get()}"}
 
     try:
         resp = session.post(
@@ -483,7 +496,7 @@ def _poll_once(
             _encode_result(
                 {"status": "failed", "error": f"invalid scopeId {task_request.scopeId!r}"}, log
             ),
-            token,
+            tokens,
             log,
         )
         return
@@ -504,7 +517,7 @@ def _poll_once(
             relay,
             task_request.requestId,
             _encode_result({"status": "failed", "error": BUNDLES_NOT_ALLOWED}, log),
-            token,
+            tokens,
             log,
         )
         return
@@ -521,14 +534,14 @@ def _poll_once(
             failed_envelope("invalid_input", PLUGIN_CODE_NOT_ALLOWED), task_request.request.doc
         )
         body = _encode_result({"status": "ok", "result": envelope}, log)
-        _post_result(session, relay, task_request.requestId, body, token, log)
+        _post_result(session, relay, task_request.requestId, body, tokens, log)
         return
 
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
     # One client per request: it carries the request id the artifact routes
-    # are scoped to, and the in-memory token.
-    relay_client = RelayClient(relay, None, task_request.requestId, session, token=token)
+    # are scoped to, and the executor's token source.
+    relay_client = RelayClient(relay, None, task_request.requestId, session, token_source=tokens)
     try:
         if is_lease:
             # A V13 lease: plugin code pinned by hash, the same hardened child runner
@@ -593,4 +606,4 @@ def _poll_once(
             )
 
     body = _encode_result(payload, log, task_request.maxResultBytes)
-    _post_result(session, relay, task_request.requestId, body, token, log)
+    _post_result(session, relay, task_request.requestId, body, tokens, log)

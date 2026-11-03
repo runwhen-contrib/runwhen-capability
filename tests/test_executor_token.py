@@ -76,10 +76,21 @@ def test_an_empty_rw_executor_token_file_falls_through(monkeypatch):
 # -- loading the token --------------------------------------------------------------------
 
 
+def test_the_mode_is_logged_once_when_the_file_is_removed(tmp_path, caplog):
+    path = tmp_path / "token"
+    path.write_text("tok")
+    with caplog.at_level(logging.INFO, logger=LOG.name):
+        _load_executor_token(path, LOG)
+    assert caplog.text.count("executor token mode:") == 1
+    assert "held in memory only" in caplog.text
+
+
 def test_the_token_is_stripped_and_the_file_unlinked(tmp_path):
     path = tmp_path / "token"
     path.write_text("  secret-token\n")
-    assert _load_executor_token(path, LOG) == "secret-token"
+    tokens = _load_executor_token(path, LOG)
+    assert tokens.get() == "secret-token"
+    assert not tokens.rereads_file
     assert not path.exists()
 
 
@@ -92,11 +103,13 @@ def test_an_unlink_refused_by_a_read_only_directory_is_tolerated_and_logged(tmp_
     secrets.chmod(0o555)
     try:
         with caplog.at_level(logging.INFO, logger=LOG.name):
-            assert _load_executor_token(path, LOG) == "tok"
+            assert _load_executor_token(path, LOG).get() == "tok"
     finally:
         secrets.chmod(0o755)
     assert path.exists()
     assert caplog.text.count("executor token file left in place (read-only mount)") == 1
+    assert caplog.text.count("executor token mode:") == 1
+    assert "re-reading" in caplog.text
     assert str(path) in caplog.text
     assert "tok" not in caplog.text.replace("token", "")
 
@@ -112,7 +125,7 @@ def test_an_unlink_that_fails_with_erofs_is_tolerated_and_logged_once(
 
     monkeypatch.setattr(serve_mod.os, "unlink", refuse)
     with caplog.at_level(logging.INFO, logger=LOG.name):
-        assert _load_executor_token(path, LOG) == "tok"
+        assert _load_executor_token(path, LOG).get() == "tok"
     assert caplog.text.count("executor token file left in place (read-only mount)") == 1
 
 
@@ -175,13 +188,24 @@ def test_serve_keeps_working_when_the_file_is_deleted_after_start(tmp_path):
     assert responses.calls[1].request.headers["Authorization"] == "Bearer token-a"
 
 
+def _refuse_unlink(monkeypatch):
+    def refuse(_path):
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(serve_mod.os, "unlink", refuse)
+
+
+# -- the token file cannot be removed (a read-only Secret mount: today's runner) -----------
+#
+# The kubelet refreshes a mounted Secret in place on rotation, so here the file stays and
+# is re-read before every relay call, with the last token read as the fallback.
+
+
 @responses.activate
-def test_serve_unlinks_the_token_file_and_tolerates_a_failed_unlink(tmp_path, monkeypatch, caplog):
+def test_serve_tolerates_a_failed_unlink_and_logs_the_mode(tmp_path, monkeypatch, caplog):
     token_file = tmp_path / "token"
     token_file.write_text("token-a")
-    monkeypatch.setattr(
-        serve_mod.os, "unlink", lambda _p: (_ for _ in ()).throw(PermissionError(errno.EACCES, "x"))
-    )
+    _refuse_unlink(monkeypatch)
     responses.add(responses.POST, f"{RELAY}/v1/tasks/next", status=204)
 
     with caplog.at_level(logging.INFO):
@@ -189,7 +213,116 @@ def test_serve_unlinks_the_token_file_and_tolerates_a_failed_unlink(tmp_path, mo
 
     assert token_file.exists()
     assert "executor token file left in place (read-only mount)" in caplog.text
+    assert caplog.text.count("executor token mode:") == 1
     assert responses.calls[0].request.headers["Authorization"] == "Bearer token-a"
+
+
+@responses.activate
+def test_a_token_file_that_stays_is_re_read_on_each_poll_so_a_rotation_is_picked_up(
+    tmp_path, monkeypatch
+):
+    token_file = tmp_path / "token"
+    token_file.write_text("token-a")
+    _refuse_unlink(monkeypatch)
+
+    def poll(request):
+        token_file.write_text("token-b")  # the Secret is refreshed after the first poll
+        return (204, {}, "")
+
+    responses.add_callback(responses.POST, f"{RELAY}/v1/tasks/next", callback=poll)
+    _serve(tmp_path, token_file, max_iterations=2)
+
+    assert [c.request.headers["Authorization"] for c in responses.calls] == [
+        "Bearer token-a",
+        "Bearer token-b",
+    ]
+
+
+@responses.activate
+def test_a_token_file_that_stays_is_re_read_immediately_before_the_result_post(
+    tmp_path, monkeypatch
+):
+    from runwhen_capability.host import run_request as real_run_request
+
+    token_file = tmp_path / "token"
+    token_file.write_text("token-old")
+    _refuse_unlink(monkeypatch)
+
+    def rotate_after_running(capability, request, credentials, scope_dir, log=None, **kwargs):
+        result = real_run_request(capability, request, credentials, scope_dir, log=log, **kwargs)
+        token_file.write_text("token-new")  # rotates between the poll and the POST
+        return result
+
+    monkeypatch.setattr(serve_mod, "run_request", rotate_after_running)
+    _one_request(responses)
+
+    _serve(tmp_path, token_file, max_iterations=1)
+
+    next_call, result_call = responses.calls
+    assert next_call.request.headers["Authorization"] == "Bearer token-old"
+    assert result_call.request.headers["Authorization"] == "Bearer token-new"
+
+
+@responses.activate
+def test_a_token_file_that_stays_falls_back_to_the_last_token_when_unreadable_at_post_time(
+    tmp_path, monkeypatch, caplog
+):
+    from runwhen_capability.host import run_request as real_run_request
+
+    token_file = tmp_path / "token"
+    token_file.write_text("token-old")
+    _refuse_unlink(monkeypatch)
+
+    def remove_after_running(capability, request, credentials, scope_dir, log=None, **kwargs):
+        result = real_run_request(capability, request, credentials, scope_dir, log=log, **kwargs)
+        token_file.write_text("")  # a refresh caught half-way: empty, then ...
+        return result
+
+    monkeypatch.setattr(serve_mod, "run_request", remove_after_running)
+    _one_request(responses)
+
+    with caplog.at_level(logging.WARNING):
+        _serve(tmp_path, token_file, max_iterations=1)
+
+    next_call, result_call = responses.calls
+    assert result_call.request.headers["Authorization"] == "Bearer token-old"
+    assert "using the last token read" in caplog.text
+
+
+@responses.activate
+def test_a_token_file_that_stays_and_then_vanishes_keeps_the_last_token(
+    tmp_path, monkeypatch, caplog
+):
+    token_file = tmp_path / "token"
+    token_file.write_text("token-a")
+    _refuse_unlink(monkeypatch)
+
+    def poll(request):
+        if token_file.exists():
+            os.remove(token_file)  # (Path.unlink is the patched os.unlink)
+        return (204, {}, "")
+
+    responses.add_callback(responses.POST, f"{RELAY}/v1/tasks/next", callback=poll)
+    with caplog.at_level(logging.WARNING):
+        _serve(tmp_path, token_file, max_iterations=2)
+
+    assert [c.request.headers["Authorization"] for c in responses.calls] == ["Bearer token-a"] * 2
+    assert "could not re-read executor token" in caplog.text
+
+
+def _one_request(rsps):
+    rsps.add(
+        responses.POST,
+        f"{RELAY}/v1/tasks/next",
+        json={
+            "requestId": "req-1",
+            "request": {"version": 1, "tasks": [{"task": "echo", "inputs": {}}]},
+            "credentials": {},
+            "scopeId": "scope-1",
+            "deadlineMs": 60000,
+        },
+    )
+    rsps.add(responses.POST, f"{RELAY}/v1/tasks/req-1/result", json={})
 
 
 @responses.activate
@@ -221,6 +354,30 @@ def test_the_relay_client_serve_hands_a_request_carries_the_startup_token(tmp_pa
     _serve(tmp_path, token_file, max_iterations=1)
 
     assert seen == [{"Authorization": "Bearer token-a"}]
+
+
+@responses.activate
+def test_the_relay_client_of_a_request_follows_a_rotation_when_the_file_stays(
+    tmp_path, monkeypatch
+):
+    token_file = tmp_path / "token"
+    token_file.write_text("token-a")
+    _refuse_unlink(monkeypatch)
+    seen = []
+    real = serve_mod.RelayClient
+
+    def spy(*args, **kwargs):
+        client = real(*args, **kwargs)
+        token_file.write_text("token-b")  # rotated after the client was made
+        seen.append(client._auth())
+        return client
+
+    monkeypatch.setattr(serve_mod, "RelayClient", spy)
+    _one_request(responses)
+
+    _serve(tmp_path, token_file, max_iterations=1)
+
+    assert seen == [{"Authorization": "Bearer token-b"}]
 
 
 def test_serve_makes_itself_non_dumpable_before_it_reads_the_token(tmp_path, monkeypatch):
@@ -387,14 +544,24 @@ rw_set o "\\"file=$file environ=$environ mem=$mem sibling=$sibling tokenfds=$fds
 
 
 @linux_only
+@pytest.mark.parametrize("mode", ["removable", "read_only"])
 def test_a_task_cannot_read_the_token_from_the_file_or_from_the_serve_process(
-    relay_server, tmp_path
+    relay_server, tmp_path, mode
 ):
+    """`removable`: the runner's new tmpfs copy -- serve unlinks it and holds the token in
+    memory. `read_only`: today's Secret mount -- the unlink is refused, the file has to stay
+    (so a task CAN read it; only the new runner closes that), serve re-reads it per call so a
+    rotation in place is picked up, and the /proc reads are still denied."""
     from relay_server import Response
 
+    read_only = mode == "read_only"
+    if read_only and os.geteuid() == 0:
+        pytest.skip("root can unlink from a read-only directory")
     token_file = tmp_path / "executor" / "token"
     token_file.parent.mkdir()
     token_file.write_text("super-secret-executor-token\n")
+    if read_only:
+        token_file.parent.chmod(0o555)
 
     files = {"capability.yaml": _MANIFEST, "tasks/t.sh": _TASK}
     # a same-uid process that stays dumpable: proves the /proc reads are denied because of
@@ -427,7 +594,13 @@ def test_a_task_cannot_read_the_token_from_the_file_or_from_the_serve_process(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        _wait_for(lambda: not token_file.exists(), "serve never unlinked the token file")
+        _wait_for(
+            lambda: any(r.path == "/v1/tasks/next" for r in relay_server.requests),
+            "serve never polled",
+        )
+        assert token_file.exists() == read_only
+        if read_only:
+            token_file.write_text("rotated-executor-token\n")  # the Secret is refreshed
         relay_server.script(
             "POST",
             "/v1/tasks/next",
@@ -459,6 +632,7 @@ def test_a_task_cannot_read_the_token_from_the_file_or_from_the_serve_process(
             "serve never posted a result",
         )
     finally:
+        token_file.parent.chmod(0o755)
         sibling.kill()
         if serve_proc is not None:
             serve_proc.terminate()
@@ -469,13 +643,18 @@ def test_a_task_cannot_read_the_token_from_the_file_or_from_the_serve_process(
     assert body["status"] == "ok", body
     [task] = body["result"]["tasks"]
     assert task["status"] == "ok", task
+    file_state = "ok" if read_only else "missing"
     assert task["outputs"]["o"] == (
-        "file=missing environ=denied mem=denied sibling=ok tokenfds=0"
+        f"file={file_state} environ=denied mem=denied sibling=ok tokenfds=0"
     ), task
     assert b"super-secret-executor-token" not in result.body
-    # every relay call was authenticated with the in-memory token
     auth = {r.header("Authorization") for r in relay_server.requests}
-    assert auth == {"Bearer super-secret-executor-token"}, stderr
+    if read_only:
+        assert result.header("Authorization") == "Bearer rotated-executor-token", stderr
+        assert auth == {"Bearer super-secret-executor-token", "Bearer rotated-executor-token"}
+    else:
+        # every relay call was authenticated with the in-memory token
+        assert auth == {"Bearer super-secret-executor-token"}, stderr
 
 
 def _wait_for(condition, message: str, timeout: float = 60.0) -> None:

@@ -31,16 +31,19 @@ the one place that conversion happens, for the calls and for every read of an
 input's body (`InputStream`), so a task that catches ArtifactError never
 sees a requests or urllib3 exception.
 
-The bearer token is held in memory: `rwtask serve` reads the executor token file
-once at start-up, unlinks it, and hands every request's client the string (see
-serve.py). A client built from a `token_file` (tests, `rwtask run`) reads the file
-once, at construction, and never again -- there is no per-call file read for a
-task process in the same pod to race or copy.
+The bearer token comes from a `TokenSource`. `rwtask serve` reads the executor token
+file at start-up and unlinks it; the source then holds the string in memory only, with no
+file for a task in the same pod to copy. If the unlink is refused (a read-only Secret
+volume, today's runner), the source re-reads the file on every call instead, so a Secret
+the kubelet refreshes in place on rotation is picked up (see serve.py). A client built
+from a plain `token` string or a `token_file` (tests, `rwtask run`) holds a fixed token:
+the file is read once, at construction.
 """
 
 from __future__ import annotations
 
 import io
+import logging
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -129,6 +132,45 @@ TRANSPORT_ERROR = "E_ARTIFACT_TRANSPORT"
 _TRANSPORT_EXCEPTIONS = (requests.RequestException, urllib3.exceptions.HTTPError, OSError)
 
 
+class TokenSource:
+    """The executor's bearer token: `get()` returns the one to send.
+
+    Fixed (`path=None`): `token` for the life of the process -- the file it came from is
+    gone. File-backed: `token` is what the file held at start-up and `get()` re-reads
+    `path` every time, so a rotation in place is picked up. A re-read that fails or finds
+    the file empty (a refresh caught mid-way) logs a warning and returns the last token
+    that was read, rather than sending nothing or dropping a result in hand."""
+
+    def __init__(self, token: str, path: Path | None = None, log: logging.Logger | None = None):
+        self._token = token
+        self._path = Path(path) if path is not None else None
+        self._log = log or logging.getLogger("runwhen_capability.relay")
+
+    @property
+    def rereads_file(self) -> bool:
+        return self._path is not None
+
+    def get(self) -> str:
+        if self._path is None:
+            return self._token
+        try:
+            fresh = self._path.read_text().strip()
+        except OSError as exc:
+            self._log.warning(
+                "could not re-read executor token from %s: %s; using the last token read",
+                self._path,
+                exc,
+            )
+            return self._token
+        if not fresh:
+            self._log.warning(
+                "executor token file %s is empty; using the last token read", self._path
+            )
+            return self._token
+        self._token = fresh
+        return fresh
+
+
 @contextmanager
 def _transport_errors(what: str) -> Iterator[None]:
     """Re-raises a transport failure inside the block -- a requests or urllib3
@@ -191,9 +233,10 @@ class InputStream(io.RawIOBase):
 class RelayClient:
     """One request's view of the relay: `base_url` is the relay root,
     `request_id` the request being served, `session` the HTTP session the serve
-    loop already uses. The bearer token is given as `token` (a string, as the
-    serve loop does) or as `token_file` (read once, here; an unreadable file
-    raises OSError) -- exactly one of them; pass `None` for the one not used."""
+    loop already uses. The bearer token is given as a `token_source` (what the
+    serve loop does), a `token` string, or a `token_file` (read once, here; an
+    unreadable file raises OSError) -- exactly one of them; pass `None` for a
+    `token_file` that is not used."""
 
     def __init__(
         self,
@@ -203,13 +246,20 @@ class RelayClient:
         session: requests.Session,
         *,
         token: str | None = None,
+        token_source: TokenSource | None = None,
     ) -> None:
-        if token is None and token_file is None:
-            raise ValueError("a RelayClient needs a token or a token_file")
-        if token is not None and token_file is not None:
-            raise ValueError("a RelayClient takes a token or a token_file, not both")
+        given = [x for x in (token_file, token, token_source) if x is not None]
+        if not given:
+            raise ValueError("a RelayClient needs a token, a token_file or a token_source")
+        if len(given) > 1:
+            raise ValueError("a RelayClient takes one of token, token_file, token_source")
         self.base_url = base_url.rstrip("/")
-        self._token = token.strip() if token is not None else Path(token_file).read_text().strip()
+        if token_source is not None:
+            self._tokens = token_source
+        elif token is not None:
+            self._tokens = TokenSource(token.strip())
+        else:
+            self._tokens = TokenSource(Path(token_file).read_text().strip())
         self.request_id = request_id
         self.session = session
 
@@ -309,4 +359,4 @@ class RelayClient:
         return f"{self.base_url}/v1/tasks/{self.request_id}/{suffix}"
 
     def _auth(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._token}"}
+        return {"Authorization": f"Bearer {self._tokens.get()}"}
