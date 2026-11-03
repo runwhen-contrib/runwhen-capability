@@ -1257,6 +1257,9 @@ def _execute(
         "RW_ARTIFACTS_DIR": str(scope_dir / _ARTIFACTS_DIR),
         "RW_CAPABILITY": capability,
         "RW_OPERATION": operation,
+        # The bundle's lib/ (it may not exist): importable from Python tasks,
+        # sourceable from bash ones. RW_* is reserved, so no input can set it.
+        "RW_LIB_DIR": str(files_dir / "lib"),
     }
     if kubeconfig_path:
         base_env["KUBECONFIG"] = kubeconfig_path

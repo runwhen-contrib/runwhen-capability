@@ -330,6 +330,111 @@ def test_a_published_bundle_reading_a_legacy_mangled_env_name_still_runs(tmp_pat
     assert task.outputs["seen"] == "t=7 e=stg"
 
 
+def _lib_bundle(task_file: str, task_body: str, lib: dict[str, str], *, inputs: str = "") -> dict:
+    """A one-task bundle (`show`, output `seen: string`) plus the given lib/ files."""
+    manifest = (
+        "apiVersion: runwhen.com/custom-capability/v1\n"
+        "name: with-lib\n"
+        "appliesTo:\n"
+        "  - { platform: kubernetes, type: statefulset }\n"
+        "tasks:\n"
+        "  - name: show\n"
+        f"    file: {task_file}\n"
+        "    readOnly: true\n"
+        f"{inputs}"
+        "    outputs:\n"
+        '      seen: { schema: "string" }\n'
+    )
+    return {
+        "capability.yaml": manifest,
+        task_file: task_body,
+        **{f"lib/{name}": content for name, content in lib.items()},
+    }
+
+
+def _lib_dir_input(name: str) -> str:
+    return f"    inputs:\n      {name}: {{ type: string, default: /none, runtime: true }}\n"
+
+
+def test_a_python_task_imports_a_module_from_the_bundles_lib_dir(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.py",
+        "from helpers import double\n\ndef main(ctx):\n    return {'seen': str(double(21))}\n",
+        {"helpers.py": "def double(n):\n    return n * 2\n"},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "42"}
+
+
+def test_a_bash_task_sources_a_file_from_the_bundles_lib_dir(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nsource "$RW_LIB_DIR/common.sh"\nrw_set seen "\\"$(greet)\\""\n',
+        {"common.sh": "greet() { echo hello-from-lib; }\n"},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "hello-from-lib"}
+
+
+def test_a_lib_module_cannot_shadow_the_standard_library(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.py",
+        "import json\n\ndef main(ctx):\n    return {'seen': json.dumps([1])}\n",
+        {"json.py": "raise RuntimeError('lib/json.py shadowed the standard library')\n"},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "[1]"}
+
+
+def test_a_python_task_runs_in_a_bundle_without_a_lib_dir(tmp_path):
+    files = _lib_bundle("tasks/show.py", "def main(ctx):\n    return {'seen': 'ok'}\n", {})
+    assert not any(path.startswith("lib/") for path in files)
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+
+
+def test_a_bash_task_in_a_bundle_without_a_lib_dir_still_gets_the_variable(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nrw_set seen "\\"${RW_LIB_DIR##*/}\\""\n',
+        {},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "lib"}
+
+
+@pytest.mark.parametrize("input_name", ["libDir", "LIB_DIR", "RW_LIB_DIR"])
+def test_an_input_cannot_change_rw_lib_dir_for_bash(tmp_path, input_name):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nsource "$RW_LIB_DIR/common.sh"\nrw_set seen "\\"$(greet)\\""\n',
+        {"common.sh": "greet() { echo real-lib; }\n"},
+        inputs=_lib_dir_input(input_name),
+    )
+    [task] = _run(files, ["show"], tmp_path, inputs={input_name: "/elsewhere"}).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "real-lib"}
+
+
+@pytest.mark.parametrize("input_name", ["libDir", "LIB_DIR"])
+def test_an_input_cannot_change_rw_lib_dir_for_python(tmp_path, input_name):
+    files = _lib_bundle(
+        "tasks/show.py",
+        "import os\n\n"
+        "def main(ctx, **inputs):\n"
+        "    return {'seen': os.environ.get('RW_LIB_DIR', '')}\n",
+        {"helpers.py": ""},
+        inputs=_lib_dir_input(input_name),
+    )
+    [task] = _run(files, ["show"], tmp_path, inputs={input_name: "/elsewhere"}).tasks
+    assert task.status == "ok", task
+    assert task.outputs["seen"].endswith("/bundle/lib")
+
+
 # -- artifact outputs: rw_artifact, the artifacts dir, host-side upload, spill ----------
 
 PUT_PREFIX = "/v1/tasks/req-1/artifacts/"
