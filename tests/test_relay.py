@@ -231,18 +231,35 @@ def test_put_artifact_quotes_the_name_but_keeps_slashes(relay_server, tmp_path):
     assert relay_server.requests[0].path == "/v1/tasks/req-1/artifacts/out%20dir/a%20b%231.txt"
 
 
-def test_put_artifact_rereads_the_token_file_on_every_call(relay_server, tmp_path):
-    relay_server.script("PUT", "/", Response(201, json=CREATED), Response(201, json=CREATED))
+def test_the_token_file_is_read_once_at_construction(relay_server, tmp_path):
+    relay_server.script("PUT", "/", *[Response(201, json=CREATED)] * 3)
     client = _client(relay_server, tmp_path, token="tok-old")
 
     _put(client, [b"a"])
-    (tmp_path / "token").write_text("tok-new\n")
+    (tmp_path / "token").write_text("tok-new\n")  # rotated after construction
     _put(client, [b"b"])
+    (tmp_path / "token").unlink()  # gone after construction
+    _put(client, [b"c"])
 
-    assert [r.header("Authorization") for r in relay_server.requests] == [
-        "Bearer tok-old",
-        "Bearer tok-new",
-    ]
+    assert [r.header("Authorization") for r in relay_server.requests] == ["Bearer tok-old"] * 3
+
+
+def test_a_client_built_from_a_token_string_never_touches_a_file(relay_server):
+    relay_server.script("PUT", "/", Response(201, json=CREATED))
+    client = RelayClient(relay_server.url, None, "req-1", requests.Session(), token=" tok-mem\n")
+
+    _put(client, [b"a"])
+
+    assert [r.header("Authorization") for r in relay_server.requests] == ["Bearer tok-mem"]
+
+
+def test_a_relay_client_needs_a_token_or_a_token_file(relay_server, tmp_path):
+    with pytest.raises(ValueError, match="token or a token_file"):
+        RelayClient(relay_server.url, None, "req-1", requests.Session())
+    token_file = tmp_path / "token"
+    token_file.write_text("x")
+    with pytest.raises(ValueError, match="not both"):
+        RelayClient(relay_server.url, token_file, "req-1", requests.Session(), token="y")
 
 
 def test_put_artifact_maps_413_to_too_large(relay_server, tmp_path):
@@ -294,17 +311,9 @@ def test_a_201_that_is_not_json_is_a_transport_error(relay_server, tmp_path):
     assert "not JSON" in excinfo.value.message
 
 
-def test_a_token_file_that_cannot_be_read_is_a_transport_error(relay_server, tmp_path):
-    client = _client(relay_server, tmp_path)
-    (tmp_path / "token").unlink()
-
-    with pytest.raises(ArtifactError) as put:
-        _put(client, [b"x"])
-    with pytest.raises(ArtifactError) as get:
-        client.open_input("prior")
-
-    _transport_error(put, OSError)
-    _transport_error(get, OSError)
+def test_a_token_file_that_cannot_be_read_fails_the_client_at_construction(relay_server, tmp_path):
+    with pytest.raises(OSError):
+        RelayClient(relay_server.url, tmp_path / "missing", "req-1", requests.Session())
     assert relay_server.started == []
 
 

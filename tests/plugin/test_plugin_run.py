@@ -403,17 +403,27 @@ def test_host_only_variables_never_reach_a_v13_task(run, monkeypatch):
     monkeypatch.setenv("RELAY_URL", "http://relay.invalid")
     monkeypatch.setenv("POOL_ID", "pool-1")
     monkeypatch.setenv("EXECUTOR_TOKEN_FILE", "/var/run/executor/token")
+    monkeypatch.setenv("RW_EXECUTOR_TOKEN_FILE", "/run/rw/executor/token")
     env = run("sh-env").envelope
     assert env["status"] == "ok"
     seen = env["outputs"]["env"]
     assert seen["relay"] == "unset"
     assert seen["pool"] == "unset"
     assert seen["token"] == "unset"
+    assert seen["rwtoken"] == "unset"
     assert seen["contract"] == "v13"
 
 
 def test_host_only_names_cannot_be_smuggled_in_through_extra_env(run):
-    for name in ("RELAY_URL", "POOL_ID", "EXECUTOR_TOKEN_FILE", "RW_SDK", "HOME", "PATH"):
+    for name in (
+        "RELAY_URL",
+        "POOL_ID",
+        "EXECUTOR_TOKEN_FILE",
+        "RW_EXECUTOR_TOKEN_FILE",
+        "RW_SDK",
+        "HOME",
+        "PATH",
+    ):
         with pytest.raises(ValueError, match="extra_env may not set"):
             run("py-nothing", extra_env={name: "x"})
 

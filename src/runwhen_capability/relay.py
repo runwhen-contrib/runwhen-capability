@@ -24,16 +24,18 @@ caller sees the mapped exception below rather than a ConnectionError.
 
 Every failure is an ArtifactError. An answer with a code maps to its subclass
 (`_raise_for`); a failure to talk to the relay at all -- a refused or broken
-connection, a timeout, a body cut short, an unreadable token file, a 201
+connection, a timeout, a body cut short, a 201
 whose body is not JSON -- is the base ArtifactError with the code
 E_ARTIFACT_TRANSPORT, raised from the original error. `_transport_errors` is
 the one place that conversion happens, for the calls and for every read of an
 input's body (`InputStream`), so a task that catches ArtifactError never
 sees a requests or urllib3 exception.
 
-The bearer token is read from the token file on every call (the same file
-`rwtask serve` polls with -- see serve.py), never cached: a request can run
-for minutes, long enough for the token to rotate under it.
+The bearer token is held in memory: `rwtask serve` reads the executor token file
+once at start-up, unlinks it, and hands every request's client the string (see
+serve.py). A client built from a `token_file` (tests, `rwtask run`) reads the file
+once, at construction, and never again -- there is no per-call file read for a
+task process in the same pod to race or copy.
 """
 
 from __future__ import annotations
@@ -130,7 +132,7 @@ _TRANSPORT_EXCEPTIONS = (requests.RequestException, urllib3.exceptions.HTTPError
 @contextmanager
 def _transport_errors(what: str) -> Iterator[None]:
     """Re-raises a transport failure inside the block -- a requests or urllib3
-    error, or an OSError (the token file, the socket) -- as
+    error, or an OSError (the socket) -- as
     ArtifactError(TRANSPORT_ERROR, "<what> failed: ..."), from the original.
     ArtifactErrors (the relay's coded answers) pass through untouched."""
     try:
@@ -188,18 +190,26 @@ class InputStream(io.RawIOBase):
 
 class RelayClient:
     """One request's view of the relay: `base_url` is the relay root,
-    `token_file` the executor token file, `request_id` the request being
-    served, `session` the HTTP session the serve loop already uses."""
+    `request_id` the request being served, `session` the HTTP session the serve
+    loop already uses. The bearer token is given as `token` (a string, as the
+    serve loop does) or as `token_file` (read once, here; an unreadable file
+    raises OSError) -- exactly one of them; pass `None` for the one not used."""
 
     def __init__(
         self,
         base_url: str,
-        token_file: Path,
+        token_file: Path | None,
         request_id: str,
         session: requests.Session,
+        *,
+        token: str | None = None,
     ) -> None:
+        if token is None and token_file is None:
+            raise ValueError("a RelayClient needs a token or a token_file")
+        if token is not None and token_file is not None:
+            raise ValueError("a RelayClient takes a token or a token_file, not both")
         self.base_url = base_url.rstrip("/")
-        self.token_file = Path(token_file)
+        self._token = token.strip() if token is not None else Path(token_file).read_text().strip()
         self.request_id = request_id
         self.session = session
 
@@ -299,4 +309,4 @@ class RelayClient:
         return f"{self.base_url}/v1/tasks/{self.request_id}/{suffix}"
 
     def _auth(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.token_file.read_text().strip()}"}
+        return {"Authorization": f"Bearer {self._token}"}

@@ -1455,8 +1455,11 @@ def _execute(
 
 
 # Host-side variables a task has no business seeing: where the relay is, which
-# pool this executor serves, and where its bearer token is mounted.
-_HOST_ONLY_ENV = frozenset({"EXECUTOR_TOKEN_FILE", "RELAY_URL", "POOL_ID"})
+# pool this executor serves, and where its bearer token is mounted
+# (RW_EXECUTOR_TOKEN_FILE is the runner's new spelling; EXECUTOR_TOKEN_FILE the legacy one).
+_HOST_ONLY_ENV = frozenset(
+    {"RW_EXECUTOR_TOKEN_FILE", "EXECUTOR_TOKEN_FILE", "RELAY_URL", "POOL_ID"}
+)
 
 
 def _inherited_env() -> dict[str, str]:

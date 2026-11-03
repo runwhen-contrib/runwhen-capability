@@ -90,11 +90,11 @@ def make_lease(task_name: str, *, code=None, inputs=None, settings=None, timeout
 def poll(tmp_path, monkeypatch):
     """Serves one polled request and returns (the POSTed result body, workdir)."""
     token = tmp_path / "token"
-    token.write_text("test-token")
     monkeypatch.setenv("RW_ARCHIVE_CACHE", str(tmp_path / "archives"))
     monkeypatch.setenv("RW_CREDENTIALS_DIR", str(tmp_path / "creds"))
 
     def go(request, *, allow_bundles=True, **extra):
+        token.write_text("test-token")  # serve reads it once and unlinks it
         with responses.RequestsMock() as rsps:
             rsps.add(
                 responses.POST,
@@ -270,9 +270,10 @@ def test_host_only_variables_stay_out_of_a_lease_task(poll, monkeypatch):
     monkeypatch.setenv("RELAY_URL", "http://relay.invalid")
     monkeypatch.setenv("POOL_ID", "pool-9")
     monkeypatch.setenv("EXECUTOR_TOKEN_FILE", "/var/run/executor/token")
+    monkeypatch.setenv("RW_EXECUTOR_TOKEN_FILE", "/run/rw/executor/token")
     envelope = envelope_of(poll(make_lease("sh-env")))
     seen = envelope["outputs"]["env"]
-    assert (seen["relay"], seen["pool"], seen["token"]) == ("unset", "unset", "unset")
+    assert (seen["relay"], seen["pool"], seen["token"], seen["rwtoken"]) == ("unset",) * 4
     assert seen["contract"] == "v13"
 
 
@@ -389,7 +390,17 @@ def test_materialized_files_are_deleted_after_a_failure_and_after_a_timeout(poll
 
 
 @pytest.mark.parametrize(
-    "name", ["RELAY_URL", "POOL_ID", "EXECUTOR_TOKEN_FILE", "RW_SDK", "HOME", "PATH", "BASH_ENV"]
+    "name",
+    [
+        "RELAY_URL",
+        "POOL_ID",
+        "EXECUTOR_TOKEN_FILE",
+        "RW_EXECUTOR_TOKEN_FILE",
+        "RW_SDK",
+        "HOME",
+        "PATH",
+        "BASH_ENV",
+    ],
 )
 def test_materialized_cannot_name_a_reserved_or_host_only_variable(poll, name):
     for entry in (
@@ -428,9 +439,10 @@ def test_host_only_variables_stay_unset_when_credentials_are_materialized(poll, 
     monkeypatch.setenv("RELAY_URL", "http://relay.invalid")
     monkeypatch.setenv("POOL_ID", "pool-9")
     monkeypatch.setenv("EXECUTOR_TOKEN_FILE", "/var/run/executor/token")
+    monkeypatch.setenv("RW_EXECUTOR_TOKEN_FILE", "/run/rw/executor/token")
     envelope = envelope_of(poll(make_lease("sh-env"), materialized=materialized()))
     seen = envelope["outputs"]["env"]
-    assert (seen["relay"], seen["pool"], seen["token"]) == ("unset", "unset", "unset")
+    assert (seen["relay"], seen["pool"], seen["token"], seen["rwtoken"]) == ("unset",) * 4
 
 
 def test_startup_removes_credential_directories_a_crashed_run_left(poll):
@@ -463,10 +475,10 @@ def relayed(relay_server, tmp_path, monkeypatch):
     from relay_server import Response
 
     token = tmp_path / "token"
-    token.write_text("test-token")
     monkeypatch.setenv("RW_CREDENTIALS_DIR", str(tmp_path / "creds"))
 
     def go(lease, put: Response | None, decls=None):
+        token.write_text("test-token")  # serve reads it once and unlinks it
         relay_server.script(
             "POST",
             "/v1/tasks/next",
