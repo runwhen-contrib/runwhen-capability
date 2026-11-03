@@ -17,9 +17,9 @@ from pathlib import Path
 
 import pydantic
 import pytest
-from _fixtures import fixture_id, fixtures, load_fixture, schema_of
+from _fixtures import def_of, fixture_id, fixtures, load_fixture, schema_of, validate_fixture
 
-from runwhen_capability.contracts import SCHEMA_NAMES, schema, validate
+from runwhen_capability.contracts import SCHEMA_NAMES, schema
 
 REPO = Path(__file__).resolve().parents[2]
 MODELS = REPO / "src" / "runwhen_capability" / "contracts" / "models"
@@ -32,6 +32,9 @@ ROUND_TRIP_KNOWN: dict[str, str] = {}
 # Invalid fixtures the model accepts although the schema rejects them: fixture
 # -> the keyword datamodel-code-generator does not turn into a model constraint.
 MODEL_LOOSER_THAN_SCHEMA: dict[str, str] = {
+    "auth-plan/materialized/invalid/reference-with-files.yaml": (
+        "materializedCredential `dependentSchemas` (reference excludes files and env)"
+    ),
     "compiled-plugin/invalid/workspace-plugin-with-release-version.yaml": (
         "`plugin` is if/then/else on `name`; the generated model is a union that accepts "
         "the name `workspace` (reserved only by a `not: {enum}` it does not carry)"
@@ -80,6 +83,18 @@ def _module_name(name: str) -> str:
 def _root_model(name: str) -> type[pydantic.BaseModel]:
     module = importlib.import_module(f"runwhen_capability.contracts.models.{_module_name(name)}")
     return getattr(module, schema(name)["title"])
+
+
+def _model_of(path: Path) -> type[pydantic.BaseModel]:
+    """The model a fixture is an instance of: its schema's root class, or the class generated
+    for the `$defs` entry (`materializedCredential` -> `MaterializedCredential`)."""
+    def_name = def_of(path)
+    if def_name is None:
+        return _root_model(schema_of(path))
+    module = importlib.import_module(
+        f"runwhen_capability.contracts.models.{_module_name(schema_of(path))}"
+    )
+    return getattr(module, def_name[0].upper() + def_name[1:])
 
 
 def _normalize(value):
@@ -152,18 +167,17 @@ def test_package_import_is_lazy():
 
 @pytest.mark.parametrize("path", _params(invalid=False, known=ROUND_TRIP_KNOWN))
 def test_round_trip(path: Path):
-    name = schema_of(path)
     doc = _normalize(load_fixture(path))
-    model = _root_model(name).model_validate(doc)
+    model = _model_of(path).model_validate(doc)
     dumped = _normalize(model.model_dump(mode="json", by_alias=True, exclude_unset=True))
-    violations = validate(name, dumped)
+    violations = validate_fixture(path, dumped)
     assert not violations, "\n".join(f"{v.path or '(root)'}: {v.message}" for v in violations)
     assert dumped == doc
 
 
 @pytest.mark.parametrize("path", _params(invalid=True, known=MODEL_LOOSER_THAN_SCHEMA))
 def test_invalid_fixtures_rejected_by_models(path: Path):
-    model = _root_model(schema_of(path))
+    model = _model_of(path)
     with pytest.raises(pydantic.ValidationError):
         model.model_validate(_normalize(load_fixture(path)))
 

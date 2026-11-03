@@ -28,6 +28,32 @@ class Encoding(Enum):
     base64 = "base64"
 
 
+class File2(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    key: str = Field(
+        ...,
+        description="the reference's secret key (a vault key, a file name), or `value` for one unnamed value; it becomes the file name under RW_AUTH_REF_DIR",
+        max_length=253,
+        min_length=1,
+        pattern="^[A-Za-z0-9._-]+$",
+    )
+    content: str
+    encoding: Encoding | None = None
+
+
+class Reference(BaseModel):
+    """
+    script auth plans only: the credential reference's material, which the executor writes to RW_AUTH_REF_DIR/<key> for the auth script (and keeps until the task ends). Not combined with `files` or `env`, which are a native plan's result.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    files: list[File2] = Field(..., min_length=1)
+
+
 class Script(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -89,7 +115,7 @@ class File1(BaseModel):
 
 class MaterializedCredential(BaseModel):
     """
-    runner -> executor (`/v1/tasks/next` `materialized[]`): the result of a native plan. Secret; never logged, never leaves the pod.
+    runner -> executor (`/v1/tasks/next` `materialized[]`): the result of a native plan (`files`, `env`), or the reference material a script plan reads (`reference`). Secret; never logged, never leaves the pod.
     """
 
     model_config = ConfigDict(
@@ -98,6 +124,10 @@ class MaterializedCredential(BaseModel):
     credentialType: common.CredentialTypeName
     files: list[File1] | None = None
     env: dict[constr(pattern=r"^[A-Z_][A-Z0-9_]*$"), str] | None = None
+    reference: Reference | None = Field(
+        None,
+        description="script auth plans only: the credential reference's material, which the executor writes to RW_AUTH_REF_DIR/<key> for the auth script (and keeps until the task ends). Not combined with `files` or `env`, which are a native plan's result.",
+    )
 
 
 class Task(BaseModel):

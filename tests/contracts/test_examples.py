@@ -24,9 +24,9 @@ import re
 from pathlib import Path
 
 import pytest
-from _fixtures import fixture_id, fixtures, load_fixture, schema_of
+from _fixtures import fixture_id, fixtures, load_fixture, schema_of, validate_fixture
 
-from runwhen_capability.contracts import SCHEMA_NAMES, load_yaml, validate
+from runwhen_capability.contracts import SCHEMA_NAMES, load_yaml
 
 # Shared definitions only, no document of their own.
 NO_EXAMPLE_NEEDED = {"common"}
@@ -72,7 +72,7 @@ def test_fixture_directories_are_schemas():
 
 @pytest.mark.parametrize("path", _valid_params())
 def test_every_valid_example_validates(path: Path):
-    violations = validate(schema_of(path), load_fixture(path))
+    violations = validate_fixture(path, load_fixture(path))
     assert not violations, "\n".join(f"{v.path or '(root)'}: {v.message}" for v in violations)
 
 
@@ -93,7 +93,7 @@ def test_valid_example_names_its_origin(path: Path):
 @pytest.mark.parametrize("path", fixtures(invalid=True), ids=fixture_id)
 def test_every_invalid_example_fails_where_expected(path: Path):
     pointer, substring = _expectation(path)
-    violations = validate(schema_of(path), load_fixture(path))
+    violations = validate_fixture(path, load_fixture(path))
     assert violations, f"{fixture_id(path)} validated, but it should be rejected"
     assert any(v.path == pointer and substring in v.message for v in violations), (
         f"expected a violation at {pointer or '(root)'} containing {substring!r}; got:\n"

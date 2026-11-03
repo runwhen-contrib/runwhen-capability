@@ -6,11 +6,13 @@ from ._internal import (
     Encoding,
     File,
     File1,
+    File2,
     Materialize,
     MaterializedCredential,
     Method,
     Method1,
     Native,
+    Reference,
     Script,
 )
 
@@ -19,10 +21,12 @@ __all__ = [
     "Encoding",
     "File",
     "File1",
+    "File2",
     "Materialize",
     "MaterializedCredential",
     "Method",
     "Method1",
     "Native",
+    "Reference",
     "Script",
 ]

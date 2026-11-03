@@ -1,0 +1,7 @@
+# expect: "" should not be valid
+credentialType: kubernetes/kubeconfig
+reference:
+  files:
+    - { key: key.json, content: "{}" }
+files:
+  - { env: KUBECONFIG, content: "apiVersion: v1" }

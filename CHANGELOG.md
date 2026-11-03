@@ -7,6 +7,12 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- contracts-v4 (tag pending): `auth-plan.schema.json#/$defs/materializedCredential` gains an optional
+  `reference: {files: [{key, content, encoding?}]}`, the reference material a script auth plan's
+  script reads from `$RW_AUTH_REF_DIR/<key>`; an entry with `reference` has no `files` or `env`.
+  CONTRACTS.md "Auth plan" and "Changes in contracts-v4" (V4-1) say so; generated models and the
+  packaged copy follow. `tests/contracts` fixtures may now be one `$defs` entry of their schema
+  (`examples/auth-plan/materialized/`).
 - A skill's `skills/<skill>/tests/**` (recorded fixtures) is dev-only and never packaged (lane F),
   exactly like the root `tests/`, `runwhen.lock` and `.runwhen/`. `load_entries` / `load_dir`
   (so `rwtask compile` and `rwtask validate`) and `rwtask pull`'s git path drop it silently: not in
