@@ -172,6 +172,7 @@ rwtask plan <dir> [--prune]
 rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]
 rwtask export <dir> [--name NAME ...] [--force]
 rwtask test <dir> [--task NAME]
+rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE] [--skill NAME] [--brief PATH] [--force]
 ```
 
 `rwtask run` is the same code path as `rwtask serve`, against the local filesystem: a capability
@@ -317,6 +318,30 @@ rwtask schemas --check   # CI: fail if any listed file is missing or differs fro
 
 Files under `schemas/` that are not listed are left alone, so an older published version can stay
 on disk after the listing moves on to a new one.
+
+### Porting a classic bundle
+
+`rwtask port` drafts a V13 skill skeleton from a classic rw-cli Robot bundle (it needs the `port`
+extra: `pip install 'runwhen-capability[port]'`):
+
+```
+rwtask port rw-cli-codecollection/codebundles/k8s-redis-healthcheck \
+    --plugin kubernetes --inventory porting/inventory/k8s-c.yaml \
+    --into plugins/kubernetes/skills
+```
+
+It writes `<into>/<skill>/SKILL.md` and `tasks.yaml` (both validate), and a porting brief to
+`<into>/../porting/briefs/<bundle>.md` (or `--brief`; never inside the skill directory). Existing
+files are not overwritten without `--force`. Warnings go to stderr.
+
+- Task names come from the classic titles with `${...}` variables removed. Target identity
+  (`NAMESPACE`, `CONTEXT`, `*_NAME` of a Kubernetes kind, ...) is dropped for `--plugin kubernetes`;
+  secrets are never inputs; the rest become `inputs`.
+- `readOnly`, `permissions` and the brief's asserts, reads, scope and false-pass notes come from
+  `--inventory`, a YAML list of per-bundle entries; without it `readOnly` follows the
+  `access:read-write` tag.
+- The scripts are not carried over. The brief names the classic scripts as reading material and
+  ends with the porting checklist; re-derive each script from the source system.
 
 ## Building a capability image
 

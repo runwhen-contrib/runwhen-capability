@@ -1,0 +1,166 @@
+# Excerpt of the CNT-1 inventory (group k8s-c): the entries the port tests use.
+- bundle: k8s-redis-healthcheck
+  displayName: Kubernetes Redis Healthcheck
+  classicResourceTypes:
+  - deployment
+  matchHints: pattern 'redis' on name, substring; level of detail detailed; qualifiers resource, namespace, cluster
+  sli: false
+  sliAsserts: ''
+  egress: none
+  tools:
+  - kubectl
+  - redis-cli inside the redis pod
+  inputs:
+  - KUBERNETES_DISTRIBUTION_BINARY
+  - CONTEXT
+  - NAMESPACE
+  - DEPLOYMENT_NAME
+  - REDIS_HEALTHCHECK_KEY
+  tasks:
+  - title: Ping Redis Workload
+    at: runbook.robot:20
+    asserts: kubectl exec deployment/NAME -- redis-cli PING does not output PONG; sev2.
+    reads:
+    - kubectl exec deployment/DEPLOYMENT_NAME -n NS -- redis-cli PING
+    permissions:
+    - apiGroups:
+      - apps
+      resources:
+      - deployments
+      verbs:
+      - get
+    - apiGroups:
+      - ''
+      resources:
+      - pods
+      verbs:
+      - get
+      - list
+    - apiGroups:
+      - ''
+      resources:
+      - pods/exec
+      verbs:
+      - create
+    scope: ns:target
+    readOnly: true
+    falsePass: none
+    falsePassWhy: ''
+    notes: 'Empty output (exec Forbidden, deployment missing, NOAUTH from a password-protected redis, redis-cli absent) all raise the same sev2 ''PING failed'' issue: wrong cause attribution but not a pass.
+      next_steps point at PVC health.'
+  - title: Verify Redis Read Write Operation
+    at: runbook.robot:44
+    asserts: SET key 0 then INCR key then GET key does not return exactly 1; sev1.
+    reads:
+    - kubectl exec deployment/NAME -- redis-cli SET KEY 0; INCR KEY; GET KEY
+    permissions:
+    - apiGroups:
+      - apps
+      resources:
+      - deployments
+      verbs:
+      - get
+    - apiGroups:
+      - ''
+      resources:
+      - pods
+      verbs:
+      - get
+      - list
+    - apiGroups:
+      - ''
+      resources:
+      - pods/exec
+      verbs:
+      - create
+    scope: ns:target
+    readOnly: false
+    falsePass: none
+    falsePassWhy: ''
+    notes: Tagged access:read-only but it writes a key (default runwhen_task_rw_healthcheck) and leaves it behind. SET/INCR return codes ignored; only the final GET value is compared, so a failed GET (empty)
+      raises sev1 (safe). With multiple replicas kubectl exec deployment/ picks one pod, which on a replica fails SET (READONLY) and raises. Key never deleted.
+  bundleNotes: Classic type deployment matched by name substring 'redis' misses StatefulSet-based redis (very common) and also matches unrelated deployments such as redis-exporter. Redis auth not supported.
+    Tiny bundle; both tasks are genuine checks with rc/empty treated as failure.
+- bundle: k8s-restart-resource
+  displayName: Kubernetes Restart resource
+  classicResourceTypes: []
+  matchHints: no .runwhen/generation-rules directory; not auto-generated (used with other tasksets)
+  sli: false
+  sliAsserts: ''
+  egress: none
+  tools:
+  - kubectl
+  inputs:
+  - KUBERNETES_DISTRIBUTION_BINARY
+  - CONTEXT
+  - NAMESPACE
+  - LABELS
+  tasks:
+  - title: Get Current Resource State with Labels
+    at: runbook.robot:20
+    asserts: Nothing; informational YAML dump of daemonsets, deployments, statefulsets matching LABELS.
+    reads:
+    - kubectl get daemonset,deployment,statefulset -l LABELS -n NS -oyaml
+    permissions:
+    - apiGroups:
+      - apps
+      resources:
+      - daemonsets
+      - deployments
+      - statefulsets
+      verbs:
+      - get
+      - list
+    scope: ns:target
+    readOnly: true
+    falsePass: none
+    falsePassWhy: ''
+    notes: No issue path.
+  - title: Get Resource Logs with Labels
+    at: runbook.robot:32
+    asserts: Nothing; informational last 200 lines (256KB cap) from pods matching LABELS.
+    reads:
+    - kubectl logs -l LABELS --tail=200 --limit-bytes=256000 -n NS
+    permissions:
+    - apiGroups:
+      - ''
+      resources:
+      - pods
+      verbs:
+      - get
+      - list
+    - apiGroups:
+      - ''
+      resources:
+      - pods/log
+      verbs:
+      - get
+    scope: ns:target
+    readOnly: true
+    falsePass: none
+    falsePassWhy: ''
+    notes: kubectl logs -l caps at 5 concurrent pods by default (--max-log-requests=5) and errors above that; the error is not checked.
+  - title: Restart Resource with Labels
+    at: runbook.robot:44
+    asserts: WRITE. kubectl rollout restart of the first DaemonSet, Deployment or StatefulSet (in that kubectl ordering) matching LABELS. Asserts nothing about outcome.
+    reads:
+    - kubectl get daemonset,deployment,statefulset -l LABELS -o jsonpath items[0].kind/items[0].metadata.name
+    - kubectl rollout restart KIND/NAME -n NS
+    permissions:
+    - apiGroups:
+      - apps
+      resources:
+      - daemonsets
+      - deployments
+      - statefulsets
+      verbs:
+      - get
+      - list
+      - patch
+    scope: ns:target
+    readOnly: false
+    falsePass: confirmed
+    falsePassWhy: 'runbook.robot:48-59 no rc or stderr check; if no workload matches resource_name is ''/'', rollout restart fails, and :59 still reports ''Restarted the following workload: /''. Rollout
+      is not awaited.'
+    notes: Only items[0] restarted although the doc says resource(s) with a set of labels; ordering across kinds is kubectl's. No rollout status wait, no pre-existing-state check.
+  bundleNotes: Remediation helper used by other tasksets; no generation rules, so no classic resource type or matching. No Add Issue calls anywhere; the bundle asserts nothing.
