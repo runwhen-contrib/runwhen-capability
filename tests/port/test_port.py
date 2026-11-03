@@ -682,6 +682,12 @@ def test_inventory_top_level_must_be_a_list_or_mapping(tmp_path):
         load_inventory_entry(bad, "demo-bundle")
 
 
+def test_inventory_is_read_as_yaml_1_2(tmp_path):
+    inv = tmp_path / "inventory.yaml"
+    inv.write_text("- bundle: demo-bundle\n  notes: no\n  tasks: []\n")
+    assert load_inventory_entry(inv, "demo-bundle")["notes"] == "no"
+
+
 def test_brief_and_warnings_say_the_inventory_has_no_entry(tmp_path):
     path = write_bundle(tmp_path, runbook=RUNBOOK)
     draft = draft_skill(read_bundle(path), "kubernetes", inventory_missing=True)
