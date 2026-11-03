@@ -492,3 +492,112 @@ def test_schema_files_must_be_json_objects():
     entries = put(kube_entries(), "integration/facets.yaml", FACETS)
     entries = put(entries, "integration/schemas/replicas.v1.json", "42")
     assert only(entries, "E_SCHEMA_FILE_INVALID").path == "/facets/0/schema"
+
+
+# -- E_SCHEMA_PATTERN (S13): plugin-authored patterns must run on RE2 ----------------------
+
+SINCE = "      since: { type: duration, default: 30m, description: Look-back window }\n"
+ROLLOUT = "skills/k8s-workload-health/schemas/rollout.v1.json"
+RBAC = "integration/schemas/rbac-rule.json"
+
+
+def test_an_input_pattern_re2_cannot_compile_is_reported_at_the_keyword():
+    entries = edit(
+        kube_entries(),
+        HEALTH_TASKS,
+        SINCE,
+        SINCE + "      name: { type: string, pattern: '^(?=a)b$' }\n",
+    )
+    d = only(entries, "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == (HEALTH_TASKS, "/tasks/0/inputs/name/pattern")
+    assert d.severity == "error" and "(?=a)" in d.message
+
+
+def test_a_setting_pattern_re2_cannot_compile_is_reported():
+    setting = "      cap: { type: string, default: a, pattern: '(a)\\1' }\n"
+    entries = edit(
+        kube_entries(),
+        HEALTH_TASKS,
+        "    inputs:\n      since",
+        "    settings:\n" + setting + "    inputs:\n      since",
+    )
+    d = only(entries, "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == (HEALTH_TASKS, "/tasks/0/settings/cap/pattern")
+    entries = edit(kube_entries(), HEALTH_TASKS, "tasks:\n", "settings:\n" + setting + "tasks:\n")
+    assert only(entries, "E_SCHEMA_PATTERN").path == "/settings/cap/pattern"
+
+
+def test_an_output_schema_file_pattern_is_reported_against_that_file():
+    schema = '{"type": "object", "properties": {"a": {"type": "string", "pattern": "(?!x)"}}}'
+    d = only(put(kube_entries(), ROLLOUT, schema), "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == (ROLLOUT, "/properties/a/pattern")
+
+
+def test_a_patternproperties_key_re2_cannot_compile_is_reported():
+    schema = '{"type": "object", "patternProperties": {"^(?<=x)y": {"type": "string"}}}'
+    d = only(put(kube_entries(), ROLLOUT, schema), "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == (ROLLOUT, "/patternProperties/^(?<=x)y")
+
+
+def test_a_property_named_pattern_is_not_the_keyword():
+    schema = (
+        '{"type": "object", "properties": {"pattern": {"type": "string"}},'
+        ' "default": {"pattern": "(?=x)"}}'
+    )
+    assert not found(put(kube_entries(), ROLLOUT, schema), "E_SCHEMA_PATTERN")
+
+
+def test_an_object_input_inline_schema_and_file_patterns_are_reported():
+    inline = edit(
+        kube_entries(),
+        HEALTH_TASKS,
+        SINCE,
+        "      v:\n        type: object\n"
+        "        schema: { type: object, properties: { x: { type: string, pattern: '(?=a)' } } }\n",
+    )
+    d = only(inline, "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == (HEALTH_TASKS, "/tasks/0/inputs/v/schema/properties/x/pattern")
+    filed = edit(
+        kube_entries(),
+        HEALTH_TASKS,
+        SINCE,
+        "      v: { type: object, schema: ./schemas/filter.v1.json }\n",
+    )
+    filed = put(filed, "skills/k8s-workload-health/schemas/filter.v1.json", '{"pattern": "(?=a)"}')
+    d = only(filed, "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == ("skills/k8s-workload-health/schemas/filter.v1.json", "/pattern")
+
+
+def test_a_facet_schema_pattern_is_reported():
+    entries = put(kube_entries(), "integration/facets.yaml", FACETS)
+    entries = put(entries, "integration/schemas/replicas.v1.json", '{"pattern": "(?=a)"}')
+    d = only(entries, "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == ("integration/schemas/replicas.v1.json", "/pattern")
+
+
+def test_a_permission_schema_pattern_is_reported_once_and_skips_rule_evaluation():
+    schema = (
+        '{"type": "object", "properties": {"verbs": {"type": "array", '
+        '"items": {"type": "string", "pattern": "(?=a)"}}}}'
+    )
+    entries = put(kube_entries(), RBAC, schema)
+    d = only(entries, "E_SCHEMA_PATTERN")
+    assert (d.file, d.path) == (RBAC, "/properties/verbs/items/pattern")
+    assert not found(entries, "E_PERMISSION_SCHEMA")
+
+
+def test_a_valid_re2_pattern_in_every_place_is_clean():
+    inputs = "      name: { type: string, pattern: '^[a-z]+(-[a-z0-9]+)*$' }\n"
+    entries = edit(kube_entries(), HEALTH_TASKS, SINCE, SINCE + inputs)
+    entries = put(
+        entries, ROLLOUT, '{"type": "object", "patternProperties": {"^x-\\\\p{L}+$": {}}}'
+    )
+    assert validate_entries(entries) == []
+
+
+def test_a_remote_ref_in_a_plugin_schema_is_reported():
+    schema = '{"type": "object", "properties": {"a": {"$ref": "https://example.com/a.json"}}}'
+    d = only(put(kube_entries(), ROLLOUT, schema), "E_SCHEMA_REF")
+    assert (d.file, d.path) == (ROLLOUT, "/properties/a/$ref")
+    local = '{"$defs": {"a": {"type": "string"}}, "properties": {"a": {"$ref": "#/$defs/a"}}}'
+    assert not found(put(kube_entries(), ROLLOUT, local), "E_SCHEMA_REF")

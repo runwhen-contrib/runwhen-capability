@@ -61,13 +61,13 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
-import jsonschema
-import referencing
+from jsonschema.protocols import Validator
 
 from .. import bundle
 from .._redaction import Redactor
 from .._rw_sh import BASH_ENV_SH, RW_SH
 from ..contracts import validate as validate_contract
+from ..contracts import validator_for_plugin_schema
 from ..custom.manifest import (
     input_env_name,
     is_reserved_env_name,
@@ -371,23 +371,22 @@ def _materialize(files_dir: Path, files: Mapping[str, bytes], executable: frozen
             handle.write(data)
 
 
-def _validator(schema: dict) -> jsonschema.Validator:
-    cls = jsonschema.Draft202012Validator
-    return cls(schema, registry=referencing.Registry(), format_checker=cls.FORMAT_CHECKER)
-
-
 def _validate_output(schema: dict, value: Any) -> list[str]:
-    """The problems `value` has against an output's JSON Schema, [] if none. The one
-    place output schemas are evaluated, so the engine can be swapped (S13: a
-    plugin-authored `pattern` is a regex the host runs)."""
-    return _problems(_validator(schema), value)
+    """The problems `value` has against an output's JSON Schema, [] if none. Output and
+    input schemas are plugin-authored, so they are evaluated with
+    `contracts.validator_for_plugin_schema` (RE2 for patterns, no remote `$ref`: S13)."""
+    try:
+        validator = validator_for_plugin_schema(schema)
+    except Exception as exc:  # noqa: BLE001 -- a plugin-authored schema; contain it
+        return [f"the schema could not be evaluated ({type(exc).__name__})"]
+    return _problems(validator, value)
 
 
 def _json_path(parts) -> str:
     return "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in parts)
 
 
-def _problems(validator: jsonschema.Validator, value: Any, limit: int = 5) -> list[str]:
+def _problems(validator: Validator, value: Any, limit: int = 5) -> list[str]:
     found = []
     try:
         for error in validator.iter_errors(value):
@@ -412,9 +411,15 @@ def _resolve_inputs(task: dict, provided: Mapping[str, Any]) -> tuple[dict, list
     }
     inputs.update(provided)
     errors = []
-    for error in sorted(
-        _validator(task["inputSchema"]).iter_errors(inputs), key=lambda e: list(e.absolute_path)
-    ):
+    try:
+        violations = sorted(
+            validator_for_plugin_schema(task["inputSchema"]).iter_errors(inputs),
+            key=lambda e: list(e.absolute_path),
+        )
+    except Exception as exc:  # noqa: BLE001 -- a plugin-authored schema; contain it
+        message = f"the input schema could not be evaluated ({type(exc).__name__})"
+        return inputs, [_error("invalid_input", message)]
+    for error in violations:
         if error.validator == "required":
             names = [n for n in task["inputSchema"].get("required", []) if n not in inputs]
             for name in names or [error.message]:

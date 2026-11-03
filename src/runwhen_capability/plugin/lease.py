@@ -164,8 +164,13 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
     contract. The compiled-task-shaped `task` carries what `execute` reads (ref, skill,
     name, script, readOnly, dryRun, outputs) and no `inputs`/`inputSchema`/`settings`:
     a lease's inputs and settings are resolved by papi and used as given. The target and
-    its identity are the lease's own. `timeout_s` is `limits.timeout`. A run is never a
-    dry run: the lease has no field to ask for one. Raises LeaseError."""
+    its identity are the lease's own. `timeout_s` is `limits.timeout`. The run is a dry run
+    (`RW_DRY_RUN=1`, `dryRun: true` on the envelope) when the lease says `dryRun: true`; a
+    task that does not declare `dryRun` refuses it (LeaseError invalid_input) before any
+    code is read. Raises LeaseError."""
+    dry_run = bool(lease.get("dryRun"))
+    if dry_run and not lease["task"].get("dryRun"):
+        raise LeaseError("invalid_input", "task does not support dry run")
     files, executable = load_code(lease["code"], archive_cache)
     leased = lease["task"]
     if leased["script"] not in files:
@@ -184,7 +189,7 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
         target=copy.deepcopy(lease.get("target")),
         inputs=dict(lease["inputs"]),
         settings=dict(lease["settings"]),
-        dry_run=False,
+        dry_run=dry_run,
         timeout_s=_duration_seconds(lease["limits"]["timeout"]),
     )
 

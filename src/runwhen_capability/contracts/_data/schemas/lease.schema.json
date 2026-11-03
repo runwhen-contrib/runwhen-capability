@@ -18,6 +18,10 @@
       "minLength": 1,
       "maxLength": 255
     },
+    "dryRun": {
+      "type": "boolean",
+      "description": "papi asks for a dry-run execution: the runner sets RW_DRY_RUN=1, and only when task.dryRun is true (otherwise the lease fails with invalid_input)."
+    },
     "workspace": {
       "type": "string",
       "minLength": 1,

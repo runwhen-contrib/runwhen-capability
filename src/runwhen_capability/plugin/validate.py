@@ -42,6 +42,11 @@ Semantic (errors unless noted)
   refers to is not a JSON object. E_INPUT_SCHEMA_MISSING -- an object input's
   `./schemas/...` file is absent. A non-`./` string `schema` is compact notation
   (E_SCHEMA_NOTATION when it does not compile).
+- E_SCHEMA_PATTERN -- a plugin-authored JSON Schema (an input's or setting's `pattern`, an
+  object input's or an output's schema, a facet schema, the permission schema) has a
+  `pattern` or `patternProperties` key RE2 cannot compile (lookaround, backreferences):
+  the host evaluates these with RE2 so a pattern cannot hang it (S13). E_SCHEMA_REF -- such
+  a schema has a `$ref` that does not point inside the schema (it would never be fetched).
 - E_SKILL_BODY_TOO_LONG -- a SKILL.md body is over 500 lines.
 - E_RULE_BUDGET -- more than 10 rules, or a rule body over 80 words (whitespace-
   separated tokens).
@@ -57,9 +62,9 @@ from typing import Any
 
 import yaml
 from jsonschema import exceptions as jsonschema_exceptions
-from jsonschema.validators import validator_for
 
-from ..contracts import TreeEntry, load_yaml, validate
+from ..contracts import TreeEntry, load_yaml, validate, validator_for_plugin_schema
+from ..contracts.plugin_schema import iter_schema_problems
 from ..custom.diagnostics import Diagnostic
 from ..custom.schema_notation import SchemaNotationError, compile_schema_notation
 from .tree import E_SKILL_MD_MISSING, E_YAML, INTEGRATION_FILES, PluginTree, load_entries
@@ -85,6 +90,8 @@ E_RULE_BUDGET = "E_RULE_BUDGET"
 E_SCHEMA_FILE_INVALID = "E_SCHEMA_FILE_INVALID"
 E_INPUT_SCHEMA_MISSING = "E_INPUT_SCHEMA_MISSING"
 E_SKILL_BODY_TOO_LONG = "E_SKILL_BODY_TOO_LONG"
+E_SCHEMA_PATTERN = "E_SCHEMA_PATTERN"
+E_SCHEMA_REF = "E_SCHEMA_REF"
 E_TASK_NAME_DUPLICATE = "E_TASK_NAME_DUPLICATE"
 
 MAX_RULES = 10
@@ -172,6 +179,24 @@ class _Validator:
         for violation in validate(name, doc):
             where = file_of(violation.path) if file_of else file
             self.add(E_SCHEMA, where, violation.path, violation.message)
+
+    def check_patterns(self, file: str, pointer: str, schema: Any) -> int:
+        """E_SCHEMA_PATTERN / E_SCHEMA_REF for what RE2 cannot run in the plugin-authored
+        `schema` found at `pointer` of `file`; how many there were."""
+        found = 0
+        for where, kind, message in iter_schema_problems(schema):
+            code = E_SCHEMA_PATTERN if kind == "pattern" else E_SCHEMA_REF
+            self.add(code, file, pointer + where, message)
+            found += 1
+        return found
+
+    def check_param_patterns(self, file: str, pointer: str, spec: Any) -> None:
+        """An input's or a setting's `pattern`, and an inline object `schema`."""
+        spec = _mapping(spec)
+        if "pattern" in spec:
+            self.check_patterns(file, pointer, {"pattern": spec["pattern"]})
+        if isinstance(spec.get("schema"), dict):
+            self.check_patterns(file, pointer + "/schema", spec["schema"])
 
     # -- driver -----------------------------------------------------------------
 
@@ -328,12 +353,16 @@ class _Validator:
                 )
 
     def check_json_object(self, file: str, where: str, path: str) -> None:
+        """`path` must be a JSON object; it is a plugin-authored schema, so its patterns
+        are checked too (reported against the schema file itself)."""
         try:
-            ok = isinstance(json.loads(self.tree.files[path].decode("utf-8")), dict)
+            doc = json.loads(self.tree.files[path].decode("utf-8"))
         except ValueError:
-            ok = False
-        if not ok:
+            doc = None
+        if not isinstance(doc, dict):
             self.add(E_SCHEMA_FILE_INVALID, file, where, f"{path} is not a JSON object")
+            return
+        self.check_patterns(path, "", doc)
 
     @staticmethod
     def integration_path(ref: str) -> str | None:
@@ -355,17 +384,23 @@ class _Validator:
             return
         try:
             schema = json.loads(self.tree.files[path].decode("utf-8"))
-            validator_class = validator_for(schema)
-            validator_class.check_schema(schema)
-        except (ValueError, jsonschema_exceptions.SchemaError) as exc:
+        except ValueError as exc:
+            self.add(E_PERMISSION_SCHEMA, file, where, f"{path} is not a valid JSON Schema: {exc}")
+            return
+        if self.check_patterns(path, "", schema):
+            return  # no point evaluating task permissions against it
+        try:
+            validator = validator_for_plugin_schema(schema)
+            validator.check_schema(schema, format_checker=validator.format_checker)
+        except jsonschema_exceptions.SchemaError as exc:
             self.add(
                 E_PERMISSION_SCHEMA,
                 file,
                 where,
-                f"{path} is not a valid JSON Schema: {getattr(exc, 'message', None) or exc}",
+                f"{path} is not a valid JSON Schema: {exc.message}",
             )
             return
-        self.permission_validator = validator_class(schema)
+        self.permission_validator = validator
 
     def check_entry_points(self) -> None:
         file = self.key_file("entryPoints")
@@ -464,6 +499,8 @@ class _Validator:
         tasks_doc = skill.tasks
         self.schema("tasks", tasks_doc, file)
         defaults = _mapping(tasks_doc.get("defaults"))
+        for setting, spec in _mapping(tasks_doc.get("settings")).items():
+            self.check_param_patterns(file, _pointer("settings", setting), spec)
         seen_names: set[str] = set()
         for i, task in enumerate(_sequence(tasks_doc.get("tasks"))):
             if not isinstance(task, dict):
@@ -479,6 +516,8 @@ class _Validator:
                     )
                 seen_names.add(name)
             self.check_script(skill_name, skill, file, i, task)
+            for setting, spec in _mapping(task.get("settings")).items():
+                self.check_param_patterns(file, _pointer("tasks", i, "settings", setting), spec)
             self.check_outputs(skill_name, skill, file, i, task)
             self.check_inputs(skill_name, skill, file, i, task)
             ref = f"{skill_name}/{name}" if isinstance(name, str) else None
@@ -523,16 +562,21 @@ class _Validator:
                 else:
                     self.check_json_object(file, where, f"skills/{skill_name}/{resolved}")
             else:
-                try:
-                    compile_schema_notation(value)
-                except SchemaNotationError as exc:
-                    self.add(
-                        E_SCHEMA_NOTATION, file, where, f"compact schema does not compile: {exc}"
-                    )
+                self.check_notation(file, where, value)
+
+    def check_notation(self, file: str, where: str, value: str) -> None:
+        try:
+            compiled = compile_schema_notation(value)
+        except SchemaNotationError as exc:
+            self.add(E_SCHEMA_NOTATION, file, where, f"compact schema does not compile: {exc}")
+            return
+        self.check_patterns(file, where, compiled)
 
     def check_inputs(self, skill_name, skill, file, i, task) -> None:
-        """An object input's `schema`: a `./schemas/...` file or compact notation."""
+        """An input's `pattern`; an object input's `schema`: an inline mapping, a
+        `./schemas/...` file or compact notation."""
         for in_name, spec in _mapping(task.get("inputs")).items():
+            self.check_param_patterns(file, _pointer("tasks", i, "inputs", in_name), spec)
             value = _mapping(spec).get("schema")
             if not isinstance(value, str):
                 continue
@@ -549,12 +593,7 @@ class _Validator:
                 else:
                     self.check_json_object(file, where, f"skills/{skill_name}/{resolved}")
             else:
-                try:
-                    compile_schema_notation(value)
-                except SchemaNotationError as exc:
-                    self.add(
-                        E_SCHEMA_NOTATION, file, where, f"compact schema does not compile: {exc}"
-                    )
+                self.check_notation(file, where, value)
 
     # -- credentials and permissions -----------------------------------------------
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -579,3 +580,73 @@ def test_object_settings_and_inputs_keep_their_keys_end_to_end(tmp_path):
         "setting_attr": "refused",
         "input": opts,
     }
+
+
+# -- plugin-authored patterns run on RE2 (S13) --------------------------------------------
+
+_EVIL = "^(a+)+$"
+_EVIL_VALUE = "a" * 40 + "b"
+
+
+def _inline_run(tmp_path, *, input_schema=None, output_schema=None, inputs=None, returns="{}"):
+    task = {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": "scripts/t.py",
+        "inputs": {name: {"type": "string"} for name in (inputs or {})},
+        "inputSchema": input_schema or {"type": "object"},
+        "settings": {},
+        "outputs": {"out": {"jsonSchema": output_schema or {"type": "object"}}},
+    }
+    script = f"def main(ctx, **inputs):\n    return {{'out': {returns}}}\n".encode()
+    start = time.monotonic()
+    outcome = execute(
+        RunSpec(task=task, files={"scripts/t.py": script}, inputs=inputs or {}),
+        scope_dir=tmp_path / "scope",
+    )
+    return outcome.envelope, time.monotonic() - start
+
+
+def test_a_catastrophic_input_pattern_does_not_hang_the_run(tmp_path):
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string", "pattern": _EVIL}},
+        "required": ["name"],
+    }
+    env, seconds = _inline_run(
+        tmp_path, input_schema=schema, inputs={"name": _EVIL_VALUE}, returns="{}"
+    )
+    assert seconds < 5
+    assert env["status"] == "failed"
+    assert env["errors"][0]["code"] == "invalid_input"
+    assert "does not match" in env["errors"][0]["message"]
+
+
+def test_a_catastrophic_output_pattern_does_not_hang_the_run(tmp_path):
+    schema = {"type": "string", "pattern": _EVIL}
+    env, seconds = _inline_run(tmp_path, output_schema=schema, returns=repr(_EVIL_VALUE))
+    assert seconds < 5
+    assert "out" not in env["outputs"]
+    assert any("does not match" in e["message"] for e in env["errors"])
+
+
+def test_an_output_matching_its_pattern_passes(tmp_path):
+    schema = {"type": "string", "pattern": "^[a-z]+\\d$"}
+    env, _ = _inline_run(tmp_path, output_schema=schema, returns="'abc1'")
+    assert env["status"] == "ok" and env["outputs"] == {"out": "abc1"}
+
+
+def test_a_remote_ref_in_an_output_schema_is_not_fetched_and_drops_the_output(tmp_path):
+    schema = {"$ref": "https://example.invalid/schema.json"}
+    env, _ = _inline_run(tmp_path, output_schema=schema, returns="{}")
+    assert "out" not in env["outputs"]
+    assert any("could not be evaluated" in e["message"] for e in env["errors"])
+
+
+def test_a_remote_ref_in_an_input_schema_is_invalid_input_not_a_crash(tmp_path):
+    schema = {"type": "object", "properties": {"a": {"$ref": "https://example.invalid/a.json"}}}
+    env, _ = _inline_run(tmp_path, input_schema=schema, inputs={"a": "x"})
+    assert env["status"] == "failed"
+    assert env["errors"][0]["code"] == "invalid_input"
+    assert "could not be evaluated" in env["errors"][0]["message"]

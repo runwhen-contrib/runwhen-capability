@@ -28,6 +28,7 @@ from .hashing import (
     permission_hash,
     task_hash,
 )
+from .plugin_schema import check_plugin_schema, validator_for_plugin_schema
 
 __all__ = [
     "SCHEMA_NAMES",
@@ -38,6 +39,7 @@ __all__ = [
     "archive_sha256",
     "canonical_json",
     "check",
+    "check_plugin_schema",
     "data_dir",
     "load_yaml",
     "normalize_permission",
@@ -46,6 +48,7 @@ __all__ = [
     "split_frontmatter",
     "task_hash",
     "validate",
+    "validator_for_plugin_schema",
 ]
 
 

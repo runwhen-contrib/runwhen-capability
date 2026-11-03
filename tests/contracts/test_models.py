@@ -32,6 +32,10 @@ ROUND_TRIP_KNOWN: dict[str, str] = {}
 # Invalid fixtures the model accepts although the schema rejects them: fixture
 # -> the keyword datamodel-code-generator does not turn into a model constraint.
 MODEL_LOOSER_THAN_SCHEMA: dict[str, str] = {
+    "compiled-plugin/invalid/workspace-plugin-with-release-version.yaml": (
+        "`plugin` is anyOf[plugin, workspace shape]; the plugin model accepts the name "
+        "`workspace` (reserved only by a `not: {enum}` it does not carry)"
+    ),
     "connection/invalid/root-and-selector.yaml": (
         "root-level oneOf of `required` + `not: {required}` (exactly one of root/selector)"
     ),

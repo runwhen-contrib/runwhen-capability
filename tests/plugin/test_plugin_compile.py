@@ -9,6 +9,7 @@ import shutil
 
 import pytest
 from _plugin_fixtures import (
+    EXAMPLES,
     KUBE_MINI,
     drop,
     edit,
@@ -20,7 +21,14 @@ from jsonschema import Draft202012Validator
 
 from runwhen_capability import __version__
 from runwhen_capability.cli import main
-from runwhen_capability.contracts import archive, check, permission_hash, task_hash
+from runwhen_capability.contracts import (
+    TreeEntry,
+    archive,
+    check,
+    load_yaml,
+    permission_hash,
+    task_hash,
+)
 from runwhen_capability.plugin import (
     PluginInvalid,
     compile_entries,
@@ -494,11 +502,100 @@ def test_warnings_do_not_block_compiling():
     assert compiled(platform_ops_entries())["plugin"]["name"] == "runwhen-platform-ops"
 
 
-def test_a_workspace_skill_tree_has_no_compiled_form():
+def test_a_skill_only_tree_has_no_compiled_form_without_a_workspace_revision():
     only = [e for e in kube_entries() if e.path.startswith(HEALTH)]
     with pytest.raises(PluginInvalid) as info:
         compiled(only)
     assert info.value.diagnostics[0].code == "E_PLUGIN_MISSING"
+
+
+def workspace_entries():
+    """The tree behind contracts/examples/compiled-plugin/synthetic-workspace-skill.yaml."""
+    base = "skills/nightly-export-check/"
+    return [
+        TreeEntry(
+            base + "SKILL.md",
+            b"---\nname: nightly-export-check\n"
+            b"description: Check that last night's export job wrote a fresh file to the shared "
+            b"volume.\nrunwhen:\n  role: cli\n  tags: [exports]\n---\n"
+            b"Run `export-fresh` when the morning report is empty.\n",
+        ),
+        TreeEntry(
+            base + "tasks.yaml",
+            b"apiVersion: runwhen.com/tasks/v1\nruntime: generic@1\ntasks:\n"
+            b"  - name: export-fresh\n    title: Export file is fresh\n"
+            b"    description: Reports the age of the newest file in the export directory.\n"
+            b"    script: scripts/export_fresh.sh\n    readOnly: true\n    inputs:\n"
+            b"      directory: { type: string, default: /data/exports, "
+            b"description: Directory to inspect }\n    outputs:\n"
+            b'      newest: { schema: "{ file: string, ageMinutes: integer }" }\n',
+        ),
+        TreeEntry(
+            base + "scripts/export_fresh.sh",
+            b'#!/usr/bin/env bash\nset -euo pipefail\nls -t "$RW_INPUT_DIRECTORY" | head -n 1\n',
+            True,
+        ),
+    ]
+
+
+def test_a_workspace_skill_revision_compiles_as_the_workspace_plugin():
+    doc = compiled(workspace_entries(), workspace_revision=7)
+    check("compiled-plugin", doc)
+    assert doc["plugin"] == {
+        "name": "workspace",
+        "version": "0.0.0-rev.7",
+        "description": "Workspace skill nightly-export-check",
+    }
+    assert doc["integration"] is None
+    assert [t["ref"] for t in doc["tasks"]] == ["workspace:nightly-export-check/export-fresh"]
+    assert doc["tasks"][0]["script"] == "skills/nightly-export-check/scripts/export_fresh.sh"
+    assert doc["rules"] == [] and doc["knowledge"] == []
+
+
+def test_the_workspace_example_is_what_compile_emits():
+    example = load_yaml(
+        (EXAMPLES / "compiled-plugin" / "synthetic-workspace-skill.yaml").read_text()
+    )
+    doc = compiled(workspace_entries(), workspace_revision=3)
+    assert {**doc, "compiler": example["compiler"]} == example
+
+
+def test_workspace_description_names_every_skill_sorted():
+    entries = workspace_entries()
+    other = [
+        TreeEntry(e.path.replace("nightly-export-check", "a-skill"), e.data, e.executable)
+        for e in entries
+    ]
+    other = [
+        TreeEntry(e.path, e.data.replace(b"nightly-export-check", b"a-skill"), e.executable)
+        for e in other
+    ]
+    doc = compiled(entries + other, workspace_revision=1)
+    assert doc["plugin"]["description"] == "Workspace skill a-skill, nightly-export-check"
+    assert doc["plugin"]["version"] == "0.0.0-rev.1"
+
+
+def test_workspace_revision_is_a_positive_integer():
+    for bad in (0, -1, True, "3", 1.5):
+        with pytest.raises(ValueError, match="workspace_revision"):
+            compiled(workspace_entries(), workspace_revision=bad)
+
+
+def test_workspace_revision_is_refused_for_a_tree_with_a_plugin_yaml():
+    with pytest.raises(ValueError, match="plugin.yaml"):
+        compiled(workspace_revision=1)
+
+
+def test_a_workspace_revision_with_rules_is_still_not_a_workspace_skill_tree():
+    entries = put(workspace_entries(), "rules/x.md", "---\nname: x\ndescription: y\n---\nz\n")
+    with pytest.raises(PluginInvalid) as info:
+        compiled(entries, workspace_revision=1)
+    assert info.value.diagnostics[0].code == "E_PLUGIN_MISSING"
+
+
+def test_an_empty_tree_does_not_compile_even_with_a_workspace_revision():
+    with pytest.raises(PluginInvalid):
+        compiled([], workspace_revision=1)
 
 
 def test_compile_entries_of_an_archive_equals_compile_tree_of_the_directory():

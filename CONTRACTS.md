@@ -1,6 +1,7 @@
-# V13 plugins contracts (contracts-v1)
+# V13 plugins contracts (contracts-v2)
 
-Every seam between the lanes of the V13 plugins program, frozen at M0. The
+Every seam between the lanes of the V13 plugins program, frozen at M0 (`contracts-v1`)
+and extended additively in `contracts-v2` (see [Changes in contracts-v2](#changes-in-contracts-v2)). The
 schemas in [`contracts/`](contracts/) are normative; this page says what they
 cannot: who produces and consumes each document, the rules that are not
 expressible in JSON Schema, and the calls made at freeze.
@@ -15,8 +16,11 @@ Design source: the V13 wiki ([skill spec](https://wiki.sdlc.shared.runwhen.com/#
 ## Using the contracts
 
 ```bash
-pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v1"
+pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v2"
 ```
+
+The `contracts-v2` tag is pending: until it exists, pin the commit
+(`@<sha>`, the head of the `lane-a/contracts-v2` branch) in place of `@contracts-v2`.
 
 ```python
 from runwhen_capability.contracts import archive, check, load_yaml, validate
@@ -124,7 +128,37 @@ What a script sees (the runner and `rwtask run` set the same names):
 | Settings | `ctx.settings.<snake_name>` | `RW_SETTING_<NAME>` |
 | Credential | the tool reads its standard form (`$KUBECONFIG`, `PG*`, `REDIS_URL`) | same |
 | Dry run | `ctx.dry_run` | `RW_DRY_RUN=1` |
-| Outputs | the returned dict; `ctx.error(code, msg, scope=, hint=, details=)`; `raise RwError(code, msg)` | `rw_output_append <name> <json>`; `rw_error <code> "<msg>"`; files in `$RW_OUT` |
+| Contract | `RW_TASK_CONTRACT=v13` | `RW_TASK_CONTRACT=v13` |
+| Outputs | the returned dict; `ctx.error(code, msg, scope=, hint=, details=)`; `raise RwError(code, msg)` | `rw_output_append <name> <json>`; `rw_output_set <name> <json>`; `rw_error <code> <msg> [scope]`; files in `$RW_OUT` |
+| Files | `$RW_OUT` (scratch and artifact files), `$RW_LIB_DIR` | `$RW_OUT`, `$RW_LIB_DIR` |
+
+**`RW_TASK_CONTRACT=v13`** is how a script tells the V13 contract from a classic
+bundle's, and both the runner and `rwtask run` set it. Under it `ctx.run` raises
+`RwCommandError` (an `RwError` whose code comes from the command's stderr) on a
+non-zero exit by default; classic bundles keep returning the exit status unless
+`check=True`. An explicit `check=` always wins.
+
+**bash.** A task runs under `set -euo pipefail` with `rw.sh` already loaded: call
+the helpers without sourcing anything.
+
+| Helper | What it does |
+|---|---|
+| `rw_output_append <name> <json>` | append one JSON value to a list-shaped output |
+| `rw_output_set <name> <json>` | set (replace) an output's value |
+| `rw_error <code> <msg> [scope]` | record a structured error (`code` is one of the closed list under Result envelope) and carry on; a clean exit with errors is `partial`, the exit status alone decides `failed` |
+| `rw_skip [reason]` | end the task `skipped`, exit 0 |
+| `rw_artifact <name> <path>` | register a file as an artifact output (or write it to `$RW_OUT/<name>`) |
+
+`$RW_OUT` is a directory fresh for this task, free to write to; the file named
+after an artifact output is what the platform stores. `$RW_LIB_DIR` is the
+skill's `lib/` directory, for sourcing shared code (`source "$RW_LIB_DIR/x.sh"`).
+Stdout and stderr are logs and are never parsed for outputs.
+
+**Testing a script.** `runwhen_capability.testing` (`make_context`, `run_main`,
+`stub_commands`) builds the same context and environment the runner does, so a
+Python script's unit test sees `ctx.resource`, `ctx.settings`, `ctx.run` and
+`ctx.error` with the V13 semantics and no cluster. `rwtask test` replays
+recorded CLI calls through PATH shims, for bash and Python scripts alike.
 
 `<NAME>` is the camelCase name in SCREAMING_SNAKE (`latencyThresholdMs` →
 `RW_SETTING_LATENCY_THRESHOLD_MS`). Identity fields are the integration's
@@ -158,6 +192,12 @@ unpacking (D29, D23):
   inputs with `required` resolved, an `inputSchema` (JSON Schema), outputs with
   their JSON Schema inlined, and the task `hash` (VER-6, archive.md);
 - `rules[]` with body and word count; `knowledge[]` with body.
+
+**Every path in the compiled doc is relative to the plugin root**, the same
+paths the lease and the archive use: `skills[].files`, `tasks[].script` and any
+output `schemaRef` read `skills/papi-health/scripts/api_probe.sh`, never a path
+relative to the skill directory (`scripts/api_probe.sh`, which is how
+`tasks.yaml` writes it). `tasks.yaml` itself stays skill-relative.
 
 ## Result envelope (D64)
 
@@ -198,6 +238,12 @@ they would build, for a small workspace skill; archive.md §8), one credential e
 (`{type, connection, authPlan}`, or `{type: runwhen/sync, minted}`), `limits`
 (`timeout`, `resources`, `maxResultBytes`) and the compiled `outputs` (so the
 runner validates and spills without the index).
+
+**Dry run.** Optional top-level `dryRun: true` asks for a dry-run execution: the
+runner runs the task with `RW_DRY_RUN=1` (`ctx.dry_run`) and the envelope carries
+`dryRun: true`. It is honored only when `task.dryRun` is true; otherwise the runner
+runs nothing and completes `failed` with `invalid_input` ("task does not support
+dry run"). Absent or `false`, the task runs for real, whatever `task.dryRun` says.
 
 ## Connections
 
@@ -370,3 +416,16 @@ Findings and issues (D63); relationship predicates in `appliesTo` (D70);
 cross-source links and `entryPoints.ingest` (O15); archive signing; settings
 resolution below the workspace (O16 changes no schema); plugin automations and
 agent tools (D16).
+
+## Changes in contracts-v2
+
+Additive: no field was removed and every document that validated under
+`contracts-v1` still does (`$id`s stay `.../v1.json`).
+
+| # | Change | Affects |
+|---|---|---|
+| V2-1 | `compiled-plugin`'s `plugin` also accepts the synthetic workspace plugin `{name: workspace, version: 0.0.0-rev.<n>, description}`; `compile_tree` / `compile_entries` take `workspace_revision=` and compile a skill-only tree (refs `workspace:<skill>/<task>`, `integration: null`). `plugin.schema` is unchanged: authors still cannot name a plugin `workspace`. | B (ingest and lease of workspace skills), C |
+| V2-2 | Every path in a compiled-plugin document is plugin-root-relative (`skills/<skill>/scripts/x.sh`); the `synthetic-runwhen-platform-ops` example said skill-relative. Stated under "Compiled plugin"; a test checks every compiled-plugin example. | D (used the example as a template), B |
+| V2-5 | "What a script sees" names `RW_TASK_CONTRACT=v13`, the bash helpers (`rw_error`, `rw_output_append`, `rw_output_set`, ...), `$RW_OUT`, `$RW_LIB_DIR`, strict mode with `rw.sh` preloaded, and `runwhen_capability.testing`. Documentation only. | F (skill authors) |
+| V2-6 | S13: plugin-authored JSON Schemas (task input `pattern`, settings, output, facet and permission schemas, compact notation) are evaluated with RE2, not Python `re`: new dependency `google-re2`, `contracts.validator_for_plugin_schema(schema)` and `contracts.check_plugin_schema(schema)`, and `rwtask validate` / ingest report `E_SCHEMA_PATTERN` (a pattern RE2 cannot compile: lookaround, backreferences) and `E_SCHEMA_REF` (a `$ref` that leaves the schema). Plugins that used lookaround in a pattern must rewrite it. | B (papi re-validation, CAP-5), D (registry ingest), F (authors) |
+| V2-7 | `lease.dryRun` (optional boolean): papi asks for a dry-run execution. The runner runs with `RW_DRY_RUN=1` and marks the envelope `dryRun: true`, only if `task.dryRun` is true; else it completes `failed` with `invalid_input` "task does not support dry run". | B, E (CAP-14 approval card), C |

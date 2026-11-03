@@ -273,6 +273,10 @@ class Lease(BaseModel):
     apiVersion: Literal["runwhen.com/lease/v1"]
     leaseId: str = Field(..., max_length=255, min_length=1)
     taskRun: str = Field(..., max_length=255, min_length=1)
+    dryRun: bool | None = Field(
+        None,
+        description="papi asks for a dry-run execution: the runner sets RW_DRY_RUN=1, and only when task.dryRun is true (otherwise the lease fails with invalid_input).",
+    )
     workspace: str | None = Field(None, max_length=255, min_length=1)
     expiresAt: AwareDatetime | None = None
     task: Task
