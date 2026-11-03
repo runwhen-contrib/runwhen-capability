@@ -235,6 +235,12 @@ they would build, for a small workspace skill; archive.md §8), one credential e
 (`timeout`, `resources`, `maxResultBytes`) and the compiled `outputs` (so the
 runner validates and spills without the index).
 
+**Dry run.** Optional top-level `dryRun: true` asks for a dry-run execution: the
+runner runs the task with `RW_DRY_RUN=1` (`ctx.dry_run`) and the envelope carries
+`dryRun: true`. It is honored only when `task.dryRun` is true; otherwise the runner
+runs nothing and completes `failed` with `invalid_input` ("task does not support
+dry run"). Absent or `false`, the task runs for real, whatever `task.dryRun` says.
+
 ## Connections
 
 **Credential reference** (five kinds, platform code, D67): `k8s-secret`,

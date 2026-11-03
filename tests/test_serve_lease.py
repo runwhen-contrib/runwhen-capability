@@ -577,3 +577,48 @@ def test_nothing_is_uploaded_for_a_task_that_failed_or_wrote_no_artifact(relayed
     body, puts = relayed(make_lease("py-nothing"), None, [DUMP_DECL])
     assert envelope_of(body)["status"] == "ok"
     assert puts == []
+
+
+# -- lease.dryRun (V2-7) ------------------------------------------------------------------
+
+
+def dry_run_lease(task_name: str, **kw) -> dict:
+    return {**make_lease(task_name, **kw), "dryRun": True}
+
+
+def test_a_lease_without_dry_run_runs_for_real_even_when_the_task_supports_it(poll):
+    envelope = envelope_of(poll(make_lease("sh-write")))
+    assert envelope["status"] == "ok"
+    assert envelope["outputs"]["result"] == {"dry": False}
+    assert "dryRun" not in envelope
+    envelope = envelope_of(poll({**make_lease("sh-write"), "dryRun": False}))
+    assert envelope["outputs"]["result"] == {"dry": False} and "dryRun" not in envelope
+
+
+def test_a_dry_run_lease_sets_rw_dry_run_and_marks_the_envelope(poll):
+    envelope = envelope_of(poll(dry_run_lease("sh-write")))
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert envelope["outputs"]["result"] == {"dry": True}
+    assert envelope["dryRun"] is True
+
+
+def test_a_python_task_sees_ctx_dry_run_under_a_dry_run_lease(poll):
+    envelope = envelope_of(poll(dry_run_lease("py-ok")))
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert envelope["outputs"]["summary"]["dry"] is True
+    assert envelope["dryRun"] is True
+
+
+def test_a_dry_run_lease_for_a_task_without_dry_run_fails_invalid_input_and_runs_nothing(poll):
+    envelope = envelope_of(poll(dry_run_lease("sh-write-no-dry")))
+    assert envelope["status"] == "failed"
+    assert envelope["outputs"] == {}
+    [error] = envelope["errors"]
+    assert error["code"] == "invalid_input"
+    assert error["message"] == "task does not support dry run"
+
+
+def test_a_dry_run_lease_must_say_a_boolean(poll):
+    envelope = envelope_of(poll({**make_lease("sh-write"), "dryRun": "yes"}))
+    [error] = envelope["errors"]
+    assert error["code"] == "invalid_input" and "dryRun" in error["message"]
