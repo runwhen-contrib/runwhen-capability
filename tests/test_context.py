@@ -146,9 +146,47 @@ def test_settings_use_snake_case_attribute_names(tmp_path, monkeypatch):
     settings = _ctx(tmp_path).settings
     assert settings.latency_threshold_ms == 250
     assert settings.already_snake is True
-    assert settings.nested.max_wait == "5s"
     assert settings["latency_threshold_ms"] == 250
     assert set(settings) == {"latency_threshold_ms", "already_snake", "nested"}
+
+
+def test_settings_snake_case_only_the_top_level_names(tmp_path, monkeypatch):
+    patterns = {"connRefused": "refused|ECONNREFUSED", "http5xx": "HTTP/1.1 5\\d\\d"}
+    monkeypatch.setenv(
+        "RW_SETTINGS_JSON",
+        json.dumps({"latencyThresholdMs": 250, "errorPatterns": patterns}),
+    )
+    settings = _ctx(tmp_path).settings
+    assert settings.latency_threshold_ms == 250
+    assert settings.error_patterns["connRefused"] == patterns["connRefused"]
+    assert settings.error_patterns.connRefused == patterns["connRefused"]
+    assert settings.error_patterns.http5xx == patterns["http5xx"]
+    assert set(settings.error_patterns) == {"connRefused", "http5xx"}
+    assert dict(settings.error_patterns) == patterns
+    with pytest.raises(AttributeError):
+        settings.error_patterns.conn_refused
+    with pytest.raises(AttributeError):
+        settings.errorPatterns
+
+
+def test_settings_keep_every_key_below_the_top_level_verbatim(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "RW_SETTINGS_JSON",
+        json.dumps(
+            {
+                "rulesList": [{"matchOn": "a", "maxCount": 1}, {"matchOn": "b", "deep": {"xY": 2}}],
+                "labels": {"app.kubernetes.io/name": "web", "someKey": {"innerKey": [{"kK": 1}]}},
+                "plainList": ["camelCase", 3],
+            }
+        ),
+    )
+    settings = _ctx(tmp_path).settings
+    assert [dict(r) for r in settings.rules_list[:1]] == [{"matchOn": "a", "maxCount": 1}]
+    assert settings.rules_list[1].matchOn == "b"
+    assert settings.rules_list[1].deep.xY == 2
+    assert settings.labels["app.kubernetes.io/name"] == "web"
+    assert settings.labels.someKey.innerKey[0].kK == 1
+    assert settings.plain_list == ["camelCase", 3]
 
 
 @pytest.mark.parametrize("name", ["RW_RESOURCE_JSON", "RW_SETTINGS_JSON"])

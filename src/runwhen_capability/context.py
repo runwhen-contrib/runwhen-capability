@@ -77,7 +77,9 @@ class AttrView(Mapping):
     """A read-only view of a JSON object with attribute access
     (`ctx.resource.namespace`, `ctx.settings.latency_threshold_ms`). Nested
     objects are views too. A missing attribute is an AttributeError, a missing
-    key a KeyError; with `snake=True` every key (at every depth) is snake_cased."""
+    key a KeyError. With `snake=True` only this object's own keys are snake_cased:
+    everything nested below them is user data and keeps its keys verbatim (a
+    setting `patterns: {connRefused: ...}` is read as `ctx.settings.patterns.connRefused`)."""
 
     __slots__ = ("_data",)
 
@@ -85,7 +87,7 @@ class AttrView(Mapping):
         object.__setattr__(
             self,
             "_data",
-            {(_snake(k) if snake else k): _wrap(v, snake) for k, v in data.items()},
+            {(_snake(k) if snake else k): _wrap(v) for k, v in data.items()},
         )
 
     def __getitem__(self, key: str) -> Any:
@@ -111,11 +113,12 @@ class AttrView(Mapping):
         return f"AttrView({self._data!r})"
 
 
-def _wrap(value: Any, snake: bool) -> Any:
+def _wrap(value: Any) -> Any:
+    """Nested values: views over dicts (keys verbatim), lists walked."""
     if isinstance(value, Mapping):
-        return AttrView(value, snake=snake)
+        return AttrView(value)
     if isinstance(value, list):
-        return [_wrap(item, snake) for item in value]
+        return [_wrap(item) for item in value]
     return value
 
 

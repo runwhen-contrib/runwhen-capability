@@ -13,6 +13,11 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Fixed
 
+- `ctx.settings` snake_cases only the top-level setting names. It used to rewrite keys at every depth,
+  so an object-typed setting whose keys are user data (`patterns: {connRefused: ...}`) arrived with
+  its keys changed. Nested values now keep their keys verbatim (still readable as attributes where
+  the key is an identifier). Python task inputs were never affected: only the top-level input name
+  is converted.
 - A custom bundle's `lib/` is now usable from its tasks, as the skill spec promises. A Python task
   imports a module from it by name (`lib/` is appended to `sys.path`, after the standard library
   and site-packages, so it can never shadow them); a bash task sources a file from it as

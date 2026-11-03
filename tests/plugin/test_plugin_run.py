@@ -535,3 +535,47 @@ def test_the_documented_pool_saturation_script_reads_settings_in_snake_case(
     assert env["outputs"]["pools"] == [{"cl_waiting": 7, "sv_idle": 0, "saturated": True}]
     env = run("pool-saturation", settings={"waitingClientsThreshold": 9}).envelope
     assert env["outputs"]["pools"][0]["saturated"] is False
+
+
+# -- object-typed settings and inputs keep their keys -------------------------------------
+
+_OBJECT_SCRIPT = b"""\
+def main(ctx, probe_opts):
+    return {
+        "seen": {
+            "setting": dict(ctx.settings.patterns),
+            "setting_attr": ctx.settings.patterns.connRefused,
+            "input": probe_opts,
+        }
+    }
+"""
+
+
+def test_object_settings_and_inputs_keep_their_keys_end_to_end(tmp_path):
+    patterns = {"connRefused": "refused", "http5xx": "5\\d\\d"}
+    opts = {"maxRetries": 2, "nestedOpts": {"innerKey": [{"kK": 1}]}}
+    task = {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": "scripts/t.py",
+        "inputs": {"probeOpts": {"type": "object"}},
+        "inputSchema": {"type": "object", "properties": {"probeOpts": {"type": "object"}}},
+        "settings": {"patterns": {"type": "object", "default": {}}},
+        "outputs": {"seen": {"jsonSchema": {"type": "object"}}},
+    }
+    outcome = execute(
+        RunSpec(
+            task=task,
+            files={"scripts/t.py": _OBJECT_SCRIPT},
+            inputs={"probeOpts": opts},
+            settings={"patterns": patterns},
+        ),
+        scope_dir=tmp_path / "scope",
+    )
+    assert outcome.envelope["errors"] == []
+    assert outcome.envelope["outputs"]["seen"] == {
+        "setting": patterns,
+        "setting_attr": "refused",
+        "input": opts,
+    }
