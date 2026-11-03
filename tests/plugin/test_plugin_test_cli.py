@@ -141,6 +141,27 @@ def test_record_then_replay_without_the_tool(rwtask, plugin, kubectl):
     ]  # replay never ran the tool
 
 
+@needs_jq
+def test_skill_tests_are_never_packaged_but_replay_reads_them_from_the_directory(
+    rwtask, plugin, kubectl, tmp_path
+):
+    from runwhen_capability.contracts import archive
+
+    record(rwtask)
+    path = fixture_path(plugin)
+    add_outputs(path, "  outputs:\n    pods: {namespace: runwhen, count: 3}\n")
+    kubectl.remove()
+    out_dir = tmp_path / "dist"
+    assert main(["compile", str(plugin), "--out", str(out_dir)]) == 0
+    tar = next(out_dir.glob("*.tar")).read_bytes()
+    names = [e.path for e in archive.read(tar)]
+    assert "skills/probe/tasks.yaml" in names
+    assert not [n for n in names if "/tests/" in n]
+    assert path.is_file()  # the fixture is still on disk, and replays from there
+    _, out, _ = rwtask("probe/kube-count", expect=0)
+    assert "PASS probe/kube-count/basic" in out
+
+
 def test_the_whole_skill_is_replayed_without_naming_a_task(rwtask, plugin, kubectl):
     if shutil.which("jq") is None:
         pytest.skip("kube-count counts with jq")

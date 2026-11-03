@@ -30,8 +30,8 @@ def git(*args: str, cwd: Path) -> str:
 
 
 def write_version(dest: Path, version: str) -> None:
-    """The kube-mini fixture at `dest`, as version `version`, plus a root `tests/` dir and a
-    dotfile that an archive leaves out."""
+    """The kube-mini fixture at `dest`, as version `version`, plus a root `tests/` dir, a skill
+    `tests/` dir and a dotfile that an archive leaves out."""
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(KUBE_MINI, dest)
@@ -39,6 +39,9 @@ def write_version(dest: Path, version: str) -> None:
     plugin.write_text(plugin.read_text().replace("version: 0.1.0", f"version: {version}"))
     (dest / "tests").mkdir()
     (dest / "tests" / "note.txt").write_text("not published\n")
+    fixtures = dest / "skills" / "k8s-base" / "tests" / "kubectl"
+    fixtures.mkdir(parents=True)
+    (fixtures / "basic.yaml").write_text("calls: []\n")  # a skill's recorded fixtures
     (dest / ".github").mkdir()
     (dest / ".github" / "ci.yml").write_text("x: 1\n")
 

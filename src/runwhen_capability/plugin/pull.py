@@ -153,9 +153,12 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 def _publishable(path: str) -> bool:
     """What `rwtask compile` leaves out of an archive: root-level dotfiles and
-    dot-directories, runwhen.lock and the root `tests/` directory."""
-    top = path.split("/", 1)[0]
-    return not top.startswith(".") and top not in ("tests", LOCK_FILE)
+    dot-directories, runwhen.lock, the root `tests/` directory and each
+    `skills/<skill>/tests/` directory."""
+    parts = path.split("/")
+    if parts[0].startswith(".") or parts[0] in ("tests", LOCK_FILE):
+        return False
+    return not (len(parts) > 3 and parts[0] == "skills" and parts[2] == "tests")
 
 
 def _fetched_from_entries(entries: list[TreeEntry], ref: str) -> Fetched:

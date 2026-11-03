@@ -122,6 +122,15 @@ def test_exec_bits_survive_the_trip(remote, cache):
     assert not any(p.startswith(("tests/", ".github/")) for p in entries)
 
 
+def test_skill_tests_are_in_git_but_not_in_the_archive_nor_the_compiled_files(remote, cache):
+    pulled = pull("kubernetes", "^0.2", source=GitSource(remote), cache_dir=cache)
+    names = [e.path for e in archive.read(pulled.archive_path.read_bytes())]
+    assert "skills/k8s-base/scripts/kubectl.sh" in names
+    assert not [n for n in names if "/tests/" in n]
+    compiled = json.loads(pulled.compiled_path.read_text())
+    assert not [f for s in compiled["skills"] for f in s["files"] if "/tests/" in f]
+
+
 def test_pulling_twice_is_idempotent(remote, cache):
     first = pull("kubernetes", "^0.1", source=GitSource(remote), cache_dir=cache)
     stamp = first.archive_path.stat().st_mtime_ns

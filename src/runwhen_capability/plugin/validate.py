@@ -56,6 +56,9 @@ Semantic (errors unless noted)
   the host evaluates these with RE2 so a pattern cannot hang it (S13). E_SCHEMA_REF -- such
   a schema has a `$ref` that does not point inside the schema (it would never be fetched).
 - E_SKILL_BODY_TOO_LONG -- a SKILL.md body is over 500 lines.
+- W_SCRIPT_READS_TESTS (warning) -- a .py or .sh file under a skill's scripts/ or lib/
+  mentions a `tests/` path; a skill's tests/ are not packaged, so a script must not read
+  them at run time.
 - E_RULE_BUDGET -- more than 10 rules, or a rule body over 80 words (whitespace-
   separated tokens).
 """
@@ -104,6 +107,7 @@ E_SCHEMA_REF = "E_SCHEMA_REF"
 E_TASK_NAME_DUPLICATE = "E_TASK_NAME_DUPLICATE"
 E_REQUIRES_RANGE = "E_REQUIRES_RANGE"
 W_DEPENDENCY_UNUSED = "W_DEPENDENCY_UNUSED"
+W_SCRIPT_READS_TESTS = "W_SCRIPT_READS_TESTS"
 
 if TYPE_CHECKING:
     from .deps import CompiledDependency
@@ -113,6 +117,7 @@ MAX_RULE_WORDS = 80
 MAX_SKILL_BODY_LINES = 500
 
 _OUTPUT_SCHEMA_FILE = re.compile(r"schemas/[^/]+\.v[0-9]+\.json")
+_TESTS_PATH = re.compile(r"\btests/")
 _DEFAULT_INTEGRATION_FILE = "integration/integration.yaml"
 
 
@@ -526,6 +531,19 @@ class _Validator:
                 )
         if skill.tasks is not None:
             self.check_tasks(name, skill)
+        self.check_tests_not_read(name, skill)
+
+    def check_tests_not_read(self, name: str, skill) -> None:
+        for path, data in sorted(skill.files.items()):
+            if not path.startswith(("scripts/", "lib/")) or not path.endswith((".py", ".sh")):
+                continue
+            if _TESTS_PATH.search(data.decode("utf-8", "replace")):
+                self.add(
+                    W_SCRIPT_READS_TESTS,
+                    f"skills/{name}/{path}",
+                    None,
+                    "skill tests/ are not packaged; a script must not read them at run time",
+                )
 
     def check_types(self, file: str, pointer: str, types: Any) -> None:
         for i, ref in enumerate(_sequence(types)):
