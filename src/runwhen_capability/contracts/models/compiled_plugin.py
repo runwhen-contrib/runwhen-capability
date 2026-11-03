@@ -21,6 +21,19 @@ class Compiler(BaseModel):
     version: str = Field(..., max_length=64, min_length=1)
 
 
+class Plugin(BaseModel):
+    """
+    plugin.yaml as authored, or the synthetic `workspace` plugin a workspace skill revision compiles to (plugin.schema keeps `workspace` reserved, so authors cannot use it).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    name: Literal["workspace"]
+    version: str = Field(..., pattern="^0\\.0\\.0-rev\\.[1-9][0-9]*$")
+    description: str = Field(..., max_length=1024, min_length=1)
+
+
 class Role(Enum):
     discovery = "discovery"
     cli = "cli"
@@ -284,7 +297,10 @@ class CompiledPlugin(BaseModel):
     )
     apiVersion: Literal["runwhen.com/compiled-plugin/v1"]
     compiler: Compiler
-    plugin: plugin_1.Plugin
+    plugin: plugin_1.Plugin | Plugin = Field(
+        ...,
+        description="plugin.yaml as authored, or the synthetic `workspace` plugin a workspace skill revision compiles to (plugin.schema keeps `workspace` reserved, so authors cannot use it).",
+    )
     integration: Integration | None
     skills: list[Skill]
     tasks: list[Task]

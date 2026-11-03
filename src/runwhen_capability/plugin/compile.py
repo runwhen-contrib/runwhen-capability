@@ -13,6 +13,10 @@ knowledge have a fixed order, and it never depends on the order of the entries.
 All paths inside the document (`script`, `files`, `schemaRef`) are relative to the
 plugin root, the same paths the lease and the archive use.
 
+A skill-only tree (a workspace skill revision: no plugin.yaml) compiles when the
+caller passes `workspace_revision`: plugin `workspace` at `0.0.0-rev.<n>`, task refs
+`workspace:<skill>/<task>`, no integration.
+
 `compile_tree` raises `PluginInvalid` when `validate_tree` finds an error, and
 checks its own output against the schema before returning it.
 """
@@ -36,40 +40,72 @@ from .validate import E_PLUGIN_MISSING, validate_tree
 
 API_VERSION = "runwhen.com/compiled-plugin/v1"
 DEFAULT_RUNTIME = "generic@1"
+WORKSPACE_PLUGIN = "workspace"
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 
-def compile_entries(entries: Iterable[TreeEntry], *, sdk_version: str | None = None) -> dict:
+def compile_entries(
+    entries: Iterable[TreeEntry],
+    *,
+    sdk_version: str | None = None,
+    workspace_revision: int | None = None,
+) -> dict:
     """`compile_tree(load_entries(entries))`; accepts `contracts.archive.read` output."""
-    return compile_tree(load_entries(entries), sdk_version=sdk_version)
+    return compile_tree(
+        load_entries(entries), sdk_version=sdk_version, workspace_revision=workspace_revision
+    )
 
 
-def compile_tree(tree: PluginTree, *, sdk_version: str | None = None) -> dict:
+def compile_tree(
+    tree: PluginTree,
+    *,
+    sdk_version: str | None = None,
+    workspace_revision: int | None = None,
+) -> dict:
     """The compiled-plugin document for `tree`. Raises PluginInvalid if validation
-    finds an error (warnings do not block)."""
+    finds an error (warnings do not block).
+
+    `workspace_revision` (>= 1) compiles a skill-only tree as the workspace plugin at
+    version `0.0.0-rev.<n>`; without it such a tree is E_PLUGIN_MISSING. It is a
+    ValueError for a tree that has a plugin.yaml or for a revision below 1."""
+    if workspace_revision is not None and (
+        isinstance(workspace_revision, bool)
+        or not isinstance(workspace_revision, int)
+        or workspace_revision < 1
+    ):
+        raise ValueError(f"workspace_revision must be an integer >= 1, got {workspace_revision!r}")
+    if workspace_revision is not None and tree.plugin is not None:
+        raise ValueError("workspace_revision applies only to a tree without a plugin.yaml")
     errors = [d for d in validate_tree(tree) if d.severity == "error"]
     if errors:
         raise PluginInvalid(errors)
-    if tree.plugin is None:
-        # A workspace skill tree has no compiled form: `workspace` is a reserved
-        # plugin name, so the plugin schema rejects the document it would need.
+    if tree.plugin is not None:
+        plugin = copy.deepcopy(tree.plugin)
+    elif workspace_revision is not None and tree.skills:
+        plugin = _workspace_plugin(tree, workspace_revision)
+    else:
         raise PluginInvalid(
             [
                 Diagnostic(
                     code=E_PLUGIN_MISSING,
                     file="plugin.yaml",
-                    message="only a plugin with a plugin.yaml compiles",
+                    message="only a plugin with a plugin.yaml compiles"
+                    + (
+                        ""
+                        if workspace_revision is None
+                        else " (a workspace skill revision needs at least one skill)"
+                    ),
                 )
             ]
         )
-    plugin_name = tree.plugin["name"]
+    plugin_name = plugin["name"]
     tasks: list[dict] = []
     for name in sorted(tree.skills):
         tasks.extend(_compile_tasks(tree, plugin_name, name))
     doc = {
         "apiVersion": API_VERSION,
         "compiler": {"name": "runwhen-capability", "version": sdk_version or __version__},
-        "plugin": copy.deepcopy(tree.plugin),
+        "plugin": plugin,
         "integration": _compile_integration(tree),
         "skills": [_compile_skill(tree, name) for name in sorted(tree.skills)],
         "tasks": tasks,
@@ -78,6 +114,15 @@ def compile_tree(tree: PluginTree, *, sdk_version: str | None = None) -> dict:
     }
     check("compiled-plugin", doc)
     return doc
+
+
+def _workspace_plugin(tree: PluginTree, revision: int) -> dict:
+    description = "Workspace skill " + ", ".join(sorted(tree.skills))
+    return {
+        "name": WORKSPACE_PLUGIN,
+        "version": f"0.0.0-rev.{revision}",
+        "description": description[:1024],
+    }
 
 
 def _sha256(data: bytes) -> str:
