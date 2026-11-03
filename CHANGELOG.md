@@ -7,6 +7,12 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `rwtask validate|compile <dir> --with SPEC` (repeatable) validates a plugin against the plugins it
+  `requires`/`extends` (INT-2): SPEC is a plugin directory, a `*.compiled.json` or `name[@version]`
+  from `$RUNWHEN_PLUGIN_CACHE` (default `~/.cache/runwhen/plugins`). The required integration's
+  types, credential types and permission schema are then checked like the plugin's own (no more
+  `W_TYPE_UNCHECKED` for it), plus `E_REQUIRES_RANGE` (npm-style ranges, new `plugin.semver`) and
+  `W_DEPENDENCY_UNUSED`. Library: `plugin.load_dependency`, `validate_tree(..., dependencies=)`.
 - `runwhen_capability.testing`, for unit-testing a skill's scripts without a runner: `make_context(...)`
   builds a real `Context` as the V13 executor does (and restores `os.environ` afterwards), with
   `.errors`, `.artifact(name)` and `.envelope(outputs)` (checked against `result-envelope`);

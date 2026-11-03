@@ -22,15 +22,23 @@ Semantic (errors unless noted)
 - E_UNKNOWN_TYPE -- an `appliesTo` type of this plugin's own platform that its
   `types` do not declare. W_TYPE_UNCHECKED (warning) -- a type or credential type
   of a `requires`/`extends` platform, which cannot be checked without the other
-  integration (a workspace skill, with no plugin.yaml, is unchecked throughout).
+  integration (a workspace skill, with no plugin.yaml, is unchecked throughout) --
+  unless the caller supplies that integration as a dependency (`--with`), in which
+  case it is checked exactly like the plugin's own: an unknown type is E_UNKNOWN_TYPE.
   E_UNKNOWN_PLATFORM -- a platform that is neither this integration's nor named in
   `requires`/`extends`.
+- E_REQUIRES_RANGE -- a supplied dependency whose version is outside the
+  `requires`/`extends` range (npm-style; `requires.platform` is not a dependency).
+  W_DEPENDENCY_UNUSED (warning) -- a supplied dependency the plugin neither requires
+  nor extends.
 - E_CREDENTIAL_TYPE_UNKNOWN -- a credential type this integration does not
   declare (`generic/*` is always known; `runwhen/sync` only on the integration's
   discovery entry-point task).
 - E_PERMISSION_SCHEMA -- a task permission fails the integration's own permission
   schema, or that schema cannot be loaded. Only tasks that use one of this
-  integration's credential types are checked; the others rely on a required
+  integration's credential types are checked; the others are checked against the
+  permission schema of the supplied dependency that owns their credential type, and
+  otherwise rely on a required
   integration (INT-2 adds that lookup).
 - E_TYPE_CHAIN -- an integration type whose parent chain does not end at the one
   root (unknown parent, cycle), or the integration does not have exactly one root.
@@ -57,8 +65,8 @@ from __future__ import annotations
 import json
 import posixpath
 import re
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from jsonschema import exceptions as jsonschema_exceptions
@@ -67,6 +75,7 @@ from ..contracts import TreeEntry, load_yaml, validate, validator_for_plugin_sch
 from ..contracts.plugin_schema import iter_schema_problems
 from ..custom.diagnostics import Diagnostic
 from ..custom.schema_notation import SchemaNotationError, compile_schema_notation
+from .semver import satisfies
 from .tree import E_SKILL_MD_MISSING, E_YAML, INTEGRATION_FILES, PluginTree, load_entries
 
 E_SCHEMA = "E_SCHEMA"
@@ -93,6 +102,11 @@ E_SKILL_BODY_TOO_LONG = "E_SKILL_BODY_TOO_LONG"
 E_SCHEMA_PATTERN = "E_SCHEMA_PATTERN"
 E_SCHEMA_REF = "E_SCHEMA_REF"
 E_TASK_NAME_DUPLICATE = "E_TASK_NAME_DUPLICATE"
+E_REQUIRES_RANGE = "E_REQUIRES_RANGE"
+W_DEPENDENCY_UNUSED = "W_DEPENDENCY_UNUSED"
+
+if TYPE_CHECKING:
+    from .deps import CompiledDependency
 
 MAX_RULES = 10
 MAX_RULE_WORDS = 80
@@ -102,15 +116,24 @@ _OUTPUT_SCHEMA_FILE = re.compile(r"schemas/[^/]+\.v[0-9]+\.json")
 _DEFAULT_INTEGRATION_FILE = "integration/integration.yaml"
 
 
-def validate_entries(entries: Iterable[TreeEntry]) -> list[Diagnostic]:
-    """`validate_tree(load_entries(entries))`."""
-    return validate_tree(load_entries(entries))
+def validate_entries(
+    entries: Iterable[TreeEntry],
+    *,
+    dependencies: Mapping[str, CompiledDependency] | None = None,
+) -> list[Diagnostic]:
+    """`validate_tree(load_entries(entries), dependencies=dependencies)`."""
+    return validate_tree(load_entries(entries), dependencies=dependencies)
 
 
-def validate_tree(tree: PluginTree) -> list[Diagnostic]:
+def validate_tree(
+    tree: PluginTree, *, dependencies: Mapping[str, CompiledDependency] | None = None
+) -> list[Diagnostic]:
     """Every finding for `tree`: the loader's diagnostics, then schema violations
-    and the semantic checks above. Errors and warnings alike."""
-    return _Validator(tree).run()
+    and the semantic checks above. Errors and warnings alike.
+
+    `dependencies` maps a `requires`/`extends` plugin name to its compiled integration
+    (see deps.load_dependency); a supplied one is checked like the plugin's own."""
+    return _Validator(tree, dependencies or {}).run()
 
 
 def _pointer(*parts: object) -> str:
@@ -135,7 +158,7 @@ def _resolve(base: str, ref: str) -> str | None:
 
 
 class _Validator:
-    def __init__(self, tree: PluginTree) -> None:
+    def __init__(self, tree: PluginTree, dependencies: Mapping[str, CompiledDependency]) -> None:
         self.tree = tree
         self.out: list[Diagnostic] = list(tree.diagnostics)
         self.plugin = tree.plugin
@@ -151,7 +174,21 @@ class _Validator:
         self.own_types = set(_mapping(integration.get("types")))
         self.own_credentials = set(_mapping(integration.get("credentialTypes")))
         plugin = _mapping(self.plugin)
-        self.external = set(_mapping(plugin.get("requires"))) | set(_mapping(plugin.get("extends")))
+        requires, extends = _mapping(plugin.get("requires")), _mapping(plugin.get("extends"))
+        self.external = set(requires) | set(extends)
+        self.dependencies = dependencies
+        # The supplied dependency of each external platform (a plugin is named after its
+        # platform; a dependency whose integration says otherwise answers to both).
+        self.dependency_for: dict[str, CompiledDependency] = {}
+        for name, dep in dependencies.items():
+            if name in self.external:
+                self.dependency_for.setdefault(name, dep)
+                self.dependency_for.setdefault(dep.platform, dep)
+        self.dependency_pointer = {
+            **{name: _pointer("extends", name) for name in extends},
+            **{name: _pointer("requires", name) for name in requires},
+        }
+        self.dependency_validators: dict[str, Any] = {}
         discovery = _mapping(_mapping(integration.get("entryPoints")).get("discovery"))
         task = discovery.get("task")
         self.discovery_task = task if isinstance(task, str) else None
@@ -203,6 +240,7 @@ class _Validator:
     def run(self) -> list[Diagnostic]:
         tree = self.tree
         self.check_plugin()
+        self.check_dependencies()
         self.check_integration()
         for name in sorted(tree.skills):
             self.check_skill(name)
@@ -228,6 +266,42 @@ class _Validator:
                 None,
                 "a plugin needs a plugin.yaml (only a workspace skill tree has none)",
             )
+
+    def check_dependencies(self) -> None:
+        """E_REQUIRES_RANGE for a supplied dependency outside its range;
+        W_DEPENDENCY_UNUSED for one the plugin does not require or extend."""
+        if self.plugin is None:
+            return
+        ranges = {**_mapping(self.plugin.get("extends")), **_mapping(self.plugin.get("requires"))}
+        ranges.pop("platform", None)  # a CalVer range for papi features, not a plugin
+        for name, dep in sorted(self.dependencies.items()):
+            if name not in ranges:
+                self.add(
+                    W_DEPENDENCY_UNUSED,
+                    "plugin.yaml",
+                    None,
+                    f"dependency {name!r} is supplied but this plugin neither requires "
+                    "nor extends it",
+                )
+                continue
+            wanted = ranges[name]
+            try:
+                fits = satisfies(dep.version, wanted)
+            except ValueError as exc:
+                self.add(
+                    E_REQUIRES_RANGE,
+                    "plugin.yaml",
+                    self.dependency_pointer[name],
+                    f"cannot check {name}@{dep.version} against {wanted!r}: {exc}",
+                )
+                continue
+            if not fits:
+                self.add(
+                    E_REQUIRES_RANGE,
+                    "plugin.yaml",
+                    self.dependency_pointer[name],
+                    f"{name}@{dep.version} does not satisfy the required range {wanted!r}",
+                )
 
     # -- integration ------------------------------------------------------------
 
@@ -478,13 +552,23 @@ class _Validator:
                         f"type {ref!r} is not declared by this plugin's integration",
                     )
             elif platform in self.external:
-                self.add(
-                    W_TYPE_UNCHECKED,
-                    file,
-                    where,
-                    f"type {ref!r} belongs to {platform!r}, a required or extended "
-                    "integration; not checked",
-                )
+                dep = self.dependency_for.get(platform)
+                if dep is None:
+                    self.add(
+                        W_TYPE_UNCHECKED,
+                        file,
+                        where,
+                        f"type {ref!r} belongs to {platform!r}, a required or extended "
+                        "integration; not checked",
+                    )
+                elif type_name not in dep.types():
+                    self.add(
+                        E_UNKNOWN_TYPE,
+                        file,
+                        where,
+                        f"type {ref!r} is not declared by the integration of "
+                        f"{dep.name}@{dep.version}",
+                    )
             else:
                 self.add(
                     E_UNKNOWN_PLATFORM,
@@ -644,12 +728,22 @@ class _Validator:
                 f"credential type {ctype!r} is not declared by this plugin's integration",
             )
         elif self.plugin is None or platform in self.external:
-            self.add(
-                W_TYPE_UNCHECKED,
-                file,
-                where,
-                f"credential type {ctype!r} belongs to another integration; not checked",
-            )
+            dep = self.dependency_for.get(platform)
+            if dep is None:
+                self.add(
+                    W_TYPE_UNCHECKED,
+                    file,
+                    where,
+                    f"credential type {ctype!r} belongs to another integration; not checked",
+                )
+            elif ctype not in dep.credential_types():
+                self.add(
+                    E_CREDENTIAL_TYPE_UNKNOWN,
+                    file,
+                    where,
+                    f"credential type {ctype!r} is not declared by the integration of "
+                    f"{dep.name}@{dep.version}",
+                )
         else:
             self.add(
                 E_CREDENTIAL_TYPE_UNKNOWN,
@@ -659,34 +753,69 @@ class _Validator:
                 "integration, generic, nor in requires/extends",
             )
 
+    def dependency_validator(self, dep: CompiledDependency) -> Any:
+        """The validator of `dep`'s permission schema, or None when it has none or the
+        schema is unusable (reported once, against the plugin.yaml entry naming it)."""
+        if dep.name in self.dependency_validators:
+            return self.dependency_validators[dep.name]
+        validator = None
+        schema = dep.permission_schema
+        where = self.dependency_pointer.get(dep.name, _pointer("requires", dep.name))
+        if isinstance(schema, dict) and not self.check_patterns("plugin.yaml", where, schema):
+            try:
+                validator = validator_for_plugin_schema(schema)
+                validator.check_schema(schema, format_checker=validator.format_checker)
+            except jsonschema_exceptions.SchemaError as exc:
+                validator = None
+                self.add(
+                    E_PERMISSION_SCHEMA,
+                    "plugin.yaml",
+                    where,
+                    f"the permission schema of {dep.name}@{dep.version} is not a valid "
+                    f"JSON Schema: {exc.message}",
+                )
+        self.dependency_validators[dep.name] = validator
+        return validator
+
     def check_permissions(self, file, i, task, credentials: list[str]) -> None:
-        if self.permission_validator is None:
-            return
+        validators: list[tuple[Any, str]] = []
         own = any(
             c in self.own_credentials or c.partition("/")[0] == self.platform for c in credentials
         )
-        if not own:
-            return  # relies on a required integration (INT-2 resolves it)
+        if own and self.permission_validator is not None:
+            validators.append((self.permission_validator, "the integration's"))
+        if not own:  # a task relies on the required integration that owns its credential
+            owners = {}
+            for ctype in credentials:
+                dep = self.dependency_for.get(ctype.partition("/")[0])
+                if dep is not None:
+                    owners[dep.name] = dep
+            for dep in owners.values():
+                validator = self.dependency_validator(dep)
+                if validator is not None:
+                    validators.append((validator, f"the {dep.name} integration's"))
         for j, rule in enumerate(_sequence(task.get("permissions"))):
-            try:
-                errors = sorted(
-                    self.permission_validator.iter_errors(rule), key=lambda e: list(e.absolute_path)
-                )
-            except Exception as exc:  # noqa: BLE001 - an unresolvable $ref in author JSON
-                self.add(
-                    E_PERMISSION_SCHEMA,
-                    file,
-                    _pointer("tasks", i, "permissions", j),
-                    f"cannot evaluate the permission schema: {exc}",
-                )
-                continue
-            for err in errors:
-                self.add(
-                    E_PERMISSION_SCHEMA,
-                    file,
-                    _pointer("tasks", i, "permissions", j, *err.absolute_path),
-                    f"fails the integration's permission schema: {err.message}",
-                )
+            for validator, owner in validators:
+                self.check_permission_rule(file, i, j, rule, validator, owner)
+
+    def check_permission_rule(self, file, i, j, rule, validator, owner: str) -> None:
+        try:
+            errors = sorted(validator.iter_errors(rule), key=lambda e: list(e.absolute_path))
+        except Exception as exc:  # noqa: BLE001 - an unresolvable $ref in author JSON
+            self.add(
+                E_PERMISSION_SCHEMA,
+                file,
+                _pointer("tasks", i, "permissions", j),
+                f"cannot evaluate the permission schema: {exc}",
+            )
+            return
+        for err in errors:
+            self.add(
+                E_PERMISSION_SCHEMA,
+                file,
+                _pointer("tasks", i, "permissions", j, *err.absolute_path),
+                f"fails {owner} permission schema: {err.message}",
+            )
 
     # -- rules, knowledge, connections ---------------------------------------------
 

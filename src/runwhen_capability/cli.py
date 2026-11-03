@@ -14,8 +14,8 @@
     rwtask test <skill>/<task> --record --resource PATH --scenario NAME [--input k=v]...
         [--setting k=v]... [--identity k=v]... [--shim TOOL]... [--force] [--allow-write]
     rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
-    rwtask validate <dir>
-    rwtask compile <plugin-dir> [--out DIR]
+    rwtask validate <dir> [--with SPEC ...]
+    rwtask compile <plugin-dir> [--out DIR] [--with SPEC ...]
     rwtask upconvert <src-dir> --into <skills-dir> [--name NAME] [--force]
 
 See serve.py, run_local.py, label.py, schemas.py, gitops.py, port/ and upconvert/.
@@ -52,6 +52,19 @@ def _add_gitops_args(subparser: argparse.ArgumentParser) -> None:
         "--workspace",
         default=None,
         help="the workspace to act on; default: the RW_WORKSPACE env var",
+    )
+
+
+def _add_with_arg(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument(
+        "--with",
+        dest="with_specs",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help="a required (requires/extends) integration to validate against, repeatable: a "
+        "plugin directory, a <name>-<version>.compiled.json file, or <name>[@<version>] from "
+        "the plugin cache ($RUNWHEN_PLUGIN_CACHE, default ~/.cache/runwhen/plugins)",
     )
 
 
@@ -405,6 +418,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "(has SKILL.md); prints file:path: CODE message, exit 1 on any error",
     )
     validate_p.add_argument("dir", help="plugin directory, or a skill directory")
+    _add_with_arg(validate_p)
 
     compile_p = sub.add_parser(
         "compile",
@@ -412,6 +426,7 @@ def _build_parser() -> argparse.ArgumentParser:
         ".compiled.json and print the archive's sha256",
     )
     compile_p.add_argument("dir", help="plugin directory (has plugin.yaml)")
+    _add_with_arg(compile_p)
     compile_p.add_argument(
         "--out", default="dist", help="directory to write the archive and compiled.json into"
     )
@@ -538,6 +553,25 @@ def _port(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     for warning in draft.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
+
+
+def _load_dependencies(who: str, specs: list[str]):
+    """{plugin name: CompiledDependency} for the `--with` specs, or None after printing
+    why one did not resolve (the caller exits 2)."""
+    from .plugin import DependencyError, load_dependency
+
+    dependencies = {}
+    for spec in specs:
+        try:
+            dep = load_dependency(spec)
+        except DependencyError as exc:
+            print(f"{who}: --with {spec}: {exc}", file=sys.stderr)
+            return None
+        if dep.name in dependencies:
+            print(f"{who}: --with names {dep.name!r} twice", file=sys.stderr)
+            return None
+        dependencies[dep.name] = dep
+    return dependencies
 
 
 def _format_plugin_diagnostic(diag) -> str:
@@ -1334,6 +1368,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate":
         from .plugin import load_dir, load_skill_dir, validate_tree
 
+        dependencies = _load_dependencies("rwtask validate", args.with_specs)
+        if dependencies is None:
+            return 2
         directory = Path(args.dir)
         if (directory / "plugin.yaml").is_file():
             tree = load_dir(directory)
@@ -1345,7 +1382,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        diagnostics = validate_tree(tree)
+        diagnostics = validate_tree(tree, dependencies=dependencies)
         for diag in diagnostics:
             print(_format_plugin_diagnostic(diag))
         errors = sum(d.severity == "error" for d in diagnostics)
@@ -1357,17 +1394,20 @@ def main(argv: list[str] | None = None) -> int:
         from .contracts import TreeEntry, archive
         from .plugin import compile_tree, load_dir, validate_tree
 
+        dependencies = _load_dependencies("rwtask compile", args.with_specs)
+        if dependencies is None:
+            return 2
         directory = Path(args.dir)
         if not (directory / "plugin.yaml").is_file():
             print(f"rwtask compile: {directory} has no plugin.yaml", file=sys.stderr)
             return 1
         tree = load_dir(directory)
-        diagnostics = validate_tree(tree)
+        diagnostics = validate_tree(tree, dependencies=dependencies)
         for diag in diagnostics:
             print(_format_plugin_diagnostic(diag))
         if any(d.severity == "error" for d in diagnostics):
             return 1
-        compiled = compile_tree(tree)
+        compiled = compile_tree(tree, dependencies=dependencies)
         try:
             tar = archive.build(
                 TreeEntry(path, data, path in tree.executable) for path, data in tree.files.items()

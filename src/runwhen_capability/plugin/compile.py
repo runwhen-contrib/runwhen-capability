@@ -27,8 +27,8 @@ import copy
 import hashlib
 import json
 import posixpath
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 from .. import __version__
 from ..contracts import TreeEntry, check, permission_hash, schema, task_hash
@@ -37,6 +37,9 @@ from ..custom.schema_notation import compile_schema_notation
 from . import PluginInvalid
 from .tree import PluginTree, load_entries
 from .validate import E_PLUGIN_MISSING, validate_tree
+
+if TYPE_CHECKING:
+    from .deps import CompiledDependency
 
 API_VERSION = "runwhen.com/compiled-plugin/v1"
 DEFAULT_RUNTIME = "generic@1"
@@ -49,10 +52,14 @@ def compile_entries(
     *,
     sdk_version: str | None = None,
     workspace_revision: int | None = None,
+    dependencies: Mapping[str, CompiledDependency] | None = None,
 ) -> dict:
     """`compile_tree(load_entries(entries))`; accepts `contracts.archive.read` output."""
     return compile_tree(
-        load_entries(entries), sdk_version=sdk_version, workspace_revision=workspace_revision
+        load_entries(entries),
+        sdk_version=sdk_version,
+        workspace_revision=workspace_revision,
+        dependencies=dependencies,
     )
 
 
@@ -61,9 +68,11 @@ def compile_tree(
     *,
     sdk_version: str | None = None,
     workspace_revision: int | None = None,
+    dependencies: Mapping[str, CompiledDependency] | None = None,
 ) -> dict:
     """The compiled-plugin document for `tree`. Raises PluginInvalid if validation
-    finds an error (warnings do not block).
+    finds an error (warnings do not block). `dependencies` are the required
+    integrations to validate against (see validate_tree); they do not change the output.
 
     `workspace_revision` (>= 1) compiles a skill-only tree as the workspace plugin at
     version `0.0.0-rev.<n>`; without it such a tree is E_PLUGIN_MISSING. It is a
@@ -76,7 +85,7 @@ def compile_tree(
         raise ValueError(f"workspace_revision must be an integer >= 1, got {workspace_revision!r}")
     if workspace_revision is not None and tree.plugin is not None:
         raise ValueError("workspace_revision applies only to a tree without a plugin.yaml")
-    errors = [d for d in validate_tree(tree) if d.severity == "error"]
+    errors = [d for d in validate_tree(tree, dependencies=dependencies) if d.severity == "error"]
     if errors:
         raise PluginInvalid(errors)
     if tree.plugin is not None:

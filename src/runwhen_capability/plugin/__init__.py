@@ -29,15 +29,19 @@ class PluginInvalid(ValueError):
 
 
 from .compile import compile_entries, compile_tree  # noqa: E402
+from .deps import CompiledDependency, DependencyError, load_dependency  # noqa: E402
 from .tree import PluginTree, SkillTree, load_dir, load_entries, load_skill_dir  # noqa: E402
 from .validate import validate_entries, validate_tree  # noqa: E402
 
 __all__ = [
+    "CompiledDependency",
+    "DependencyError",
     "PluginInvalid",
     "PluginTree",
     "SkillTree",
     "compile_entries",
     "compile_tree",
+    "load_dependency",
     "load_dir",
     "load_entries",
     "load_skill_dir",
