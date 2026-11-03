@@ -188,3 +188,10 @@ tasks:
     readOnly: true
     outputs:
       pods: { schema: "{ namespace: string, count: integer }" }
+  - name: sh-paths
+    title: Bash, credential paths
+    description: Reports the path-valued credential variables it was given.
+    script: scripts/sh_paths.sh
+    readOnly: true
+    outputs:
+      paths: { schema: "{ kubeconfig: string, pgpassfile: string, sslCertFile: string }" }

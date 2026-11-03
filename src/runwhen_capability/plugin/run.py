@@ -229,6 +229,59 @@ def coerce_value(type_name: str | None, raw: str) -> Any:
     return raw
 
 
+# -- the caller's credential paths -------------------------------------------------------
+
+#: Variables whose value is a path to a credential or its trust material. The task runs
+#: with its scope directory as the working directory, so a relative one the caller set
+#: (`KUBECONFIG=../x.kubeconfig`) means something else there: `execute` with
+#: `inherit_home` resolves each against the caller's own directory first.
+CREDENTIAL_PATH_VARS: tuple[str, ...] = (
+    "KUBECONFIG",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CONFIG",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AZURE_CONFIG_DIR",
+    "PGPASSFILE",
+    "PGSSLROOTCERT",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+)
+_PATH_LIST_VARS = frozenset({"KUBECONFIG"})  # os.pathsep-separated, each entry a path
+
+
+def _absolute_path(value: str, cwd: str, home: str | None) -> str:
+    if not value:
+        return value
+    if value == "~" or value.startswith("~/"):
+        return home + value[1:] if home else value
+    return value if os.path.isabs(value) else os.path.join(cwd, value)
+
+
+def resolve_credential_paths(
+    environ: Mapping[str, str], *, cwd: str | None = None, home: str | None = None
+) -> dict[str, str]:
+    """The CREDENTIAL_PATH_VARS of `environ` whose value changes when made absolute
+    against `cwd` (default: the current directory): a relative value, or a leading `~`
+    (expanded against `home`, default `environ`'s HOME, because the child may be given a
+    private one). Empty values and absolute paths are left alone; KUBECONFIG is resolved
+    entry by entry."""
+    cwd = cwd or os.getcwd()
+    home = home if home is not None else environ.get("HOME")
+    changed: dict[str, str] = {}
+    for name in CREDENTIAL_PATH_VARS:
+        value = environ.get(name)
+        if not value:
+            continue
+        parts = value.split(os.pathsep) if name in _PATH_LIST_VARS else [value]
+        resolved = os.pathsep.join(_absolute_path(p, cwd, home) for p in parts)
+        if resolved != value:
+            changed[name] = resolved
+    return changed
+
+
 # -- execute ----------------------------------------------------------------------------
 
 
@@ -414,7 +467,9 @@ def execute(
     environment (it may not name a reserved or host-only variable: ValueError), and its
     values are redacted from what comes back. `inherit_home` runs the child with the
     caller's own HOME instead of a private one, for `rwtask run` on a developer's
-    machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner.
+    machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner. It
+    also makes relative credential paths in the caller's environment (KUBECONFIG, ...:
+    `CREDENTIAL_PATH_VARS`) absolute against the caller's working directory.
     `path_prepend` (absolute directories, put first on the child's PATH) and `shim_env`
     (only the RW_SHIM_* names of shims.SHIM_ENV_NAMES) are how `rwtask test` puts its
     shims in front of the real tools; ValueError for anything else."""
@@ -491,7 +546,11 @@ def execute(
     except (OSError, ValueError) as exc:
         return failed([_error("internal", f"could not prepare the task's scope: {exc}")])
 
-    env = {**caller_env, **_v13_env(spec, inputs, settings, language)}
+    # `rwtask run` / `rwtask test --record`: the caller's own environment is the credential,
+    # and its relative paths were written for the caller's directory, not the scope's.
+    # Not part of caller_env: those values are redacted from the result, a path is not secret.
+    caller_paths = resolve_credential_paths(os.environ) if inherit_home else {}
+    env = {**caller_paths, **caller_env, **_v13_env(spec, inputs, settings, language)}
     skill = task["skill"]
     plugin_name = task["ref"].split(":", 1)[0]
     started_at = datetime.now(UTC)
@@ -706,4 +765,12 @@ def _collect_artifacts(
     return artifacts, errors
 
 
-__all__ = ["RunOutcome", "RunSpec", "coerce_value", "execute", "resolve_target"]
+__all__ = [
+    "CREDENTIAL_PATH_VARS",
+    "RunOutcome",
+    "RunSpec",
+    "coerce_value",
+    "execute",
+    "resolve_credential_paths",
+    "resolve_target",
+]
