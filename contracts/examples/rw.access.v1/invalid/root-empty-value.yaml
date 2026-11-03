@@ -1,0 +1,4 @@
+# expect: /root/canonicalKey/value should be non-empty
+root:
+  canonicalKey: { name: kubeSystemUid, value: "" }
+rules: []

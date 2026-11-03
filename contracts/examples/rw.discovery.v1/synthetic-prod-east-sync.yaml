@@ -33,6 +33,7 @@ commit:
     - { type: secret, parentPath: kubernetes/clusters/prod-east/namespaces/payments, status: excluded, reason: "secrets are never synced" }
     - { type: deployment, parentPath: kubernetes/clusters/prod-east/namespaces/kube-system, status: forbidden, reason: "deployments is forbidden in namespace kube-system" }
   summary:
+    root: { canonicalKey: { name: kubeSystemUid, value: "3f0c9a52-7d1e-4b86-a3c4-5e2f8b1d6a97" } }
     counts: { cluster: 1, namespace: 1, deployment: 1 }
     partitions: { complete: 2, failed: 0, forbidden: 1, excluded: 1 }
     discoveredTypes: [certificate.cert-manager.io]

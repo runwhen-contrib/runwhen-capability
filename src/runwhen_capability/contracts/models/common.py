@@ -292,3 +292,22 @@ class Resources(BaseModel):
     )
     cpu: Quantity | None = None
     memory: Quantity | None = None
+
+
+class CanonicalKey(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    name: CamelName
+    value: str = Field(..., max_length=1024, min_length=1)
+
+
+class RootIdentity(BaseModel):
+    """
+    The identity-bearing value an integration's discovery or permissionCheck task reports for the connection's root; papi re-keys the root to `<name>=<value>` (CONTRACTS.md, Discovery sync).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    canonicalKey: CanonicalKey

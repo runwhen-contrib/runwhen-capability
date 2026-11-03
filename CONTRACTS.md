@@ -1,7 +1,8 @@
-# V13 plugins contracts (contracts-v2)
+# V13 plugins contracts (contracts-v3)
 
 Every seam between the lanes of the V13 plugins program, frozen at M0 (`contracts-v1`)
-and extended additively in `contracts-v2` (see [Changes in contracts-v2](#changes-in-contracts-v2)). The
+and extended additively in `contracts-v2` and `contracts-v3` (see [Changes in contracts-v2](#changes-in-contracts-v2),
+[Changes in contracts-v3](#changes-in-contracts-v3)). The
 schemas in [`contracts/`](contracts/) are normative; this page says what they
 cannot: who produces and consumes each document, the rules that are not
 expressible in JSON Schema, and the calls made at freeze.
@@ -16,11 +17,11 @@ Design source: the V13 wiki ([skill spec](https://wiki.sdlc.shared.runwhen.com/#
 ## Using the contracts
 
 ```bash
-pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v2"
+pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v3"
 ```
 
-The `contracts-v2` tag is pending: until it exists, pin the commit
-(`@<sha>`, the head of the `lane-a/contracts-v2` branch) in place of `@contracts-v2`.
+The `contracts-v3` tag is pending: until it exists, pin the commit
+(`@<sha>`, the head of the `lane-a/contracts-v3` branch) in place of `@contracts-v3`.
 
 ```python
 from runwhen_capability.contracts import archive, check, load_yaml, validate
@@ -90,7 +91,7 @@ type (`kubernetes/namespace`).
 
 | Block | Rules the schema does not carry |
 |---|---|
-| `types` | Exactly one type is `root` (with `rootKey`); every other type has a `parent` whose chain ends at a root. Path = `platform/<plural>/<name>/…` down the chain. Names and parents never change (D21). |
+| `types` | Exactly one type is `root` (with `rootKey`); every other type has a `parent` whose chain ends at a root. Path = `platform/<plural>/<name>/…` down the chain. Names and parents never change (D21). The root may also name a `canonicalKey` (camelCase, e.g. Kubernetes `kubeSystemUid`), the identity-bearing value the integration's discovery or permissionCheck task reports for the root; see "Canonical root key" under Discovery sync. A `canonicalKey` on a non-root type is a schema error. |
 | `credentialTypes` | Name prefix is the platform (`kubernetes/kubeconfig`), except `generic/*` and the platform-minted `runwhen/sync`. `materialize.env: {fromTaskVars: true}` means the task names the variables (`generic/env`). |
 | `credentialTypes` `content` | Optional token naming what the type's material is (`kubeconfig` for `kubernetes/kubeconfig`); used to match references (call F1). |
 | `authMethods` | Exactly one of `native` (`passthrough`, `in-cluster-token`) or `script`. `accepts` lists reference kinds and/or content tokens (call F1). `in-cluster-token` only produces a file-materialized type. |
@@ -363,6 +364,28 @@ entry-point tasks (agreed with lanes C and F, 2026-11-04):
 | `discovery` | `{}`: discovery is driven by settings and the connection's root | settings only (e.g. Kubernetes `namespaces`) | `summary` of `kind: rw.discovery.summary.v1`; resources go through the sync API |
 | `cli` | `{"command": "<arguments>"}` | a required input `command` (`type: string`); allowlists live in settings | the integration's own output (text or artifact) |
 
+**Canonical root key** (contracts-v3, call F21). `rootKey` is the provisional
+key papi dedupes a root on when a connection is confirmed, before the
+integration has run anything. In-cluster and private values collide across
+clusters (in-cluster `apiServer` is the service-range IP: 10.96.0.1 on
+kind/kubeadm, 10.0.0.1 on AKS), so until a canonical key is reported papi scopes
+in-cluster and private keys by runner (`runner:<uuid>|<server>`). When the root
+type declares `canonicalKey: <name>`, the integration's first discovery run (the
+summary) or permission check (the access report) may report
+`root: {canonicalKey: {name, value}}`, with `name` equal to the declared name
+(`kubeSystemUid`: the `kube-system` namespace UID, which is the same whichever
+path reaches the cluster). papi then:
+
+1. re-keys the connection's provisional root to `<name>=<value>`;
+2. if another root already holds that key, re-points the reporting connection to
+   it and marks its own old root `superseded`, for an admin to retire. There is
+   no automatic subtree merge: both roots may carry children, issues and
+   memories.
+
+`rootKey` stays the key until one is reported. A report whose `name` differs
+from the root type's declared `canonicalKey`, or for a root type that declares
+none, is ignored and logged: papi never re-keys a root on an undeclared name.
+
 ## Hashing
 
 All in `runwhen_capability.contracts.hashing`, with vectors in `contracts/vectors/`:
@@ -417,7 +440,7 @@ every wiki example valid.
 | F18 | Claude Code's extra frontmatter keys (`argument-hint`, `model`, `user-invocable`) are rejected. | SK7 strict; add them in v2 if a skill needs one. |
 | F19 | Plugin files are YAML 1.2; `load_yaml` is the reference loader for Python. | YAML 1.1 turns the kubernetes alias `no` into `false`; every lane must parse the same way. |
 | F20 | `rw.discovery.v1` keeps today's open/items/commit API: no edges payload (rule-derived), discovered types move from the pack `PUT` to `open`, `summary` on commit replaces `stats`, `taskRun` replaces `capabilityRunUuid`. | Smallest change to working code; static types now register at install. |
-| F21 | Kubernetes `rootKey: server` is provisional: an in-cluster and a GKE connection to one cluster report different servers, so connection confirm takes `attachToRoot` (lane C). A canonical key (the `kube-system` namespace UID from the first permission check) is a `contracts-v2` candidate. | e2e #3 needs two connections on one root. |
+| F21 | Kubernetes `rootKey: server` is provisional: an in-cluster and a GKE connection to one cluster report different servers, so connection confirm takes `attachToRoot` (lane C). Resolved by `contracts-v3`: the root type may declare `canonicalKey` (Kubernetes: `kubeSystemUid`, the `kube-system` namespace UID) and discovery or the permission check reports it (see "Canonical root key"). | e2e #3 needs two connections on one root. |
 
 ## Not in v1
 
@@ -438,3 +461,12 @@ Additive: no field was removed and every document that validated under
 | V2-5 | "What a script sees" names `RW_TASK_CONTRACT=v13`, the bash helpers (`rw_error`, `rw_output_append`, `rw_output_set`, ...), `$RW_OUT`, `$RW_LIB_DIR`, strict mode with `rw.sh` preloaded, and `runwhen_capability.testing`. Documentation only. | F (skill authors) |
 | V2-6 | S13: plugin-authored JSON Schemas (task input `pattern`, settings, output, facet and permission schemas, compact notation) are evaluated with RE2, not Python `re`: new dependency `google-re2`, `contracts.validator_for_plugin_schema(schema)` and `contracts.check_plugin_schema(schema)`, and `rwtask validate` / ingest report `E_SCHEMA_PATTERN` (a pattern RE2 cannot compile: lookaround, backreferences) and `E_SCHEMA_REF` (a `$ref` that leaves the schema). Plugins that used lookaround in a pattern must rewrite it. | B (papi re-validation, CAP-5), D (registry ingest), F (authors) |
 | V2-7 | `lease.dryRun` (optional boolean): papi asks for a dry-run execution. The runner runs with `RW_DRY_RUN=1` and marks the envelope `dryRun: true`, only if `task.dryRun` is true; else it completes `failed` with `invalid_input` "task does not support dry run". | B, E (CAP-14 approval card), C |
+
+## Changes in contracts-v3
+
+Additive: no field was removed and every document that validated under
+`contracts-v2` still does (`$id`s stay `.../v1.json`).
+
+| # | Change | Affects |
+|---|---|---|
+| V2-3 | Canonical root key. `types.yaml`: a root type may declare `canonicalKey: <camelName>` (Kubernetes: `kubeSystemUid`); on a non-root type it is a schema error. `common.schema.json#/$defs/rootIdentity` is `{canonicalKey: {name, value}}`; `rw.discovery.summary.v1` and `rw.access.v1` each gain an optional top-level `root` of that shape. papi re-keys the root to `<name>=<value>`; if another root holds that key, it re-points the reporting connection and marks its own old root `superseded` (no automatic subtree merge). Compile carries `canonicalKey` through in `integration.definition`; no semantic check beyond the schema. Settles F21. | C (papi root dedupe), F (kubernetes discover and check-permissions report it) |

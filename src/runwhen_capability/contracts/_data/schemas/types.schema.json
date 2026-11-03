@@ -42,6 +42,10 @@
             }
           ]
         },
+        "canonicalKey": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/camelName",
+          "description": "Root types only: the name of an identity-bearing value that the integration's discovery or permissionCheck task reports for the root (`root.canonicalKey` of rw.discovery.summary.v1 / rw.access.v1). Once reported, it supersedes `rootKey` for dedupe (kubernetes: `kubeSystemUid`)."
+        },
         "parent": {
           "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
         },
@@ -99,6 +103,11 @@
               {
                 "required": [
                   "rootKey"
+                ]
+              },
+              {
+                "required": [
+                  "canonicalKey"
                 ]
               }
             ]

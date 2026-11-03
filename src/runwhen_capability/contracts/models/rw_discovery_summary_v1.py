@@ -35,3 +35,4 @@ class DiscoverySummary(BaseModel):
     discoveredTypes: list[common.TypeName] | None = None
     durationMs: int | None = Field(None, ge=0)
     errors: list[error.Error] | None = None
+    root: common.RootIdentity | None = None

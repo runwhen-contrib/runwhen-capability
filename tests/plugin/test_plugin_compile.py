@@ -77,6 +77,11 @@ def test_kube_mini_compiles_and_checks_against_the_schema():
     ]
 
 
+def test_root_canonical_key_is_carried_into_the_integration_definition():
+    cluster = compiled()["integration"]["definition"]["types"]["cluster"]
+    assert cluster["canonicalKey"] == "kubeSystemUid"
+
+
 def test_sdk_version_override():
     assert compiled(sdk_version="9.9.9")["compiler"]["version"] == "9.9.9"
 

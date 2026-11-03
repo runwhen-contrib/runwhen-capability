@@ -396,6 +396,34 @@
         }
       },
       "additionalProperties": false
+    },
+    "rootIdentity": {
+      "type": "object",
+      "description": "The identity-bearing value an integration's discovery or permissionCheck task reports for the connection's root; papi re-keys the root to `<name>=<value>` (CONTRACTS.md, Discovery sync).",
+      "properties": {
+        "canonicalKey": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/camelName"
+            },
+            "value": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            }
+          },
+          "required": [
+            "name",
+            "value"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "canonicalKey"
+      ],
+      "additionalProperties": false
     }
   }
 }
