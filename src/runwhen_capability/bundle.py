@@ -1235,14 +1235,14 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
-#: Sets RLIMIT_AS, then becomes the real command. Run as `python -I -S -c <this> <bytes>
+#: Sets RLIMIT_DATA, then becomes the real command. Run as `python -I -S -c <this> <bytes>
 #: <argv...>` so the limit is in force from the first instruction of the task's interpreter
 #: (or bash), and is inherited by whatever the task starts. -I -S: nothing in the scope or
 #: the site directories can shadow the three stdlib imports.
-_RLIMIT_AS_LAUNCHER = (
+_RLIMIT_DATA_LAUNCHER = (
     "import os, resource, sys\n"
     "limit = int(sys.argv[1])\n"
-    "resource.setrlimit(resource.RLIMIT_AS, (limit, limit))\n"
+    "resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))\n"
     "os.execvp(sys.argv[2], sys.argv[2:])\n"
 )
 
@@ -1250,7 +1250,7 @@ _memory_limit_noted = False
 
 
 def _with_memory_limit(argv: list[str], limit_bytes: int) -> list[str]:
-    return [sys.executable, "-I", "-S", "-c", _RLIMIT_AS_LAUNCHER, str(limit_bytes), *argv]
+    return [sys.executable, "-I", "-S", "-c", _RLIMIT_DATA_LAUNCHER, str(limit_bytes), *argv]
 
 
 def _note_memory_limit_unsupported(log: logging.Logger) -> None:
@@ -1300,9 +1300,9 @@ def _execute(
     `path_prepend` (directories put FIRST on the child's PATH: `rwtask test`'s shims) and
     `shim_env` (the RW_SHIM_* variables those shims read: RW_* is otherwise never set from
     outside, so plugin/run.py checks the names before passing them) and
-    `memory_limit_bytes` (CAP-7: the child's RLIMIT_AS on Linux, applied by a small stdlib
+    `memory_limit_bytes` (CAP-7: the child's RLIMIT_DATA on Linux, applied by a small stdlib
     launcher that execs the real argv, so nothing runs in a forked child of this threaded
-    process; skipped, with one debug line, where `resource.RLIMIT_AS` is not enforced)."""
+    process; skipped, with one debug line, where it is not enforced)."""
     base_env = {
         **_inherited_env(),
         **(extra_env or {}),

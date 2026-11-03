@@ -43,12 +43,16 @@ collected only from a task that exited 0. Outputs are optional: a task that writ
 
 Limits (CAP-7). `limits.resources.memory` of a lease (or `resources.memory` of the compiled
 task, for `rwtask run`) is a Kubernetes quantity (`256Mi`, `1Gi`, `512M`, `1000000`). On Linux
-it becomes the child's `RLIMIT_AS`, set before the task's interpreter starts: it caps the
-task's address space (virtual memory, a little above what it resident-uses), so give it
-headroom; a Python task needs well over 100Mi just to start. A task that dies out of memory
-under it is an `internal` error whose hint says so, unless it reported an error of its own.
-Elsewhere (macOS) the limit is not applied; that is logged once at debug level. `cpu` is
-advisory only: it is the platform's scheduling request, and nothing here enforces it.
+it becomes the child's `RLIMIT_DATA`, set before the task's interpreter (or bash) starts and
+inherited by what the task runs: it caps the writable private memory the task allocates (heap,
+anonymous mappings, stack-like data; Linux 4.7+). Not `RLIMIT_AS`: that counts reserved
+address space, and Go binaries (kubectl, helm, flux, ...) reserve far more than they use, so
+they cannot even start under an address-space limit of 512Mi (measured; golang/go#38010),
+while the same kubectl starts under a `RLIMIT_DATA` of 128Mi. A task that dies out of memory
+under the limit is an `internal` error whose hint says so, unless it reported an error of its
+own. Elsewhere (macOS) the limit is not applied; that is logged once at debug level. The pod's
+cgroup limit, set by the runner, is the hard bound either way. `cpu` is advisory only: it is
+the platform's scheduling request, and nothing here enforces it.
 
 `resolve_target` turns a resource path into the lease's `target` (path, qualified type,
 identity), from the plugin's own integration types where the platform is its own.
@@ -762,7 +766,7 @@ def execute(
     return finish(envelope, artifacts, log_tail)
 
 
-#: What a child prints when an allocation fails under RLIMIT_AS: Python's MemoryError, the
+#: What a child prints when an allocation fails under RLIMIT_DATA: Python's MemoryError, the
 #: C library's ENOMEM text (bash, most tools), and the interpreter's own failure to start.
 _OUT_OF_MEMORY_TEXT = (
     "MemoryError",

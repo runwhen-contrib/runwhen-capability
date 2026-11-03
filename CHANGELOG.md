@@ -31,7 +31,7 @@ with the wheel and sdist attached to the GitHub Release.
 
 - A task's memory limit (CAP-7). A lease's `limits.resources.memory` (and a compiled task's
   `resources.memory`, for `rwtask run`) is a Kubernetes quantity applied to the task's child as
-  `RLIMIT_AS` on Linux; elsewhere it is not applied. A task that dies of it and reported no error of
+  `RLIMIT_DATA` on Linux (not `RLIMIT_AS`, which stops Go tools such as kubectl from starting); elsewhere it is not applied. A task that dies of it and reported no error of
   its own fails `internal` with the hint "the task exceeded its memory limit (<quantity>)". `cpu` stays
   advisory. `plugin.run.parse_quantity_bytes` reads the quantity.
 

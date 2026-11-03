@@ -730,7 +730,7 @@ def _run_allocating(tmp_path, *, spec_memory=None, task_memory=None):
     return outcome.envelope
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux only")
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_DATA is enforced on Linux only")
 @pytest.mark.parametrize("where", ["spec", "task"])
 def test_a_task_that_allocates_past_its_memory_limit_fails_with_the_hint(tmp_path, where):
     kw = {"spec_memory": "64Mi"} if where == "spec" else {"task_memory": "64Mi"}
@@ -742,7 +742,7 @@ def test_a_task_that_allocates_past_its_memory_limit_fails_with_the_hint(tmp_pat
     assert envelope["outputs"] == {}
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux only")
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_DATA is enforced on Linux only")
 def test_a_task_within_its_memory_limit_runs_normally(tmp_path):
     envelope = _run_allocating(tmp_path, spec_memory="2Gi")
     assert envelope["status"] == "ok", envelope["errors"]
@@ -766,3 +766,21 @@ def test_a_failure_with_no_memory_limit_is_never_blamed_on_memory(run):
     envelope = run("py-raise").envelope
     assert envelope["status"] == "failed"
     assert all("hint" not in e or "memory" not in e["hint"] for e in envelope["errors"])
+
+
+_GO_PROBE = b"#!/bin/bash\nkubectl version --client >/dev/null\n"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_DATA is enforced on Linux only")
+@pytest.mark.skipif(shutil.which("kubectl") is None, reason="needs a Go binary (kubectl) on PATH")
+def test_a_go_binary_starts_under_a_realistic_memory_limit(tmp_path):
+    """RLIMIT_AS would stop kubectl at 512Mi (Go reserves address space it never uses)."""
+    task = {**_memory_task("256Mi"), "script": "scripts/t.sh", "outputs": {}}
+    outcome = execute(
+        RunSpec(
+            task=task, files={"scripts/t.sh": _GO_PROBE}, executable=frozenset({"scripts/t.sh"})
+        ),
+        scope_dir=tmp_path / "scope",
+    )
+    assert validate_contract("result-envelope", outcome.envelope) == []
+    assert outcome.envelope["status"] == "ok", outcome.envelope["errors"]
