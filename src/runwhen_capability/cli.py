@@ -2,6 +2,8 @@
 
     rwtask serve --relay <url> --pool <poolId> --workdir /work
     rwtask run <capability-dir> --request request.json [--credentials creds.json]
+    rwtask run <skill>/<task> --resource PATH [--plugin-dir DIR] [--input k=v]...
+        [--setting k=v]... [--identity k=v]... [--allow-write] [--dry-run] [--out DIR]
     rwtask label [--schemas] <capability-dir>
     rwtask schemas [--check] [--project-dir DIR]
     rwtask plan <dir> [--prune]
@@ -96,14 +98,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_p = sub.add_parser(
         "run",
-        help="run a request against a capability directory, or --local a bundle "
-        "directory's task(s), locally",
+        help="run a request against a capability directory, --local a bundle directory's "
+        "task(s), or a V13 plugin task (<skill>/<task> --resource PATH), locally",
     )
     run_p.add_argument(
         "capability_dir",
         nargs="?",
         default=None,
-        help="path to the capability directory (has manifest.yaml, tasks.py) -- omit with --local",
+        help="path to the capability directory (has manifest.yaml, tasks.py) -- omit with "
+        "--local; or <skill>/<task> of a V13 plugin (see --resource)",
     )
     run_p.add_argument("--request", default=None, help="path to a request.json (a RequestEnvelope)")
     run_p.add_argument(
@@ -151,6 +154,60 @@ def _build_parser() -> argparse.ArgumentParser:
         help="degrade every unresolved credential to anonymous instead of failing the "
         "request -- a deliberate local-dev escape hatch for testing against public "
         "repos without a credentials.json; never available to `rwtask serve`",
+    )
+
+    v13_group = run_p.add_argument_group(
+        "V13 plugin task",
+        "`rwtask run <skill>/<task> --resource PATH`: your own environment (KUBECONFIG, PG*, "
+        "AWS_*, ~/.kube) is the credential (D43). The result envelope is written to "
+        "<out>/result.yaml and any artifacts to <out>/<name>; exit 1 only if it is `failed`.",
+    )
+    v13_group.add_argument(
+        "--resource",
+        default=None,
+        metavar="PATH",
+        help="the target's resource path, e.g. kubernetes/clusters/kind/namespaces/web/"
+        "deployments/api",
+    )
+    v13_group.add_argument(
+        "--plugin-dir", default=".", metavar="DIR", help="the plugin directory; default: ."
+    )
+    v13_group.add_argument(
+        "--input",
+        dest="v13_inputs",
+        action="append",
+        default=None,
+        metavar="K=V",
+        help="a task input (repeatable); JSON for integer/number/boolean/array/object types",
+    )
+    v13_group.add_argument(
+        "--setting",
+        dest="v13_settings",
+        action="append",
+        default=None,
+        metavar="K=V",
+        help="a task setting over its default (repeatable); typed like --input",
+    )
+    v13_group.add_argument(
+        "--identity",
+        dest="v13_identity",
+        action="append",
+        default=None,
+        metavar="K=V",
+        help="set or override an identity field of the target (repeatable)",
+    )
+    v13_group.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="run a task that is not read-only (readOnly: false)",
+    )
+    v13_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="set RW_DRY_RUN=1; only for a task that declares dryRun: true",
+    )
+    v13_group.add_argument(
+        "--out", default="out", metavar="DIR", help="where to write result.yaml; default: ./out"
     )
 
     label_p = sub.add_parser(
@@ -422,6 +479,167 @@ def _format_plugin_diagnostic(diag) -> str:
     return f"{prefix}{head}{diag.code} {diag.message}"
 
 
+def _is_v13_run(parser: argparse.ArgumentParser, args: argparse.Namespace) -> bool:
+    """`rwtask run <skill>/<task>`: the first positional has a `/` and is not an existing
+    directory (a classic `rwtask run path/to/capability` keeps working), or `--resource`
+    says so. `--local` is always the classic bundle form."""
+    target = args.capability_dir
+    if args.local or not target:
+        return False
+    if args.resource is not None:
+        if "/" not in target:
+            parser.error("run --resource needs <skill>/<task>, got " + repr(target))
+        return True
+    return "/" in target and not Path(target).is_dir()
+
+
+def _key_values(parser: argparse.ArgumentParser, flag: str, items: list[str] | None):
+    pairs = []
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            parser.error(f"{flag} expects K=V, got {item!r}")
+        pairs.append((key, value))
+    return pairs
+
+
+def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    import shutil
+    import tempfile
+
+    import yaml
+
+    from .plugin import PluginInvalid, compile_tree, load_dir, validate_tree
+    from .plugin.run import RunSpec, coerce_value, execute, resolve_target
+
+    ref = args.capability_dir
+    if args.request or args.tasks or args.inputs or args.target or args.credentials:
+        parser.error(
+            "run <skill>/<task> takes none of --request/--task/--inputs/--target/--credentials"
+        )
+    directory = Path(args.plugin_dir)
+    if not (directory / "plugin.yaml").is_file():
+        print(f"rwtask run: {directory} has no plugin.yaml (see --plugin-dir)", file=sys.stderr)
+        return 1
+    tree = load_dir(directory)
+    diagnostics = validate_tree(tree)
+    for diag in diagnostics:
+        print(_format_plugin_diagnostic(diag), file=sys.stderr)
+    if any(d.severity == "error" for d in diagnostics):
+        return 1
+    try:
+        compiled = compile_tree(tree)
+    except PluginInvalid as exc:
+        print(f"rwtask run: {exc}", file=sys.stderr)
+        return 1
+
+    wanted = ref.split(":", 1)[1] if ":" in ref else ref
+    tasks = {f"{t['skill']}/{t['name']}": t for t in compiled["tasks"]}
+    task = tasks.get(wanted)
+    if task is None:
+        available = ", ".join(sorted(tasks)) or "none"
+        print(
+            f"rwtask run: no task {wanted!r} in this plugin (tasks: {available})", file=sys.stderr
+        )
+        return 2
+    if not task["readOnly"] and not (args.allow_write or (args.dry_run and task["dryRun"])):
+        effects = "; ".join(task.get("effects") or ["changes things"])
+        hint = ", or --dry-run to only look" if task["dryRun"] else ""
+        print(
+            f"rwtask run: {ref} is not read-only: it {effects}. Pass --allow-write to run it{hint}",
+            file=sys.stderr,
+        )
+        return 2
+    if args.dry_run and not task["dryRun"]:
+        print(
+            f"rwtask run: {ref} does not declare dryRun: true, so --dry-run is refused",
+            file=sys.stderr,
+        )
+        return 2
+
+    bad_values: list[str] = []
+
+    def typed(flag: str, items, specs: dict) -> dict:
+        values = {}
+        for key, raw in _key_values(parser, flag, items):
+            try:
+                values[key] = coerce_value((specs.get(key) or {}).get("type"), raw)
+            except ValueError as exc:
+                bad_values.append(f"{flag} {key}: {exc}")
+        return values
+
+    inputs = typed("--input", args.v13_inputs, task.get("inputs") or {})
+    settings = typed("--setting", args.v13_settings, task.get("settings") or {})
+    if bad_values:
+        for message in bad_values:
+            print(f"rwtask run: {message}", file=sys.stderr)
+        return 2
+    identity = dict(_key_values(parser, "--identity", args.v13_identity))
+
+    target = None
+    if args.resource is not None:
+        try:
+            target = resolve_target(args.resource, tree, identity_overrides=identity)
+        except ValueError as exc:
+            print(f"rwtask run: {exc}", file=sys.stderr)
+            return 2
+        for warning in target.pop("warnings", []):
+            print(f"warning: {warning}", file=sys.stderr)
+        applies = (task.get("appliesTo") or {}).get("types")
+        if applies and target["type"] not in applies:
+            print(
+                f"warning: {ref} applies to {', '.join(applies)}, not {target['type']}",
+                file=sys.stderr,
+            )
+    elif task.get("appliesTo"):
+        print(f"rwtask run: {ref} needs a target: pass --resource PATH", file=sys.stderr)
+        return 2
+
+    spec = RunSpec(
+        task=task,
+        files=tree.files,
+        executable=tree.executable,
+        target=target,
+        inputs=inputs,
+        settings=settings,
+        dry_run=args.dry_run,
+    )
+    owns_workdir = args.workdir is None
+    scope_dir = Path(args.workdir) if args.workdir else Path(tempfile.mkdtemp(prefix="rwtask-run-"))
+    out = Path(args.out)
+    try:
+        outcome = execute(spec, scope_dir=scope_dir, inherit_home=True)
+        out.mkdir(parents=True, exist_ok=True)
+        text = yaml.safe_dump(outcome.envelope, sort_keys=False, allow_unicode=True)
+        (out / "result.yaml").write_text(text, encoding="utf-8")
+        declared = [n for n, o in (task.get("outputs") or {}).items() if "artifact" in o]
+        for name in declared:  # never leave a stale file from an earlier run to pass for this one
+            if name not in outcome.artifacts:
+                (out / name).unlink(missing_ok=True)
+        for name, source in outcome.artifacts.items():
+            (out / name).unlink(missing_ok=True)
+            shutil.copyfile(source, out / name)
+    finally:
+        if owns_workdir and not args.keep_workdir:
+            shutil.rmtree(scope_dir, ignore_errors=True)
+        else:
+            print(f"rwtask run: scope kept at {scope_dir}", file=sys.stderr)
+
+    envelope = outcome.envelope
+    summary = f"rwtask run: {ref}: {envelope['status']}"
+    if envelope.get("reason"):
+        summary += f" ({envelope['reason']})"
+    if envelope["errors"]:
+        summary += " [" + ", ".join(e["code"] for e in envelope["errors"]) + "]"
+    print(summary + f" -> {out / 'result.yaml'}", file=sys.stderr)
+    for error in envelope["errors"]:
+        print(f"  {error['code']}: {error['message']}", file=sys.stderr)
+    if envelope["status"] in ("failed", "partial") and outcome.log_tail.strip():
+        print("--- output of the script ---", file=sys.stderr)
+        print(outcome.log_tail.rstrip(), file=sys.stderr)
+    return 1 if envelope["status"] == "failed" else 0
+
+
 def _gitops_config(parser: argparse.ArgumentParser, args: argparse.Namespace, command: str):
     from . import gitops
 
@@ -528,6 +746,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run":
+        if _is_v13_run(parser, args):
+            return _run_v13(parser, args)
         if args.local:
             from .run_local import run_local_bundle
 

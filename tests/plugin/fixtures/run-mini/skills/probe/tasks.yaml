@@ -1,0 +1,176 @@
+apiVersion: runwhen.com/tasks/v1
+runtime: generic@1
+defaults:
+  credentials: kubernetes/kubeconfig
+  timeout: 30s
+settings:
+  latencyThresholdMs: { type: integer, default: 1500, description: Slower than this is slow }
+  label: { type: string, default: plain, description: A free-text setting }
+  hosts: { type: "string[]", default: [], description: Extra hosts }
+  waitingClientsThreshold: { type: integer, default: 5, description: Clients waiting for a server connection }
+  host: { type: string, default: "", description: "host:port; empty = <name>.<namespace>.svc:5432" }
+tasks:
+  - name: py-ok
+    title: Python, ok
+    description: Returns what it was given.
+    script: scripts/py_ok.py
+    readOnly: true
+    dryRun: true
+    inputs:
+      since: { type: duration, default: 30m, description: Look-back window }
+      limit: { type: integer, default: 3, description: How many }
+    outputs:
+      summary: { schema: "{ namespace: string, name: string, path: string, threshold: integer, since: string, limit: integer, label: string, hosts: string[], dry: boolean, lib: string }" }
+  - name: sh-ok
+    title: Bash, ok
+    description: Appends to a list output and writes an artifact.
+    script: scripts/sh_ok.sh
+    readOnly: true
+    inputs:
+      count: { type: integer, default: 2, description: How many probes }
+      note: { type: string, default: hello, description: A note }
+    outputs:
+      probe: { schema: "{ namespace: string, name: string, threshold: integer, note: string }[]" }
+      events: { artifact: { contentType: application/json } }
+  - name: py-partial
+    title: Python, partial
+    description: Records an error and returns anyway.
+    script: scripts/py_partial.py
+    readOnly: true
+    outputs:
+      pools: { schema: "{ n: integer }[]" }
+  - name: py-raise
+    title: Python, RwError
+    description: Raises a structured error.
+    script: scripts/py_raise.py
+    readOnly: true
+  - name: py-run
+    title: Python, ctx.run
+    description: Runs a shell snippet that fails.
+    script: scripts/py_run.py
+    readOnly: true
+    inputs:
+      snippet: { type: string, default: "false", description: sh -c snippet }
+  - name: sh-exit3
+    title: Bash, exit 3
+    description: Exits 3 without recording an error.
+    script: scripts/sh_exit3.sh
+    readOnly: true
+  - name: sh-rw-error
+    title: Bash, rw_error
+    description: Records an error and carries on.
+    script: scripts/sh_rw_error.sh
+    readOnly: true
+  - name: sh-missing-tool
+    title: Bash, missing tool
+    description: Calls a tool that is not installed.
+    script: scripts/sh_missing_tool.sh
+    readOnly: true
+  - name: py-bad-output
+    title: Python, bad output
+    description: Returns an output that breaks its schema.
+    script: scripts/py_bad_output.py
+    readOnly: true
+    outputs:
+      summary: { schema: "{ namespace: string }" }
+      good: { schema: "{ n: integer }" }
+  - name: py-undeclared
+    title: Python, undeclared output
+    description: Returns an output the task never declared.
+    script: scripts/py_undeclared.py
+    readOnly: true
+    outputs:
+      summary: { schema: "{ n: integer }" }
+  - name: py-skip
+    title: Python, skipped
+    description: Has nothing to check.
+    script: scripts/py_skip.py
+    readOnly: true
+  - name: py-nothing
+    title: Python, no outputs
+    description: Returns nothing, writes no errors.
+    script: scripts/py_nothing.py
+    readOnly: true
+    outputs:
+      summary: { schema: "{ n: integer }" }
+  - name: py-crash
+    title: Python, crash
+    description: Raises a plain exception.
+    script: scripts/py_crash.py
+    readOnly: true
+  - name: py-slow
+    title: Python, slow
+    description: Sleeps past its deadline.
+    script: scripts/py_slow.py
+    readOnly: true
+  - name: py-artifact
+    title: Python, artifact
+    description: Writes an artifact and a data output.
+    script: scripts/py_artifact.py
+    readOnly: true
+    outputs:
+      dump: { artifact: { contentType: text/plain } }
+      declaredButNeverWritten: { artifact: { contentType: text/plain } }
+      n: { schema: "{ v: integer }" }
+  - name: py-secret
+    title: Python, leaks a credential
+    description: Returns the credential it was given.
+    script: scripts/py_secret.py
+    readOnly: true
+    outputs:
+      leaked: { schema: "{ token: string }" }
+  - name: sh-env
+    title: Bash, environment
+    description: Reports which variables it can see.
+    script: scripts/sh_env.sh
+    readOnly: true
+    outputs:
+      env: { schema: "{ relay: string, pool: string, token: string, contract: string, home: string }" }
+  - name: sh-nested
+    title: Bash, nested shell
+    description: A shell it starts is not forced into strict mode.
+    script: scripts/sh_nested.sh
+    readOnly: true
+    outputs:
+      nested: { schema: "{ ok: boolean }" }
+  - name: sh-write
+    title: Bash, write
+    description: Changes something, unless it is a dry run.
+    script: scripts/sh_write.sh
+    readOnly: false
+    effects: ["Pretends to restart something"]
+    destructive: false
+    idempotent: true
+    dryRun: true
+    outputs:
+      result: { schema: "{ dry: boolean }" }
+  - name: sh-write-no-dry
+    title: Bash, write without dry run
+    description: Changes something and cannot be dry-run.
+    script: scripts/sh_write.sh
+    readOnly: false
+    effects: ["Pretends to restart something"]
+    destructive: false
+    outputs:
+      result: { schema: "{ dry: boolean }" }
+  - name: py-need
+    title: Python, required input
+    description: Needs a reason.
+    script: scripts/py_nothing.py
+    readOnly: true
+    inputs:
+      reason: { type: string, description: Why }
+  - name: api-probe
+    title: API probe (the wiki 42b script)
+    description: Calls the API through kubectl and measures latency.
+    script: scripts/api_probe.sh
+    readOnly: true
+    outputs:
+      probe: { schema: "{ path: string, status: integer, latencyMs: integer, slow: boolean }[]" }
+  - name: pool-saturation
+    title: Pool saturation (the wiki 42b script)
+    description: Reads SHOW POOLS.
+    script: scripts/pool_saturation.py
+    readOnly: true
+    outputs:
+      pools: { schema: "{ cl_waiting: integer, sv_idle: integer, saturated: boolean }[]" }

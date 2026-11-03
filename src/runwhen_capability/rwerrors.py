@@ -99,8 +99,9 @@ _RATE_LIMITED = re.compile(r"\b429\b|too many requests|rate limit|throttling")
 
 def classify_command_error(argv: Sequence[str], returncode: int, stderr: str) -> str:
     """The error code for a failed command, from its stderr and exit status.
-    First match wins, in this order: permission_denied, not_found,
-    unreachable, timeout, rate_limited, storage, dependency, else internal.
+    First match wins, in this order: permission_denied, dependency (a
+    missing resource type), not_found, unreachable, timeout, rate_limited,
+    storage, dependency (a missing binary), else internal.
     Matching is case-insensitive. `argv` is accepted so a later rule can be
     tool-specific; no rule reads it today.
 
@@ -108,8 +109,20 @@ def classify_command_error(argv: Sequence[str], returncode: int, stderr: str) ->
     resource, so it is excluded from the `not found` rule; as is any
     `not found` at exit status 127 (the shell's "no such command")."""
     text = stderr.lower()
-    if _any(text, "forbidden", "permission denied", "authorizationfailed", "accessdenied"):
+    if _any(
+        text,
+        "forbidden",
+        "permission denied",
+        "authorizationfailed",
+        "accessdenied",
+        "unauthorized",
+        "you must be logged in",
+    ):
         return "permission_denied"
+    # A missing CRD or API (metrics.k8s.io): the tool works, the cluster lacks
+    # what the task needs. Checked before not_found, whose wording it may share.
+    if "doesn't have a resource type" in text:
+        return "dependency"
     if returncode != 127 and (
         "notfound" in text or "not found" in text.replace("command not found", "")
     ):
@@ -124,9 +137,20 @@ def classify_command_error(argv: Sequence[str], returncode: int, stderr: str) ->
         "tls handshake",
         "x509:",
         "could not resolve host",
+        "(serviceunavailable)",
+        "currently unable to handle the request",
+        ": eof",
+        "unexpected eof",
     ):
         return "unreachable"
-    if returncode == 124 or _any(text, "deadline exceeded", "context deadline", "timed out"):
+    if returncode == 124 or _any(
+        text,
+        "deadline exceeded",
+        "context deadline",
+        "timed out",
+        "(timeout)",
+        "unable to return a response in the time allotted",
+    ):
         return "timeout"
     if _RATE_LIMITED.search(text):
         return "rate_limited"

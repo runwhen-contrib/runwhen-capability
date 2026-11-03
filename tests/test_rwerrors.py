@@ -67,6 +67,8 @@ def test_rw_command_error_validates_its_code_too():
         RwCommandError("bogus", "m", argv=["x"], returncode=1, stderr="")
 
 
+KUBECTL = ["kubectl", "get", "pods"]
+
 # One real-looking sample per rule, plus the precedence and fall-through cases.
 _CASES = [
     # permission_denied
@@ -319,6 +321,30 @@ _CASES = [
         "dial tcp 1.2.3.4:443: i/o timeout, context deadline exceeded",
         "unreachable",
     ),
+    # From lane F's kubectl pilots (2026-11-04).
+    (
+        KUBECTL,
+        1,
+        "Error from server (Timeout): the server was unable to return a response in the "
+        "time allotted, but may still be processing the request (get pods)",
+        "timeout",
+    ),
+    (
+        KUBECTL,
+        1,
+        "Error from server (ServiceUnavailable): the server is currently unable to handle the "
+        "request (get pods.metrics.k8s.io)",
+        "unreachable",
+    ),
+    (KUBECTL, 1, 'error: Get "https://10.0.0.1:443/api/v1/pods": EOF', "unreachable"),
+    (KUBECTL, 1, "error: unexpected EOF", "unreachable"),
+    (
+        KUBECTL,
+        1,
+        'error: the server doesn\'t have a resource type "helmreleases"',
+        "dependency",
+    ),
+    (KUBECTL, 1, "error: You must be logged in to the server (Unauthorized)", "permission_denied"),
 ]
 
 
