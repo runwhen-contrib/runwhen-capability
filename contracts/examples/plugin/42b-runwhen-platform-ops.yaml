@@ -1,0 +1,7 @@
+# source: 42b-example-papi-skill.md "## Layout"
+# plugin.yaml
+name: runwhen-platform-ops
+version: 0.1.0
+description: Operate self-hosted RunWhen platform installs - papi, task workers, pgbouncer.
+requires:
+  kubernetes: ^0.2

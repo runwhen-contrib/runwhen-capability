@@ -1,0 +1,20 @@
+# source: 42b-example-papi-skill.md "## papi-recovery and the checklist"
+# skills/papi-recovery/tasks.yaml
+apiVersion: runwhen.com/tasks/v1
+runtime: kubernetes@1
+defaults:
+  credentials: kubernetes/kubeconfig
+tasks:
+  - name: restart-worker
+    title: Restart the task worker
+    description: Rolling restart of this release's taskiq worker Deployment.
+    script: scripts/restart_worker.sh
+    readOnly: false
+    effects: ["Restarts the release's taskiq worker pods; in-flight background tasks are interrupted"]
+    destructive: false
+    idempotent: true
+    permissions: [{ apiGroups: [apps], resources: [deployments], verbs: [patch] }]
+    inputs:
+      reason: { type: string, description: Why; recorded as an annotation on the Deployment }
+    outputs:
+      result: { schema: "{ deployment: string, restartedAt: datetime }" }

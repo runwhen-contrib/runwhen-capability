@@ -1,0 +1,8 @@
+# expect: /authMethods/gke is valid under each of
+platform: kubernetes
+authMethods:
+  gke:
+    produces: kubernetes/kubeconfig
+    accepts: [gcp-sa-key, cloud-identity]
+    native: passthrough
+    script: auth/gke.py

@@ -1,0 +1,24 @@
+# source: synthetic (no wiki example); consistent with 50-connections-credentials.md (CON-2, how connections get created)
+apiVersion: runwhen.com/credential-inventory/v1
+runner: runner-a
+reportedAt: 2026-11-03T08:55:00Z
+references:
+  - id: in-cluster-sa
+    kind: in-cluster-sa
+    state: ok
+    hints:
+      serviceAccount: runner
+      namespace: runwhen-local
+      server: https://10.0.0.1:443
+  - id: kubeconfigs
+    kind: k8s-secret
+    ref: runwhen-local/kubeconfigs
+    keys: [kubeconfig]
+    format: kubeconfig
+    state: ok
+    hints:
+      namespace: runwhen-local
+      labels: { runwhen.com/credential: "true" }
+      contexts:
+        - { name: prod-east, cluster: gke_acme-prod_us-east1_prod-east, server: "https://34.74.10.20" }
+        - { name: prod-west, cluster: gke_acme-prod_us-west1_prod-west, server: "https://35.233.40.50", namespace: payments }

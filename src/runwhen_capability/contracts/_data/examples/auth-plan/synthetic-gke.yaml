@@ -1,0 +1,16 @@
+# source: synthetic (no wiki example); consistent with 50-connections-credentials.md (D67, the prod-east connection)
+connection: prod-east
+integration: kubernetes@1.4.0
+authMethod: gke
+credentialType: kubernetes/kubeconfig
+reference: { kind: vault, ref: secret/data/rw/gcp-prod-sa, format: gcp-sa-key }
+step:
+  script:
+    path: auth/gke.py
+    archive:
+      sha256: "sha256:c41e3c8e506788a71a0a98d424e8848aaf97ab992aedda52d3762fe8305d4bd4"
+      size: 48213
+      url: /v1/blobs/sha256:c41e3c8e506788a71a0a98d424e8848aaf97ab992aedda52d3762fe8305d4bd4
+inputs: { project: acme-prod, location: us-east1, cluster: prod-east }
+materialize:
+  file: { env: KUBECONFIG, mode: "0600" }

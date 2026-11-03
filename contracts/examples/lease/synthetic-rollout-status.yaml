@@ -1,0 +1,63 @@
+# source: synthetic (no wiki example); consistent with 42a-skill-spec.md, 50-connections-credentials.md, 49-plugin-registry.md (D35, D46, D67)
+apiVersion: runwhen.com/lease/v1
+leaseId: lease_01JC8Q2W5T
+taskRun: run_01JC8Q2W3Z
+workspace: stg-shared
+expiresAt: 2026-11-03T09:24:02Z
+task:
+  ref: "kubernetes:k8s-workload-health/rollout-status"
+  plugin: kubernetes
+  version: 0.3.0
+  skill: k8s-workload-health
+  name: rollout-status
+  hash: "sha256:adae8bf3e6b5857c36dacc408034db0e425a50052f716bff4e4c64df8524e4f0"
+  script: scripts/rollout_status.py
+  readOnly: true
+target:
+  path: kubernetes/clusters/prod-east/namespaces/payments/deployments/payments-api
+  type: kubernetes/deployment
+  identity: { cluster: prod-east, namespace: payments, name: payments-api }
+  labels: { app.kubernetes.io/name: payments-api }
+inputs: { since: 30m }
+settings: { restartThreshold: 5 }
+runtime:
+  name: kubernetes
+  major: 1
+  image: ghcr.io/runwhen-contrib/runtime-kubernetes:1.2.0
+  digest: "sha256:f350a5e10e8d7ac8103796b0d6cd4da0316d569bb9252f3539f6783e14185c51"
+code:
+  archive:
+    sha256: "sha256:c41e3c8e506788a71a0a98d424e8848aaf97ab992aedda52d3762fe8305d4bd4"
+    size: 48213
+    url: /v1/blobs/sha256:c41e3c8e506788a71a0a98d424e8848aaf97ab992aedda52d3762fe8305d4bd4
+credentials:
+  - type: kubernetes/kubeconfig
+    connection: prod-east
+    authPlan:
+      connection: prod-east
+      integration: kubernetes@1.4.0
+      authMethod: gke
+      credentialType: kubernetes/kubeconfig
+      reference: { kind: vault, ref: secret/data/rw/gcp-prod-sa, format: gcp-sa-key }
+      step:
+        script:
+          path: auth/gke.py
+          archive:
+            sha256: "sha256:c41e3c8e506788a71a0a98d424e8848aaf97ab992aedda52d3762fe8305d4bd4"
+            size: 48213
+            url: /v1/blobs/sha256:c41e3c8e506788a71a0a98d424e8848aaf97ab992aedda52d3762fe8305d4bd4
+      inputs: { project: acme-prod, location: us-east1, cluster: prod-east }
+      materialize:
+        file: { env: KUBECONFIG, mode: "0600" }
+  - type: runwhen/sync
+    minted: { ref: "sync/lease_01JC8Q2W5T", ttlSeconds: 900 }
+limits:
+  timeout: 60s
+  resources: { cpu: 250m, memory: 256Mi }
+  maxResultBytes: 1048576
+outputs:
+  rollout:
+    jsonSchema: { type: object, properties: { replicaSets: { type: array } } }
+    description: Rollout state per ReplicaSet
+  events:
+    artifact: { contentType: application/x-ndjson, maxSize: 50Mi }

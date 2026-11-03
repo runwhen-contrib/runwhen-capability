@@ -1,0 +1,8 @@
+# expect: /tasks/0 'readonly' was unexpected
+apiVersion: runwhen.com/tasks/v1
+tasks:
+  - name: rollout-status
+    title: Rollout status
+    description: Is the latest rollout progressing, stuck or failed, and why?
+    script: scripts/rollout_status.py
+    readonly: true

@@ -1,0 +1,4 @@
+# expect: /types/cluster is not valid under any of
+types:
+  cluster: { root: true, rootKey: server, parent: namespace, plural: clusters }
+  namespace: { parent: cluster, plural: namespaces }

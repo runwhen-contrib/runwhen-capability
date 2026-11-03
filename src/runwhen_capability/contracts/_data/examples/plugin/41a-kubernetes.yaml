@@ -1,0 +1,6 @@
+# source: 41a-integration-spec.md "## plugin.yaml"
+name: kubernetes
+version: 0.3.0
+description: Kubernetes clusters - inventory, dependencies, health and a read-only kubectl.
+requires: {}                      # a plugin that only adds skills: { kubernetes: ^0.3 }
+extends: null                     # openshift: { kubernetes: ^0.3 } (D18)

@@ -1,0 +1,7 @@
+# expect: "" 'apiVersion' is a required property
+tasks:
+  - name: rollout-status
+    title: Rollout status
+    description: Is the latest rollout progressing, stuck or failed, and why?
+    script: scripts/rollout_status.py
+    readOnly: true

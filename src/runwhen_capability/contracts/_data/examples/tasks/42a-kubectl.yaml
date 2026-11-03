@@ -1,0 +1,15 @@
+# source: 42a-skill-spec.md "### Settings and the CLI"
+apiVersion: runwhen.com/tasks/v1   # fixture: wrapper
+tasks:   # fixture: wrapper; the block below is the verbatim list item
+- name: kubectl
+  title: kubectl (read-only)
+  description: Run a read-only kubectl command against the resource's cluster
+  script: scripts/kubectl.sh
+  readOnly: true
+  permissions: [{ apiGroups: ["*"], resources: ["*"], verbs: [get, list, watch] }]   # D68: RBAC rules, not a RunWhen name
+  settings:
+    allowedVerbs:    { type: "string[]", default: [get, describe, logs, top, events, explain] }
+    deniedResources: { type: "string[]", default: [secrets] }        # refused whatever the verbs and flags allow; configmaps are not denied
+    maxOutputLines:  { type: integer, default: 2000 }
+  inputs:
+    command: { type: string, description: "kubectl arguments, e.g. get pods -o wide" }
