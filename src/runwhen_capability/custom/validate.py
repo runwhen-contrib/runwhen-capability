@@ -86,6 +86,7 @@ _STANDARD_BASH_ENV = frozenset(
         "RW_RESOURCE_JSON",
         "RW_SETTINGS_JSON",
         "RW_DRY_RUN",
+        "RW_TASK_CONTRACT",
     }
 )
 

@@ -257,3 +257,36 @@ def test_run_check_classifies_a_missing_binary_as_dependency(tmp_path):
     with pytest.raises(RwCommandError) as excinfo:
         ctx.run(["sh", "-c", "definitely-not-a-real-tool-xyz"], check=True)
     assert excinfo.value.code == "dependency"
+
+
+def test_run_default_is_unchanged_without_the_v13_contract(tmp_path, monkeypatch):
+    monkeypatch.delenv("RW_TASK_CONTRACT", raising=False)
+    assert _ctx(tmp_path).run([sys.executable, "-c", "raise SystemExit(3)"]).returncode == 3
+    monkeypatch.setenv("RW_TASK_CONTRACT", "v12")
+    assert _ctx(tmp_path).run([sys.executable, "-c", "raise SystemExit(7)"]).returncode == 7
+
+
+def test_run_raises_by_default_under_the_v13_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_TASK_CONTRACT", "v13")
+    script = (
+        "import sys; sys.stderr.write('Error from server (NotFound): pods x not found'); "
+        "sys.exit(1)"
+    )
+    with pytest.raises(RwCommandError) as excinfo:
+        _ctx(tmp_path).run([sys.executable, "-c", script])
+    assert excinfo.value.code == "not_found"
+    assert excinfo.value.returncode == 1
+
+
+def test_run_under_v13_returns_a_successful_process(tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_TASK_CONTRACT", "v13")
+    assert _ctx(tmp_path).run([sys.executable, "-c", "print('hi')"]).stdout.strip() == "hi"
+
+
+def test_an_explicit_check_wins_under_either_contract(tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_TASK_CONTRACT", "v13")
+    proc = _ctx(tmp_path).run([sys.executable, "-c", "raise SystemExit(4)"], check=False)
+    assert proc.returncode == 4
+    monkeypatch.delenv("RW_TASK_CONTRACT")
+    with pytest.raises(RwCommandError):
+        _ctx(tmp_path).run([sys.executable, "-c", "raise SystemExit(4)"], check=True)

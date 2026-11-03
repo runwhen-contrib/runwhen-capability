@@ -254,6 +254,9 @@ class Context:
         self.resource: AttrView | None = _json_object_env("RW_RESOURCE_JSON", snake=False)
         self.settings: AttrView = _json_object_env("RW_SETTINGS_JSON", snake=True) or AttrView({})
         self.dry_run: bool = os.environ.get("RW_DRY_RUN") == "1"
+        # "v13": the host runs this task under the V13 contract (D42), where ctx.run
+        # fails on a non-zero exit unless the task says otherwise.
+        self._v13_contract = os.environ.get("RW_TASK_CONTRACT") == "v13"
         self._errors: list[dict[str, Any]] = []
         self._errors_file = os.environ.get("RW_ERRORS_FILE") or None
 
@@ -350,13 +353,22 @@ class Context:
         env: dict[str, str] | None = None,
         *,
         inherit_env: bool = True,
-        check: bool = False,
+        check: bool | None = None,
     ) -> subprocess.CompletedProcess:
         """Runs argv as a subprocess. stdout is captured (returned on
         `.stdout`); stderr is captured and forwarded line-by-line to
         ctx.log; the timeout (default DEFAULT_RUN_TIMEOUT) is enforced --
         a timeout raises subprocess.TimeoutExpired, which the task host
         treats like any other task exception.
+
+        A non-zero exit raises RwCommandError when `check` is true, whose
+        `code` is classify_command_error(argv, returncode, stderr) -- so an
+        uncaught `kubectl get` that was Forbidden ends the task as
+        `permission_denied`, not a generic failure -- and is returned
+        (`.returncode`) when it is false. `check=None` (the default) means true
+        under the V13 task contract (env `RW_TASK_CONTRACT=v13`, D42) and false
+        otherwise, so classic bundles and packaged capabilities behave exactly as
+        they always have; an explicit True or False always wins.
 
         `env` is MERGED OVER the parent environment, never a replacement:
         a tool needs PATH and the rest of its runtime, and a caller that
@@ -513,7 +525,7 @@ class Context:
         if stderr:
             for line in stderr.splitlines():
                 self.log.info("%s: %s", prog, line)
-        if check and proc.returncode != 0:
+        if (self._v13_contract if check is None else check) and proc.returncode != 0:
             last = next((ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), "")
             message = f"{prog} exited {proc.returncode}" + (f": {last[:500]}" if last else "")
             raise RwCommandError(
