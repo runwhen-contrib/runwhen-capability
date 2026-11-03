@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -256,16 +258,6 @@ def test_an_archive_in_the_cache_is_verified_and_run(poll):
     assert envelope["outputs"]["summary"]["lib"] == "from-lib"
 
 
-def test_a_corrupt_archive_in_the_cache_is_a_hash_mismatch(poll):
-    data = archive.build(entries())
-    sha = archive_sha256(data)
-    poll.archives.mkdir()
-    (poll.archives / f"{sha.removeprefix('sha256:')}.tar").write_bytes(data + b"\0" * 512)
-    lease = make_lease("py-ok", code={"archive": {"sha256": sha, "size": len(data)}})
-    [error] = envelope_of(poll(lease))["errors"]
-    assert error["code"] == "internal"
-
-
 # -- code archives fetched from the relay (I3) ---------------------------------------------------
 
 
@@ -462,6 +454,89 @@ def test_concurrent_requests_for_one_archive_both_succeed_and_leave_one_file(
     assert len([r for r in relay_server.requests if r.path.endswith("/code")]) == 2
     assert [p.name for p in cache.iterdir()] == [f"{sha.removeprefix('sha256:')}.tar"]
     assert (cache / f"{sha.removeprefix('sha256:')}.tar").read_bytes() == data
+
+
+def test_a_corrupt_archive_in_the_cache_is_dropped_and_fetched_again(fetch):
+    data = archive.build(entries())
+    hex_digest = archive_sha256(data).removeprefix("sha256:")
+    fetch.archives.mkdir()
+    (fetch.archives / f"{hex_digest}.tar").write_bytes(data + b"\0" * 512)
+    envelope = envelope_of(fetch(archive_lease(data), code_response(data)))
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert len(fetch.code_requests()) == 1
+    assert (fetch.archives / f"{hex_digest}.tar").read_bytes() == data
+    assert [p.name for p in fetch.archives.iterdir()] == [f"{hex_digest}.tar"]
+
+
+def test_a_corrupt_cached_archive_is_refetched_only_once(fetch):
+    data = archive.build(entries())
+    hex_digest = archive_sha256(data).removeprefix("sha256:")
+    fetch.archives.mkdir()
+    (fetch.archives / f"{hex_digest}.tar").write_bytes(b"corrupt")
+    wrong = bytes([data[0] ^ 1]) + data[1:]
+    lease = archive_lease(data)
+    [error] = envelope_of(fetch(lease, code_response(wrong, sha=archive_sha256(data))))["errors"]
+    assert error["code"] == "dependency"
+    assert len(fetch.code_requests()) == 1
+    assert not (fetch.archives / f"{hex_digest}.tar").exists()  # the corrupt entry is gone
+
+
+def test_without_a_relay_a_corrupt_cached_archive_stays_an_internal_error(tmp_path):
+    data = archive.build(entries())
+    sha = archive_sha256(data)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    corrupt = cache / f"{sha.removeprefix('sha256:')}.tar"
+    corrupt.write_bytes(data + b"\0" * 512)
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": len(data)}}, cache)
+    assert raised.value.code == "internal"
+    assert corrupt.exists()
+
+
+def test_a_size_over_the_limit_is_refused_before_the_relay_is_asked(relay_server, tmp_path):
+    sha = archive_sha256(archive.build(entries()))
+    size = archive.MAX_ARCHIVE_BYTES + 1
+    client = RelayClient(relay_server.url, None, "req-1", requests.Session(), token="t")
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": size}}, tmp_path / "cache", client)
+    assert raised.value.code == "dependency"
+    assert sha in raised.value.message
+    assert relay_server.started == []
+
+
+@pytest.mark.parametrize(
+    "sha",
+    [
+        "sha256:../../x",
+        "sha256:" + "A" * 64,
+        "sha256:" + "a" * 63,
+        "sha256:" + "a" * 64 + "/..",
+        "x",
+    ],
+)
+def test_a_sha256_that_is_not_64_lower_case_hex_never_reaches_the_cache_path(tmp_path, sha):
+    cache = tmp_path / "cache"
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": 1}}, cache)
+    assert raised.value.code == "invalid_input"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_fetch_removes_stale_temp_files_but_not_fresh_ones(fetch):
+    data = archive.build(entries())
+    hex_digest = archive_sha256(data).removeprefix("sha256:")
+    fetch.archives.mkdir()
+    stale = fetch.archives / f"{hex_digest}.tar.dead.tmp"
+    fresh = fetch.archives / f"{hex_digest}.tar.live.tmp"
+    stale.write_bytes(b"partial")
+    fresh.write_bytes(b"partial")
+    old = time.time() - 2 * 3600
+    os.utime(stale, (old, old))
+    assert envelope_of(fetch(archive_lease(data), code_response(data)))["status"] == "ok"
+    assert not stale.exists()
+    assert fresh.exists()
+    assert (fetch.archives / f"{hex_digest}.tar").read_bytes() == data
 
 
 @pytest.mark.parametrize("scope_id", [".archives", ".rw-artifact-cache", "", "..", "a/b"])

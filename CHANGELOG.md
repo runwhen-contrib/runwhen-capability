@@ -15,7 +15,11 @@ with the wheel and sdist attached to the GitHub Release.
   a unique temporary file and renamed into place, so concurrent fetches of one archive in a pod both
   succeed. A failed or mismatched fetch is a `dependency` envelope that names the archive (not the
   relay URL or token); with no relay (`rwtask run`) a missing archive stays a `dependency` error.
-  `.archives`, the cache directory, is refused as a `scopeId`. `load_code` and
+  A cached archive that fails its hash is dropped and fetched once more (with no relay it stays an
+  `internal` error); a lease size over 64 MiB is refused before the relay is asked; a sha256 that is
+  not `sha256:<64 lower-case hex>` is `invalid_input` and never reaches a cache path; `*.tmp` files
+  of dead fetches older than an hour are removed. `.archives`, the cache directory, is refused as a
+  `scopeId`. `load_code` and
   `runspec_from_lease` take an optional `relay`.
 - `rwtask pull [--plugin-dir DIR] [--from git+URL|DIR | --registry URL] [--frozen] [name[@range] ...]`
   (AUT-1) resolves a plugin's `requires`/`extends` (not `platform`) to exact versions and fills the

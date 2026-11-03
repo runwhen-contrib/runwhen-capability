@@ -157,6 +157,23 @@ def _decode_inline(item: dict) -> bytes:
 
 
 _FETCH_CHUNK = 64 * 1024
+_STALE_TMP_SECONDS = 3600
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def _remove_stale_temp_files(cache: Path) -> None:
+    """Best effort: deletes the `.tmp` files of fetches that died mid-write (a killed
+    pod) and are older than an hour; a fetch in flight is never that old."""
+    cutoff = time.time() - _STALE_TMP_SECONDS
+    try:
+        for tmp in cache.glob("*.tar.*.tmp"):
+            try:
+                if tmp.stat().st_mtime < cutoff:
+                    tmp.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def _fetch_archive(relay: RelayClient, code_archive: dict, path: Path) -> bytes:
@@ -171,7 +188,14 @@ def _fetch_archive(relay: RelayClient, code_archive: dict, path: Path) -> bytes:
     that names the archive and the relay's code, never the URL or the token."""
     sha = code_archive["sha256"]
     size = code_archive["size"]
-    cap = min(size, archive_mod.MAX_ARCHIVE_BYTES)
+    if size > archive_mod.MAX_ARCHIVE_BYTES:
+        raise LeaseError(
+            "dependency",
+            f"archive {sha} could not be fetched: its size, {size} bytes, is over the "
+            f"{archive_mod.MAX_ARCHIVE_BYTES} allowed",
+        )
+    _remove_stale_temp_files(path.parent)
+    cap = size
     try:
         with relay.open_code() as stream:
             header = stream.headers.get("X-RW-Sha256")
@@ -241,7 +265,8 @@ def load_code(
     """(files by plugin-root path, executable paths) of a lease's `code`, after checking
     them against the sha256 the lease names. An archive that is not in the cache is
     fetched through `relay` and cached (`_fetch_archive`); with no relay it is a
-    `dependency` error. Raises LeaseError."""
+    `dependency` error. A cached archive that fails its hash is fetched again once when
+    there is a relay (`internal` error when there is none). Raises LeaseError."""
     if "inline" in code:
         inline = code["inline"]
         entries = []
@@ -262,9 +287,24 @@ def load_code(
     else:
         sha = code["archive"]["sha256"]
         hex_digest = sha.removeprefix("sha256:")
+        if not _HEX_DIGEST.fullmatch(hex_digest):
+            # the hex becomes a file name: nothing but a sha256 may reach the path
+            raise LeaseError("invalid_input", f"archive sha256 {sha!r} is not sha256:<64 hex>")
         path = (cache_dir or archive_cache_dir()) / f"{hex_digest}.tar"
         try:
             data = path.read_bytes()
+            try:
+                archive_mod.verify(data, sha)
+            except ArchiveError as exc:
+                if relay is None:
+                    raise LeaseError("internal", f"archive {sha} rejected: {exc}") from None
+                # a corrupt cache entry heals itself: drop it and fetch it once more
+                _log.warning("cached archive %s is corrupt (%s); fetching it again", sha, exc)
+                try:
+                    path.unlink()
+                except OSError:
+                    pass  # the fetch replaces it anyway
+                data = _fetch_archive(relay, code["archive"], path)
         except FileNotFoundError:
             if relay is None:
                 raise LeaseError(
@@ -276,7 +316,6 @@ def load_code(
         except OSError as exc:
             raise LeaseError("internal", f"archive {sha} could not be read: {exc}") from None
         try:
-            archive_mod.verify(data, sha)
             entries = archive_mod.read(data)
         except ArchiveError as exc:
             raise LeaseError("internal", f"archive {sha} rejected: {exc}") from None
