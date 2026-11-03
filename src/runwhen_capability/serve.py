@@ -49,8 +49,9 @@ plugin/lease.py). It needs the same opt-in as a bundle: hash verification proves
 is what the lease names, not that it is trustworthy, and papi sends workspace skills inline
 as arbitrary code. Without `--allow-bundles` (or RW_ALLOW_BUNDLES=1) it completes as a
 failed envelope with `invalid_input` (PLUGIN_CODE_NOT_ALLOWED) and nothing is written or
-run. Otherwise it is validated against the `lease` contract and run through the same child
-runner as a bundle, in its own scope, which is always wiped. The poll response's
+run (the envelope carries the lease's provenance when the lease is valid). Otherwise it is
+validated against the `lease` contract and run through the same child runner as a bundle,
+in its own scope, which is always wiped. The poll response's
 `materialized[]` (secret files and variables the runner produced) is written under
 `$RW_CREDENTIALS_DIR`, exported to the task and deleted at its end. The result POSTed is
 `{"status": "ok", "result": <the bare D64 result envelope>}` -- not the classic
@@ -102,7 +103,12 @@ from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
 from .models import BundleRequestEnvelope, TaskHostRequest, V13LeaseRequest
-from .plugin.lease import failed_envelope, run_lease, wipe_stale_credentials
+from .plugin.lease import (
+    attach_provenance,
+    failed_envelope,
+    run_lease,
+    wipe_stale_credentials,
+)
 from .relay import RelayClient
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
@@ -473,7 +479,9 @@ def _poll_once(
             "--allow-bundles",
             task_request.requestId,
         )
-        envelope = failed_envelope("invalid_input", PLUGIN_CODE_NOT_ALLOWED)
+        envelope = attach_provenance(
+            failed_envelope("invalid_input", PLUGIN_CODE_NOT_ALLOWED), task_request.request.doc
+        )
         body = _encode_result({"status": "ok", "result": envelope}, log)
         _post_result(session, relay, task_request.requestId, body, token_file, token, log)
         return

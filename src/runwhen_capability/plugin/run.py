@@ -41,6 +41,19 @@ the file is returned in `RunOutcome.artifacts` (`rwtask serve` passes an
 collected only from a task that exited 0. Outputs are optional: a task that writes none is
 `ok` with `outputs: {}`.
 
+Limits (CAP-7). `limits.resources.memory` of a lease (or `resources.memory` of the compiled
+task, for `rwtask run`) is a Kubernetes quantity (`256Mi`, `1Gi`, `512M`, `1000000`). On Linux
+it becomes the child's `RLIMIT_DATA`, set before the task's interpreter (or bash) starts and
+inherited by what the task runs: it caps the writable private memory the task allocates (heap,
+anonymous mappings, stack-like data; Linux 4.7+). Not `RLIMIT_AS`: that counts reserved
+address space, and Go binaries (kubectl, helm, flux, ...) reserve far more than they use, so
+they cannot even start under an address-space limit of 512Mi (measured; golang/go#38010),
+while the same kubectl starts under a `RLIMIT_DATA` of 128Mi. A task that dies out of memory
+under the limit is an `internal` error whose hint says so, unless it reported an error of its
+own. Elsewhere (macOS) the limit is not applied; that is logged once at debug level. The pod's
+cgroup limit, set by the runner, is the hard bound either way. `cpu` is advisory only: it is
+the platform's scheduling request, and nothing here enforces it.
+
 `resolve_target` turns a resource path into the lease's `target` (path, qualified type,
 identity), from the plugin's own integration types where the platform is its own.
 """
@@ -53,11 +66,13 @@ import logging
 import os
 import re
 import shutil
+import signal
 import tempfile
 import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
@@ -126,6 +141,8 @@ class RunSpec:
     settings: dict = field(default_factory=dict)
     dry_run: bool = False
     timeout_s: float | None = None
+    #: a memory quantity (`256Mi`) for the task's child; else the task's `resources.memory`
+    memory: str | None = None
 
 
 @dataclass
@@ -137,6 +154,18 @@ class RunOutcome:
     envelope: dict
     artifacts: dict[str, Path] = field(default_factory=dict)
     log_tail: str = ""
+
+
+def provenance_for_task(plugin: Mapping[str, Any], task: Mapping[str, Any]) -> dict:
+    """The `provenance` (VER-6) of a run of the compiled `task` of the compiled `plugin`
+    document: `{task, plugin, version, taskHash}`. What `rwtask run` stamps on its
+    envelope; a lease's is plugin/lease.py's `provenance_from_lease`."""
+    return {
+        "task": task["ref"],
+        "plugin": plugin["plugin"]["name"],
+        "version": plugin["plugin"]["version"],
+        "taskHash": task["hash"],
+    }
 
 
 # -- resolve_target ---------------------------------------------------------------
@@ -309,6 +338,33 @@ def _error(code: str, message: str, scope: str | None = None) -> dict:
     if scope:
         out["scope"] = scope[:1024]
     return out
+
+
+_QUANTITY = re.compile(r"^([0-9]+(?:\.[0-9]+)?)(m|k|M|G|T|Ki|Mi|Gi|Ti)?$")
+_QUANTITY_FACTORS = {
+    None: Decimal(1),
+    "m": Decimal("0.001"),
+    "k": Decimal(10) ** 3,
+    "M": Decimal(10) ** 6,
+    "G": Decimal(10) ** 9,
+    "T": Decimal(10) ** 12,
+    "Ki": Decimal(2) ** 10,
+    "Mi": Decimal(2) ** 20,
+    "Gi": Decimal(2) ** 30,
+    "Ti": Decimal(2) ** 40,
+}
+
+
+def parse_quantity_bytes(quantity: str) -> int:
+    """The bytes of a quantity as the `quantity` contract spells it (digits, an optional
+    fraction, an optional m/k/M/G/T/Ki/Mi/Gi/Ti suffix), rounded up: `256Mi` is 268435456,
+    `512M` 512000000, `1.5Gi` 1610612736, `1000000` itself. ValueError for anything else."""
+    match = _QUANTITY.match(quantity) if isinstance(quantity, str) else None
+    if match is None:
+        raise ValueError(f"{quantity!r} is not a quantity (such as 256Mi, 1Gi, 512M or 1000000)")
+    number, suffix = match.groups()
+    scaled = Decimal(number) * _QUANTITY_FACTORS[suffix]
+    return int(scaled.to_integral_value(rounding="ROUND_CEILING"))
 
 
 def _duration_seconds(text: str) -> float | None:
@@ -569,6 +625,14 @@ def execute(
     if timeout_s is None:
         timeout_s = float(bundle.DEFAULT_REQUEST_DEADLINE)
 
+    memory = spec.memory or (task.get("resources") or {}).get("memory")
+    memory_bytes: int | None = None
+    if memory is not None:
+        try:
+            memory_bytes = parse_quantity_bytes(memory) or None  # a limit of 0 is no limit
+        except ValueError as exc:
+            return failed([_error("invalid_input", f"the memory limit: {exc}")])
+
     redactor = Redactor([v for v in (*caller_env.values(), *redact) if v])
     files_dir = scope_dir / _PLUGIN_DIR
     rw_sdk_dir = scope_dir / ".rw-sdk"
@@ -618,6 +682,7 @@ def execute(
                 home=Path(os.environ["HOME"]) if inherit_home and "HOME" in os.environ else None,
                 path_prepend=path_prepend,
                 shim_env=shim_env,
+                memory_limit_bytes=memory_bytes,
             )
         except (bundle._LaunchError, OSError) as exc:
             return failed([_error("internal", str(exc))])
@@ -626,6 +691,19 @@ def execute(
 
         events = stream.events
         errors = errors_from_jsonl(scope_dir / bundle._ERRORS_FILE)
+        if (
+            memory_bytes is not None
+            and not errors
+            and not timed_out
+            and exit_code != 0
+            and _ran_out_of_memory(exit_code, log_tail)
+        ):
+            errors.append(
+                {
+                    **_error("internal", "the task ran out of memory"),
+                    "hint": f"the task exceeded its memory limit ({memory})",
+                }
+            )
         missing = sorted({e["name"] for e in events if e["op"] == "missing_command"})
         for name in missing:
             errors.append(_error("dependency", f"{name!r} is not installed (command not found)"))
@@ -686,6 +764,24 @@ def execute(
         if redactor and "reason" in envelope:
             envelope["reason"] = redactor.text(envelope["reason"])
     return finish(envelope, artifacts, log_tail)
+
+
+#: What a child prints when an allocation fails under RLIMIT_DATA: Python's MemoryError, the
+#: C library's ENOMEM text (bash, most tools), and the interpreter's own failure to start.
+_OUT_OF_MEMORY_TEXT = (
+    "MemoryError",
+    "Cannot allocate memory",
+    "out of memory",
+    "Out of memory",
+    "failed to map segment",
+)
+
+
+def _ran_out_of_memory(exit_code: int, log_tail: str) -> bool:
+    """Whether a failed child died of its memory limit: SIGKILL (a child that was not
+    killed for its deadline; the caller checks that), or a memory-exhaustion message in
+    what it printed. Conservative: any other failure stays the task's own."""
+    return exit_code == -signal.SIGKILL or any(t in log_tail for t in _OUT_OF_MEMORY_TEXT)
 
 
 def _check_outputs(task: dict, raw: dict[str, Any]) -> tuple[dict[str, Any], list[dict]]:

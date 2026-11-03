@@ -14,6 +14,15 @@ Every problem with the lease itself is an envelope, never an exception: `failed`
 (the code does not match its hash, cannot be read, or lacks the task's script) or
 `dependency` (an archive that is not in the cache: fetching one waits for DLV-9).
 
+Provenance (VER-6). Every envelope a lease produces carries `provenance` (the lease's task
+ref, plugin, version, task hash, the code's archive sha256, the runtime image and digest,
+`leaseId`, `taskRun`, and the first credential entry's `connection`): the ok, the failed,
+the timed out, and every refusal after the lease validated (a hash mismatch, a missing
+archive, a dry run the task does not support, plugin code switched off). A lease that does
+not validate gets none: its fields cannot be trusted. It is added in one place
+(`run_lease`, and `attach_provenance` for the opt-in refusal in serve.py), never by the
+paths that build the envelope.
+
 Credentials, new (lane C's contract): the poll response may also carry `materialized[]`
 (`auth-plan#/$defs/materializedCredential`: the runner's native auth plans, already
 executed). Each file is written under a fresh 0700 per-task directory of
@@ -93,6 +102,39 @@ def failed_envelope(code: str, message: str, scope: str | None = None) -> dict:
     return derive_envelope(exit_code=1, outputs={}, errors=[error], started_at=now, finished_at=now)
 
 
+def provenance_from_lease(lease: dict) -> dict:
+    """The `provenance` of an envelope of this lease. `lease` must satisfy the `lease`
+    contract. `connection` is the first credential entry that names one (a `runwhen/sync`
+    entry does not)."""
+    code = lease["code"]
+    leased = lease["task"]
+    provenance: dict[str, Any] = {
+        "task": leased["ref"],
+        "plugin": leased["plugin"],
+        "version": leased["version"],
+        "taskHash": leased["hash"],
+        "archiveSha256": (code.get("archive") or code["inline"])["sha256"],
+        "runtime": {"image": lease["runtime"]["image"], "digest": lease["runtime"]["digest"]},
+        "leaseId": lease["leaseId"],
+        "taskRun": lease["taskRun"],
+    }
+    connection = next(
+        (c["connection"] for c in lease["credentials"] if isinstance(c.get("connection"), str)),
+        None,
+    )
+    if connection is not None:
+        provenance["connection"] = connection
+    return provenance
+
+
+def attach_provenance(envelope: dict, doc: Any) -> dict:
+    """`envelope` with the provenance of the lease `doc`, unless `doc` does not satisfy the
+    `lease` contract (then it is returned as it is). For a refusal made before `run_lease`."""
+    if not validate("lease", doc):
+        envelope["provenance"] = provenance_from_lease(doc)
+    return envelope
+
+
 # -- the code ---------------------------------------------------------------------------
 
 
@@ -164,7 +206,8 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
     contract. The compiled-task-shaped `task` carries what `execute` reads (ref, skill,
     name, script, readOnly, dryRun, outputs) and no `inputs`/`inputSchema`/`settings`:
     a lease's inputs and settings are resolved by papi and used as given. The target and
-    its identity are the lease's own. `timeout_s` is `limits.timeout`. The run is a dry run
+    its identity are the lease's own. `timeout_s` is `limits.timeout` and `memory` is
+    `limits.resources.memory` (`cpu` is advisory and not read). The run is a dry run
     (`RW_DRY_RUN=1`, `dryRun: true` on the envelope) when the lease says `dryRun: true`; a
     task that does not declare `dryRun` refuses it (LeaseError invalid_input) before any
     code is read. Raises LeaseError."""
@@ -191,6 +234,7 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
         settings=dict(lease["settings"]),
         dry_run=dry_run,
         timeout_s=_duration_seconds(lease["limits"]["timeout"]),
+        memory=lease["limits"].get("resources", {}).get("memory"),
     )
 
 
@@ -405,6 +449,37 @@ def run_lease(
         return failed_envelope(
             "invalid_input", f"the lease is invalid: {first.path or '/'}: {first.message}"
         )
+    envelope = _run_valid_lease(
+        doc,
+        scope_dir=scope_dir,
+        credentials=credentials,
+        materialized=materialized,
+        deadline_s=deadline_s,
+        archive_cache=archive_cache,
+        secrets_root=secrets_root,
+        relay=relay,
+        output_decls=output_decls,
+        log=log,
+    )
+    envelope["provenance"] = provenance_from_lease(doc)
+    check("result-envelope", envelope)
+    return envelope
+
+
+def _run_valid_lease(
+    doc: dict,
+    *,
+    scope_dir: Path,
+    credentials: Mapping[str, str],
+    materialized: Sequence[Any],
+    deadline_s: float | None,
+    archive_cache: Path | None,
+    secrets_root: Path | None,
+    relay: RelayClient | None,
+    output_decls: Sequence[OutputDecl],
+    log: logging.Logger,
+) -> dict:
+    """The envelope of a lease that satisfies the `lease` contract, without provenance."""
     try:
         spec = runspec_from_lease(doc, archive_cache=archive_cache)
     except LeaseError as exc:
@@ -449,9 +524,7 @@ def run_lease(
             artifact_uploader=uploader,
             log=log,
         )
-        envelope = outcome.envelope
-        check("result-envelope", envelope)
-        return envelope
+        return outcome.envelope
     except LeaseError as exc:
         return failed_envelope(exc.code, exc.message, exc.scope)
     except OSError as exc:
@@ -470,9 +543,11 @@ def _task_secrets_dir(root: Path) -> Path:
 __all__ = [
     "LeaseError",
     "archive_cache_dir",
+    "attach_provenance",
     "credentials_dir",
     "failed_envelope",
     "load_code",
+    "provenance_from_lease",
     "relay_uploader",
     "run_lease",
     "runspec_from_lease",

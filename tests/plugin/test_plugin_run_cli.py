@@ -55,6 +55,27 @@ def test_a_successful_run_writes_result_yaml_and_exits_0(rwtask):
     assert "probe/py-ok: ok" in err
 
 
+def test_the_envelope_carries_provenance_from_the_compiled_task(rwtask):
+    from runwhen_capability.plugin import compile_tree, load_dir
+
+    compiled = compile_tree(load_dir(RUN_MINI))
+    task = next(t for t in compiled["tasks"] if t["ref"].endswith(":probe/py-ok"))
+    for name, expect in (("probe/py-ok", 0), ("probe/py-raise", 1)):
+        _, envelope, _ = rwtask(name, expect=expect)
+        provenance = envelope["provenance"]
+        assert provenance["task"].endswith(f":{name}")
+        assert provenance["plugin"] == compiled["plugin"]["name"]
+        assert provenance["version"] == compiled["plugin"]["version"]
+        assert provenance["taskHash"].startswith("sha256:")
+    _, envelope, _ = rwtask("probe/py-ok", expect=0)
+    assert envelope["provenance"] == {
+        "task": task["ref"],
+        "plugin": compiled["plugin"]["name"],
+        "version": compiled["plugin"]["version"],
+        "taskHash": task["hash"],
+    }
+
+
 def test_a_string_input_stays_raw_even_if_it_looks_like_json(rwtask):
     _, envelope, _ = rwtask("probe/sh-ok", "--input", "note=5", expect=0)
     assert envelope["outputs"]["probe"][0]["note"] == "5"

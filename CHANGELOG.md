@@ -13,6 +13,12 @@ with the wheel and sdist attached to the GitHub Release.
   types, credential types and permission schema are then checked like the plugin's own (no more
   `W_TYPE_UNCHECKED` for it), plus `E_REQUIRES_RANGE` (npm-style ranges, new `plugin.semver`) and
   `W_DEPENDENCY_UNUSED`. Library: `plugin.load_dependency`, `validate_tree(..., dependencies=)`.
+- Every result envelope of a lease carries `provenance` (VER-6): the task ref, plugin, version and
+  task hash, the code's sha256, the runtime image and digest, `leaseId`, `taskRun`, and the first
+  credential's `connection`. It is on ok, failed and timed-out envelopes and on every refusal after
+  the lease validated (code hash mismatch, archive not in the cache, a dry run the task does not
+  support, plugin code switched off); a lease that fails its own contract gets none. `rwtask run`
+  stamps `{task, plugin, version, taskHash}` from the compiled task.
 - `runwhen_capability.testing`, for unit-testing a skill's scripts without a runner: `make_context(...)`
   builds a real `Context` as the V13 executor does (and restores `os.environ` afterwards), with
   `.errors`, `.artifact(name)` and `.envelope(outputs)` (checked against `result-envelope`);
@@ -22,6 +28,12 @@ with the wheel and sdist attached to the GitHub Release.
 - `rwtask port <bundle-dir> --plugin <name> --into <skills-dir>` drafts a V13 `SKILL.md` and
   `tasks.yaml`, plus a porting brief, from a classic rw-cli Robot bundle. It never copies classic
   script bodies. Needs the new `port` extra (`robotframework>=7`).
+
+- A task's memory limit (CAP-7). A lease's `limits.resources.memory` (and a compiled task's
+  `resources.memory`, for `rwtask run`) is a Kubernetes quantity applied to the task's child as
+  `RLIMIT_DATA` on Linux (not `RLIMIT_AS`, which stops Go tools such as kubectl from starting); elsewhere it is not applied. A task that dies of it and reported no error of
+  its own fails `internal` with the hint "the task exceeded its memory limit (<quantity>)". `cpu` stays
+  advisory. `plugin.run.parse_quantity_bytes` reads the quantity.
 
 ### Fixed
 
