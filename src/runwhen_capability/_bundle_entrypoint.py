@@ -36,6 +36,9 @@ bundle.py's _execute() for exactly what it sets:
     RW_WORKDIR           Context.workdir
     RW_CAPABILITY        Context.capability
     RW_OPERATION         Context.operation
+    RW_LIB_DIR           the bundle's lib/ directory (it may not exist); put on
+                         sys.path, after everything already there, before the
+                         task file is imported
     RW_ARTIFACTS_DIR     the directory the host uploads artifacts from; here
                          `ctx.artifacts` writes into it (see main())
     RW_CREDENTIALS_FILE  a 0600 file holding Context credentials as JSON;
@@ -116,6 +119,12 @@ def main() -> int:
     artifacts_dir = os.environ.get("RW_ARTIFACTS_DIR")
     if artifacts_dir:
         ctx.artifacts = ArtifactsClient(ctx, local_sink=LocalArtifactSink(Path(artifacts_dir)))
+
+    # Appended, never prepended: a lib/json.py must not shadow the standard
+    # library or this SDK (the -P/-s flags keep the rest of sys.path trusted).
+    lib_dir = os.environ.get("RW_LIB_DIR")
+    if lib_dir and Path(lib_dir).is_dir():
+        sys.path.append(lib_dir)
 
     module_name = f"runwhen_capability_bundle_{uuid.uuid4().hex}"
     spec = importlib.util.spec_from_file_location(module_name, task_file)

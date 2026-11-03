@@ -78,6 +78,7 @@ _STANDARD_BASH_ENV = frozenset(
         "RW_OUTPUT_FD",
         "RW_ARTIFACTS_DIR",
         "RW_WORKDIR",
+        "RW_LIB_DIR",
         "RW_CAPABILITY",
         "RW_OPERATION",
     }
