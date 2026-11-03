@@ -5,9 +5,11 @@ contracts/vectors/archive/ (golden plugin archives).
 Each file is {"description": ..., "cases": [{"name", "input", "expected"}]} so
 a Go (or any other) implementation can replay it. Bytes are carried as
 base64 (`dataBase64`). Each archive case is a <case>.json (entries, sha256, size)
-plus the exact bytes <case>.tar. The case lists below are fixed; `expected` is computed
-by the Python reference implementation, and a test fails if the committed
-files differ from a fresh run. Run from the repo root:
+plus the exact bytes <case>.tar; archive/invalid/ holds hand-built malicious archives
+(<case>.json {description, expectedCode} + <case>.tar) that every reader must reject.
+The case lists below are fixed; `expected` is computed by the Python reference
+implementation, and a test fails if the committed files differ from a fresh run.
+Run from the repo root:
 
     PYTHONPATH=src python3 scripts/gen_vectors.py             # rewrite contracts/vectors/
     PYTHONPATH=src python3 scripts/gen_vectors.py --out DIR   # write somewhere else
@@ -241,6 +243,133 @@ ARCHIVE_CASES: dict[str, tuple[str, list[TreeEntry]]] = {
 }
 
 
+def _raw_header(
+    name: bytes,
+    size: int | bytes,
+    typeflag: bytes = b"0",
+    *,
+    linkname: bytes = b"",
+    magic: bytes = b"ustar\x0000",
+    realsize: int | None = None,
+    checksum_delta: int = 0,
+) -> bytes:
+    """A 512-byte ustar header written by hand (no tar library), so malicious
+    archives can be made that a library's own writer would refuse to produce.
+    `size` is an octal number or the raw 12-byte field; `checksum_delta` breaks
+    the checksum."""
+    header = bytearray(512)
+    header[0 : len(name)] = name
+    header[100:108] = b"0000644\x00"
+    header[108:124] = b"0000000\x00" * 2
+    header[124:136] = size if isinstance(size, bytes) else f"{size:011o}".encode() + b"\x00"
+    header[136:148] = b"00000000000\x00"
+    header[156:157] = typeflag
+    header[157 : 157 + len(linkname)] = linkname
+    header[257:265] = magic
+    if realsize is not None:  # GNU sparse 'realsize' field
+        header[483:495] = f"{realsize:011o}".encode() + b"\x00"
+    header[148:156] = b" " * 8
+    header[148:156] = f"{sum(header) + checksum_delta:06o}".encode() + b"\x00 "
+    return bytes(header)
+
+
+def _padded_block(data: bytes) -> bytes:
+    return data + bytes(-len(data) % 512)
+
+
+_END = bytes(1024)
+
+
+def _pax(records: dict[str, str]) -> bytes:
+    """pax extended-header data: '<len> key=value\\n' records."""
+    out = b""
+    for key, value in records.items():
+        body = f" {key}={value}\n".encode()
+        length = len(body) + 1
+        while len(str(length)) + len(body) != length:
+            length = len(str(length)) + len(body)
+        out += f"{length}".encode() + body
+    return out
+
+
+def _invalid_archives() -> dict[str, tuple[str, str, bytes]]:
+    """case -> (description, expectedCode, bytes). Hand-built; each one is an
+    archive a safe reader must reject."""
+    ok_member = _raw_header(b"plugin.yaml", 5) + _padded_block(b"hello")
+    pax_global = _pax({"path": "../../etc/evil", "size": "480000000"})
+    pax_extended = _pax({"path": "../../etc/evil"})
+    longname = b"a/" * 200 + b"evil\x00"
+    return {
+        "pax-global-path-override": (
+            "A pax global header ('g') that overrides the path and declared size of the "
+            "next member, which looks like a plain regular file; a generic tar library "
+            "folds it in silently.",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"pax_global_header", len(pax_global), b"g")
+            + _padded_block(pax_global)
+            + ok_member
+            + _END,
+        ),
+        "pax-extended-header": (
+            "A pax extended header ('x') that rewrites the next member's path.",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"PaxHeader/plugin.yaml", len(pax_extended), b"x")
+            + _padded_block(pax_extended)
+            + ok_member
+            + _END,
+        ),
+        "gnu-longname": (
+            "A GNU long-name entry ('L') carrying a path longer than ustar allows "
+            "(ustar magic, so only the typeflag gives it away).",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"././@LongLink", len(longname), b"L")
+            + _padded_block(longname)
+            + ok_member
+            + _END,
+        ),
+        "gnu-sparse": (
+            "A GNU sparse entry ('S') claiming a 480 MiB real size in a few bytes of archive.",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"sparse.bin", 5, b"S", realsize=480 * 1024 * 1024)
+            + _padded_block(b"hello")
+            + _END,
+        ),
+        "bad-checksum": (
+            "A well-formed regular file whose header checksum is off by one.",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"plugin.yaml", 5, checksum_delta=1) + _padded_block(b"hello") + _END,
+        ),
+        "symlink": (
+            "A symlink ('2') pointing at an absolute path.",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"link", 0, b"2", linkname=b"/etc/passwd") + ok_member + _END,
+        ),
+        "truncated-data": (
+            "A regular file declaring 5000 bytes but ending after 100, with no end marker.",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"plugin.yaml", 5000) + b"x" * 100,
+        ),
+        "trailing-garbage-after-end": (
+            "A valid archive followed, after the two zero blocks, by non-zero bytes.",
+            "E_INVALID_PLUGIN",
+            build_archive([TreeEntry("plugin.yaml", b"hello")]) + b"garbage" + bytes(505),
+        ),
+        "base256-size": (
+            "A size field in GNU base-256 form (high bit set) instead of octal.",
+            "E_INVALID_PLUGIN",
+            _raw_header(b"plugin.yaml", b"\x80" + bytes(10) + b"\x05")
+            + _padded_block(b"hello")
+            + _END,
+        ),
+        "declared-size-over-limit": (
+            "A regular file declaring 17 MiB (limit 16 MiB) with no bytes behind it: the "
+            "declared size is checked before any slicing.",
+            "E_ARCHIVE_TOO_LARGE",
+            _raw_header(b"big.bin", 17 * 1024 * 1024) + _END,
+        ),
+    }
+
+
 def build_archives() -> dict[str, bytes]:
     """relative path under the vectors dir -> bytes, for each archive case."""
     out: dict[str, bytes] = {}
@@ -263,6 +392,12 @@ def build_archives() -> dict[str, bytes]:
             json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
         ).encode()
         out[f"archive/{case}.tar"] = archive
+    for case, (description, code, archive) in _invalid_archives().items():
+        doc = {"description": description, "expectedCode": code}
+        out[f"archive/invalid/{case}.json"] = (
+            json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+        ).encode()
+        out[f"archive/invalid/{case}.tar"] = archive
     return out
 
 

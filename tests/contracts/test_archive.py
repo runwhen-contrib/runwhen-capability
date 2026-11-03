@@ -319,3 +319,74 @@ def test_golden_vector_replays(case):
     assert doc["sha256"] == archive_sha256(golden)
     verify(golden, doc["sha256"])
     assert read(golden) == _sorted(entries)
+
+
+# --- malicious archives -----------------------------------------------------
+
+_INVALID_CASES = [
+    "bad-checksum",
+    "base256-size",
+    "declared-size-over-limit",
+    "gnu-longname",
+    "gnu-sparse",
+    "pax-extended-header",
+    "pax-global-path-override",
+    "symlink",
+    "trailing-garbage-after-end",
+    "truncated-data",
+]
+
+
+def _invalid_cases():
+    folder = data_dir() / "vectors" / "archive" / "invalid"
+    return sorted(f.name[: -len(".json")] for f in folder.iterdir() if f.name.endswith(".json"))
+
+
+def test_invalid_vector_cases_present():
+    assert _invalid_cases() == _INVALID_CASES
+
+
+@pytest.mark.parametrize("case", _INVALID_CASES)
+def test_invalid_vector_is_rejected(case):
+    folder = data_dir() / "vectors" / "archive" / "invalid"
+    doc = json.loads((folder / f"{case}.json").read_text(encoding="utf-8"))
+    assert set(doc) == {"description", "expectedCode"}
+    assert _code(read, (folder / f"{case}.tar").read_bytes()) == doc["expectedCode"]
+
+
+def test_read_does_not_use_tarfile():
+    # A generic tar library folds pax/GNU extension headers into the next
+    # member; the reader must parse plain ustar itself.
+    assert not hasattr(archive_mod, "tarfile")
+
+
+def test_read_requires_two_zero_blocks_and_nothing_after():
+    one = build([TreeEntry("f", b"x")])
+    body = one[: 512 + 512]  # header + padded data
+    assert _code(read, body) == "E_INVALID_PLUGIN"  # no end marker at all
+    assert _code(read, body + bytes(512)) == "E_INVALID_PLUGIN"  # only one zero block
+    assert read(body + bytes(1024)) == [TreeEntry("f", b"x")]  # unpadded record is fine
+    assert _code(read, body + bytes(1024) + b"\x01") == "E_INVALID_PLUGIN"
+
+
+def test_read_rejects_wrong_magic_and_version():
+    data = bytearray(build([TreeEntry("f", b"x")]))
+    for offset, value in ((257, b"X"), (263, b"9")):
+        broken = bytearray(data)
+        broken[offset : offset + 1] = value
+        broken[148:156] = f"{sum(broken[:148]) + sum(broken[156:512]) + 32 * 8:06o}\0 ".encode()
+        assert _code(read, bytes(broken)) == "E_INVALID_PLUGIN"
+
+
+def test_read_checks_declared_size_against_the_limit_before_the_bytes(monkeypatch):
+    data = build([TreeEntry("f", b"x" * 100)])
+    monkeypatch.setattr(archive_mod, "MAX_FILE_BYTES", 99)
+    assert _code(read, data) == "E_ARCHIVE_TOO_LARGE"
+
+
+def test_read_directory_entry_with_data_is_invalid():
+    header = bytearray(build([TreeEntry("d", b"")])[:512])
+    header[156:157] = b"5"
+    header[124:136] = b"00000000001\x00"
+    header[148:156] = f"{sum(header[:148]) + sum(header[156:]) + 256:06o}\0 ".encode()
+    assert _code(read, bytes(header) + b"x".ljust(512, b"\0") + bytes(1024)) == "E_INVALID_PLUGIN"

@@ -23,8 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import io
-import tarfile
+import re
 import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -112,38 +111,81 @@ def build(entries: Iterable[TreeEntry]) -> bytes:
 def read(data: bytes) -> list[TreeEntry]:
     """Extract an archive to memory, sorted by the UTF-8 bytes of the path.
 
-    Accepts typeflag '0' entries, ignores '5' (directory) entries, ignores
-    uid/gid/mtime, and treats the owner exec bit as `executable`. Anything else
-    (symlinks, hardlinks, devices, fifos, pax/GNU specials), an unsafe or
-    colliding path, or a malformed tar is E_INVALID_PLUGIN; a limit is
-    E_ARCHIVE_TOO_LARGE. The hash matching is not proof of safety: callers
-    verify and read."""
+    Parses plain ustar headers directly -- never through a tar library, which
+    folds pax and GNU extension headers into the next member -- so every
+    entry's data is exactly the `size` bytes after its own 512-byte header and
+    the declared sizes are what the limits are checked against. Each header
+    needs a valid checksum, magic `ustar\\0` and version `00`. Typeflag '0' is a
+    file, '5' a directory entry (ignored, size 0); every other typeflag
+    (symlinks, hardlinks, devices, fifos, pax x/g, GNU L/K/S, NUL) is
+    E_INVALID_PLUGIN, as are an unsafe or colliding path, a non-octal size
+    (base-256), truncation, a missing second end block, or non-zero bytes after
+    the end. uid/gid/mtime are ignored; `executable` is the owner exec bit.
+    Exceeding a limit is E_ARCHIVE_TOO_LARGE. The hash matching is not proof of
+    safety: callers verify and read."""
     if len(data) > MAX_ARCHIVE_BYTES:
         raise _too_large(f"archive is {len(data)} bytes (limit {MAX_ARCHIVE_BYTES})")
     entries: list[TreeEntry] = []
-    try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
-            for member in tf:
-                if member.type == tarfile.DIRTYPE:
-                    continue
-                if member.type != tarfile.REGTYPE:
-                    raise _invalid(f"{member.name!r}: unsupported entry type {member.type!r}")
-                if len(entries) >= MAX_FILES:
-                    raise _too_large(f"more than {MAX_FILES} files")
-                if member.size > MAX_FILE_BYTES:
-                    raise _too_large(
-                        f"{member.name!r} is {member.size} bytes (limit {MAX_FILE_BYTES})"
-                    )
-                handle = tf.extractfile(member)
-                content = handle.read() if handle is not None else b""
-                if len(content) != member.size:
-                    raise _invalid(f"{member.name!r}: truncated")
-                entries.append(TreeEntry(member.name, content, bool(member.mode & 0o100)))
-    except ArchiveError:
-        raise
-    except (tarfile.TarError, EOFError, UnicodeError, ValueError) as exc:
-        raise _invalid(f"not a valid tar archive: {exc}") from exc
+    pos = 0
+    while True:
+        block = data[pos : pos + _BLOCK]
+        if len(block) < _BLOCK:
+            raise _invalid("truncated: no end-of-archive marker")
+        if block == _ZERO_BLOCK:
+            break
+        size, typeflag, path, mode = _parse_header(block)
+        pos += _BLOCK
+        if typeflag == b"5":
+            if size != 0:
+                raise _invalid("directory entry with data")
+            continue
+        if len(entries) >= MAX_FILES:
+            raise _too_large(f"more than {MAX_FILES} files")
+        if size > MAX_FILE_BYTES:
+            raise _too_large(f"{path!r} declares {size} bytes (limit {MAX_FILE_BYTES})")
+        end = pos + _padded(size, _BLOCK)
+        if end > len(data):
+            raise _invalid(f"{path!r}: truncated (declares {size} bytes)")
+        entries.append(TreeEntry(path, data[pos : pos + size], bool(mode & 0o100)))
+        pos = end
+    if data[pos + _BLOCK : pos + 2 * _BLOCK] != _ZERO_BLOCK:
+        raise _invalid("missing second end-of-archive block")
+    if data.count(0, pos + 2 * _BLOCK) != len(data) - pos - 2 * _BLOCK:
+        raise _invalid("non-zero bytes after the end-of-archive marker")
     return _validated(entries)
+
+
+_ZERO_BLOCK = bytes(_BLOCK)
+_OCTAL = re.compile(rb"[0-7]+")
+
+
+def _octal_field(field: bytes, what: str) -> int:
+    """A numeric header field: octal digits then NULs or spaces. Anything else
+    (empty, base-256, junk) is invalid."""
+    text = field.rstrip(b"\x00 ")
+    if not _OCTAL.fullmatch(text):
+        raise _invalid(f"header {what} field is not octal: {field!r}")
+    return int(text, 8)
+
+
+def _parse_header(block: bytes) -> tuple[int, bytes, str, int]:
+    """(size, typeflag, path, mode) of one ustar header, or E_INVALID_PLUGIN."""
+    stored = _octal_field(block[148:156].lstrip(b" "), "checksum")
+    if stored != sum(block[:148]) + 8 * 0x20 + sum(block[156:]):
+        raise _invalid("header checksum mismatch")
+    if block[257:263] != b"ustar\x00" or block[263:265] != b"00":
+        raise _invalid("not a ustar header (magic/version)")
+    typeflag = block[156:157]
+    if typeflag not in (b"0", b"5"):
+        raise _invalid(f"unsupported entry type {typeflag!r}")
+    size = _octal_field(block[124:136], "size")
+    mode = _octal_field(block[100:108], "mode")
+    try:
+        name = block[0:100].split(b"\x00", 1)[0].decode("utf-8")
+        prefix = block[345:500].split(b"\x00", 1)[0].decode("utf-8")
+    except UnicodeDecodeError:
+        raise _invalid("path is not valid UTF-8") from None
+    return size, typeflag, f"{prefix}/{name}" if prefix else name, mode
 
 
 def _validated(entries: Iterable[TreeEntry]) -> list[TreeEntry]:
