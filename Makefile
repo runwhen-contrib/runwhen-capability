@@ -1,4 +1,4 @@
-.PHONY: install test lint fmt fmt-check dist contracts-sync
+.PHONY: install test lint fmt fmt-check dist contracts-sync contracts-models
 
 install:
 	python3 -m pip install -e ".[dev]"
@@ -20,3 +20,6 @@ dist:
 
 contracts-sync:
 	python3 scripts/sync_contracts.py
+
+contracts-models:
+	python3 scripts/gen_contract_models.py

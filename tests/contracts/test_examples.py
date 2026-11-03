@@ -24,11 +24,9 @@ import re
 from pathlib import Path
 
 import pytest
+from _fixtures import fixture_id, fixtures, load_fixture, schema_of
 
-from runwhen_capability.contracts import SCHEMA_NAMES, validate
-from runwhen_capability.contracts._yaml12 import load_yaml, split_frontmatter
-
-EXAMPLES = Path(__file__).resolve().parents[2] / "contracts" / "examples"
+from runwhen_capability.contracts import SCHEMA_NAMES, load_yaml, validate
 
 # Shared definitions only, no document of their own.
 NO_EXAMPLE_NEEDED = {"common"}
@@ -38,36 +36,13 @@ NO_EXAMPLE_NEEDED = {"common"}
 KNOWN_FAILURES: dict[str, str] = {}
 
 
-def _load(path: Path):
-    text = path.read_text(encoding="utf-8")
-    return split_frontmatter(text)[0] if path.suffix == ".md" else load_yaml(text)
-
-
-def _fixtures(*, invalid: bool) -> list[Path]:
-    return sorted(
-        p
-        for p in EXAMPLES.rglob("*")
-        if p.is_file()
-        and p.suffix in {".yaml", ".md"}
-        and ("invalid" in p.relative_to(EXAMPLES).parts) == invalid
-    )
-
-
-def _rel(path: Path) -> str:
-    return path.relative_to(EXAMPLES).as_posix()
-
-
 def _valid_params():
-    for path in _fixtures(invalid=False):
+    for path in fixtures(invalid=False):
         marks = []
-        reason = KNOWN_FAILURES.get(_rel(path))
+        reason = KNOWN_FAILURES.get(fixture_id(path))
         if reason:
             marks.append(pytest.mark.xfail(strict=True, reason=reason))
-        yield pytest.param(path, id=_rel(path), marks=marks)
-
-
-def _schema_of(path: Path) -> str:
-    return path.relative_to(EXAMPLES).parts[0]
+        yield pytest.param(path, id=fixture_id(path), marks=marks)
 
 
 _EXPECT = re.compile(r"^# expect: (\S+) (.+)$")
@@ -79,7 +54,7 @@ def _expectation(path: Path) -> tuple[str, str]:
         if match:
             pointer, substring = match.groups()
             return ("" if pointer == '""' else pointer), substring.strip()
-    raise AssertionError(f"{_rel(path)}: no `# expect: <json-pointer> <substring>` line")
+    raise AssertionError(f"{fixture_id(path)}: no `# expect: <json-pointer> <substring>` line")
 
 
 def test_loader_keeps_timestamps_as_strings():
@@ -89,7 +64,7 @@ def test_loader_keeps_timestamps_as_strings():
 
 
 def test_fixture_directories_are_schemas():
-    unknown = {_schema_of(p) for p in _fixtures(invalid=False) + _fixtures(invalid=True)} - set(
+    unknown = {schema_of(p) for p in fixtures(invalid=False) + fixtures(invalid=True)} - set(
         SCHEMA_NAMES
     )
     assert not unknown, f"examples for schemas that do not exist: {sorted(unknown)}"
@@ -97,29 +72,29 @@ def test_fixture_directories_are_schemas():
 
 @pytest.mark.parametrize("path", _valid_params())
 def test_every_valid_example_validates(path: Path):
-    violations = validate(_schema_of(path), _load(path))
+    violations = validate(schema_of(path), load_fixture(path))
     assert not violations, "\n".join(f"{v.path or '(root)'}: {v.message}" for v in violations)
 
 
-@pytest.mark.parametrize("path", _fixtures(invalid=False), ids=_rel)
+@pytest.mark.parametrize("path", fixtures(invalid=False), ids=fixture_id)
 def test_valid_example_names_its_origin(path: Path):
     head = "\n".join(path.read_text(encoding="utf-8").splitlines()[:2])
-    assert "# source: " in head, f"{_rel(path)}: no `# source:` line"
+    assert "# source: " in head, f"{fixture_id(path)}: no `# source:` line"
     if "# source: synthetic" in head:
         assert path.name.startswith("synthetic-"), (
-            f"{_rel(path)}: synthetic fixtures are named synthetic-*"
+            f"{fixture_id(path)}: synthetic fixtures are named synthetic-*"
         )
     else:
         assert re.match(r"\d+[a-z]?-", path.name), (
-            f"{_rel(path)}: wiki fixtures are named <page>-<slug>"
+            f"{fixture_id(path)}: wiki fixtures are named <page>-<slug>"
         )
 
 
-@pytest.mark.parametrize("path", _fixtures(invalid=True), ids=_rel)
+@pytest.mark.parametrize("path", fixtures(invalid=True), ids=fixture_id)
 def test_every_invalid_example_fails_where_expected(path: Path):
     pointer, substring = _expectation(path)
-    violations = validate(_schema_of(path), _load(path))
-    assert violations, f"{_rel(path)} validated, but it should be rejected"
+    violations = validate(schema_of(path), load_fixture(path))
+    assert violations, f"{fixture_id(path)} validated, but it should be rejected"
     assert any(v.path == pointer and substring in v.message for v in violations), (
         f"expected a violation at {pointer or '(root)'} containing {substring!r}; got:\n"
         + "\n".join(f"  {v.path or '(root)'}: {v.message}" for v in violations)
@@ -127,6 +102,6 @@ def test_every_invalid_example_fails_where_expected(path: Path):
 
 
 def test_every_schema_has_an_example():
-    covered = {_schema_of(p) for p in _fixtures(invalid=False)}
+    covered = {schema_of(p) for p in fixtures(invalid=False)}
     missing = set(SCHEMA_NAMES) - NO_EXAMPLE_NEEDED - covered
     assert not missing, f"schemas with no valid example fixture: {sorted(missing)}"
