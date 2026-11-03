@@ -1,4 +1,4 @@
-# expect: /plugin is not valid under any of
+# expect: /plugin/version does not match
 # fixture: the workspace plugin only has a 0.0.0-rev.<n> version
 apiVersion: runwhen.com/compiled-plugin/v1
 compiler: { name: rwtask, version: 0.5.0 }

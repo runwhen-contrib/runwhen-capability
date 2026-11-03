@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -264,3 +266,43 @@ def test_the_temp_directory_goes_away_with_the_context_manager_and_workdir_is_ho
         assert out_dir.is_dir()
     assert not out_dir.exists()
     assert tmp_path.exists()
+
+
+def test_make_context_sets_the_reference_time_once():
+    before = datetime.now(UTC)
+    with make_context() as tc:
+        first = tc.ctx.now()
+        assert first == tc.ctx.now()
+        assert before.replace(microsecond=0) <= first <= datetime.now(UTC)
+        with tc.environ():
+            assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", os.environ["RW_NOW"])
+            assert os.environ["RW_NOW_EPOCH"] == str(int(first.timestamp()))
+
+
+def test_make_context_takes_an_explicit_now_and_a_script_sees_it():
+    fixed = datetime(2026, 11, 4, 9, 14, 2, 123456, tzinfo=UTC)
+    seen = {}
+
+    def script(ctx):
+        seen.update(env=os.environ["RW_NOW"], epoch=os.environ["RW_NOW_EPOCH"], now=ctx.now())
+        return {}
+
+    with make_context(now=fixed) as tc:
+        run_main(script, tc)
+    assert seen == {
+        "env": "2026-11-04T09:14:02.123Z",
+        "epoch": "1793783642",
+        "now": datetime(2026, 11, 4, 9, 14, 2, 123000, tzinfo=UTC),
+    }
+
+
+def test_make_context_refuses_a_naive_now():
+    with pytest.raises(ValueError, match="timezone"):
+        make_context(now=datetime(2026, 11, 4, 9, 0, 0))
+
+
+def test_the_reference_time_does_not_leak_into_the_environment(monkeypatch):
+    monkeypatch.delenv("RW_NOW", raising=False)
+    monkeypatch.delenv("RW_NOW_EPOCH", raising=False)
+    with make_context(now=datetime(2026, 11, 4, tzinfo=UTC)):
+        assert "RW_NOW" not in os.environ and "RW_NOW_EPOCH" not in os.environ

@@ -1069,6 +1069,7 @@ def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[st
     from .plugin.fixtures import dump_scenario
     from .plugin.run import RunSpec, execute
     from .plugin.shims import ShimSession
+    from .reftime import current_now
 
     who = "rwtask test --record"
     ref = f"{task['skill']}/{task['name']}"
@@ -1113,6 +1114,7 @@ def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[st
         return failure
 
     scope_dir = Path(tempfile.mkdtemp(prefix="rwtask-test-"))
+    now = current_now()  # the run's reference time: kept in the scenario, replayed as is
     try:
         with ShimSession.record(shims) as session:
             for tool in session.missing:
@@ -1127,6 +1129,7 @@ def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[st
                     inputs=inputs,
                     settings=settings,
                     dry_run=args.dry_run,
+                    now=now,
                 ),
                 scope_dir=scope_dir,
                 inherit_home=True,
@@ -1151,6 +1154,7 @@ def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[st
         expect=expect,
         header=_RECORD_HEADER,
         dry_run=args.dry_run,
+        now=now,
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(text, encoding="utf-8")
@@ -1233,6 +1237,7 @@ def _replay_v13(
                             inputs=scenario.inputs,
                             settings=scenario.settings,
                             dry_run=scenario.dry_run,
+                            now=scenario.now,
                         ),
                         scope_dir=scope_dir,
                         path_prepend=session.path_prepend,

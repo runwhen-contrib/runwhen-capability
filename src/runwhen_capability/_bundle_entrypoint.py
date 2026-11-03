@@ -49,9 +49,9 @@ bundle.py's _execute() for exactly what it sets:
                          run --allow-anonymous only)
     RW_ERRORS_FILE       the error side channel `ctx.error` appends to
     RW_OUT               a per-task writable directory (left to the task)
-    RW_RESOURCE_JSON, RW_SETTINGS_JSON, RW_DRY_RUN
-                         what `ctx.resource`, `ctx.settings` and `ctx.dry_run`
-                         read (set by the host when it has them)
+    RW_RESOURCE_JSON, RW_SETTINGS_JSON, RW_DRY_RUN, RW_NOW
+                         what `ctx.resource`, `ctx.settings`, `ctx.dry_run` and
+                         `ctx.now()` read (set by the host when it has them)
 
 The variables only this wrapper needs are removed from os.environ before the
 task's module is even imported, so nothing the task starts inherits them.

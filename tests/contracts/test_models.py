@@ -33,8 +33,12 @@ ROUND_TRIP_KNOWN: dict[str, str] = {}
 # -> the keyword datamodel-code-generator does not turn into a model constraint.
 MODEL_LOOSER_THAN_SCHEMA: dict[str, str] = {
     "compiled-plugin/invalid/workspace-plugin-with-release-version.yaml": (
-        "`plugin` is anyOf[plugin, workspace shape]; the plugin model accepts the name "
-        "`workspace` (reserved only by a `not: {enum}` it does not carry)"
+        "`plugin` is if/then/else on `name`; the generated model is a union that accepts "
+        "the name `workspace` (reserved only by a `not: {enum}` it does not carry)"
+    ),
+    "compiled-plugin/invalid/plugin-missing-version.yaml": (
+        "`plugin` is if/then/else on `name`; the generated union model does not carry the "
+        "branch's `required`, so a missing version is only caught by the schema"
     ),
     "connection/invalid/root-and-selector.yaml": (
         "root-level oneOf of `required` + `not: {required}` (exactly one of root/selector)"

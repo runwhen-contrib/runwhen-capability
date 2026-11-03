@@ -25,6 +25,9 @@ What the script is given, beyond the host's own environment:
 - `RW_SETTINGS_JSON` and bash `RW_SETTING_<NAME>` (compiled defaults overlaid by the spec);
 - inputs: keyword arguments (Python, snake_case) or `RW_INPUT_<NAME>` (bash);
 - `RW_DRY_RUN=1` under dry run, `RW_LIB_DIR` (the skill's lib/), `RW_OUT`, `RW_ERRORS_FILE`;
+- `RW_NOW` (RFC 3339 UTC, milliseconds, `Z`) and `RW_NOW_EPOCH` (integer seconds): the run's
+  reference time, taken once when the run starts unless `RunSpec.now` carries one
+  (`rwtask test` replays a scenario at the time it was recorded at); `ctx.now()` reads it;
 - whatever the caller passes as `extra_env` (materialized credentials), which may not
   name a reserved variable (RW_*, HOME, PATH, ...) or a host-only one.
 
@@ -89,6 +92,7 @@ from ..custom.manifest import (
     task_file_language,
 )
 from ..envelope import derive_envelope, errors_from_jsonl
+from ..reftime import check_aware, current_now, now_env
 from .shims import SHIM_ENV_NAMES
 from .tree import PluginTree
 
@@ -143,6 +147,13 @@ class RunSpec:
     timeout_s: float | None = None
     #: a memory quantity (`256Mi`) for the task's child; else the task's `resources.memory`
     memory: str | None = None
+    #: the run's reference time (`RW_NOW`, `ctx.now()`): an aware datetime; else the run's
+    #: start. `rwtask test` replays a scenario at the time it was recorded at
+    now: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.now is not None:
+            check_aware(self.now)
 
 
 @dataclass
@@ -517,6 +528,7 @@ def _v13_env(
     inputs: dict,
     settings: dict,
     language: str,
+    run_started_at: datetime,
 ) -> dict[str, str]:
     env = {"RW_TASK_CONTRACT": "v13", "RW_SETTINGS_JSON": json.dumps(settings)}
     for name, value in settings.items():
@@ -535,6 +547,7 @@ def _v13_env(
             env[f"RW_INPUT_{input_env_name(name)}"] = _env_text(value)
     if spec.dry_run:
         env["RW_DRY_RUN"] = "1"
+    env.update(now_env(spec.now if spec.now is not None else run_started_at))
     return env
 
 
@@ -573,6 +586,8 @@ def execute(
     task = spec.task
     caller_env = check_extra_env(extra_env or {})
     started_at = datetime.now(UTC)
+    # The run's reference time (RW_NOW), taken once here unless the spec carries one.
+    run_started_at = current_now()
 
     def finish(
         envelope: dict, artifacts: dict[str, Path] | None = None, log_tail: str = ""
@@ -652,7 +667,11 @@ def execute(
     # and its relative paths were written for the caller's directory, not the scope's.
     # Not part of caller_env: those values are redacted from the result, a path is not secret.
     caller_paths = resolve_credential_paths(os.environ) if inherit_home else {}
-    env = {**caller_paths, **caller_env, **_v13_env(spec, inputs, settings, language)}
+    env = {
+        **caller_paths,
+        **caller_env,
+        **_v13_env(spec, inputs, settings, language, run_started_at),
+    }
     skill = task["skill"]
     plugin_name = task["ref"].split(":", 1)[0]
     started_at = datetime.now(UTC)

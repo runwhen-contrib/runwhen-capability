@@ -17,8 +17,9 @@
 
 `make_context` builds a real `Context` the way the V13 executor does (plugin/run.py): the
 same environment (`RW_TASK_CONTRACT=v13`, `RW_RESOURCE_JSON`, `RW_SETTINGS_JSON`,
-`RW_DRY_RUN`, `RW_OUT`, `RW_ERRORS_FILE`), so `ctx.resource` keys are verbatim, `ctx.settings`
-names are snake_cased at the top level only, `ctx.run` raises `RwCommandError` on a non-zero
+`RW_DRY_RUN`, `RW_NOW`, `RW_NOW_EPOCH`, `RW_OUT`, `RW_ERRORS_FILE`), so `ctx.resource` keys
+are verbatim, `ctx.now()` is fixed (pass `now=` to choose it), `ctx.settings` names are
+snake_cased at the top level only, `ctx.run` raises `RwCommandError` on a non-zero
 exit, and `ctx.error` writes the side channel. `settings` takes the names as `tasks.yaml`
 declares them (camelCase). Pass `v13=False` for the classic contract (`ctx.run` returns on a
 non-zero exit unless `check=True`).
@@ -51,6 +52,7 @@ from .context import Context
 from .contracts import check as check_contract
 from .envelope import derive_envelope, errors_from_jsonl
 from .errors import SkipTask
+from .reftime import current_now, now_env
 from .rwerrors import RwError
 
 __all__ = ["TestContext", "make_context", "run_main", "stub_commands"]
@@ -180,12 +182,16 @@ def make_context(
     dry_run: bool = False,
     workdir: Path | None = None,
     v13: bool = True,
+    now: datetime | None = None,
 ) -> TestContext:
     """A `TestContext` whose `.ctx` is a real `Context`, built as the V13 executor builds
     it. `resource` is `ctx.resource` verbatim (identity fields plus `path` and `type`;
     None: `ctx.resource` is None); `settings` are the task's settings by their declared
-    names; `workdir` is `ctx.workdir` (default: a directory inside the temporary one).
-    See the module docstring for the example."""
+    names; `workdir` is `ctx.workdir` (default: a directory inside the temporary one);
+    `now` is the run's reference time, `ctx.now()` and `RW_NOW`/`RW_NOW_EPOCH` (an aware
+    datetime; default: the moment of this call, fixed for the context). See the module
+    docstring for the example."""
+    reference = now_env(now if now is not None else current_now())
     root = Path(tempfile.mkdtemp(prefix="rw-testing-"))
     try:
         out_dir = root / "out"
@@ -201,6 +207,7 @@ def make_context(
             "RW_DRY_RUN": "1" if dry_run else None,
             "RW_OUT": str(out_dir),
             "RW_ERRORS_FILE": str(errors_file),
+            **reference,
         }
         with _scoped_environ(env):
             ctx = Context(capability="test", operation="test", workdir=Path(workdir))

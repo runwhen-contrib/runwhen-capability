@@ -29,35 +29,24 @@
       "additionalProperties": false
     },
     "plugin": {
-      "description": "plugin.yaml as authored, or the synthetic `workspace` plugin a workspace skill revision compiles to (plugin.schema keeps `workspace` reserved, so authors cannot use it).",
-      "anyOf": [
-        {
-          "$ref": "https://schemas.runwhen.com/plugin/v1.json"
+      "description": "plugin.yaml as authored, or the synthetic `workspace` plugin a workspace skill revision compiles to (plugin.schema keeps `workspace` reserved, so authors cannot use it). Discriminated by `name`, so a broken plugin block reports the exact field.",
+      "if": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "const": "workspace"
+          }
         },
-        {
-          "type": "object",
-          "properties": {
-            "name": {
-              "const": "workspace"
-            },
-            "version": {
-              "type": "string",
-              "pattern": "^0\\.0\\.0-rev\\.[1-9][0-9]*$"
-            },
-            "description": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 1024
-            }
-          },
-          "required": [
-            "name",
-            "version",
-            "description"
-          ],
-          "additionalProperties": false
-        }
-      ]
+        "required": [
+          "name"
+        ]
+      },
+      "then": {
+        "$ref": "#/$defs/workspacePlugin"
+      },
+      "else": {
+        "$ref": "https://schemas.runwhen.com/plugin/v1.json"
+      }
     },
     "integration": {
       "oneOf": [
@@ -806,6 +795,29 @@
           "additionalProperties": false
         }
       ]
+    },
+    "workspacePlugin": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "const": "workspace"
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^0\\.0\\.0-rev\\.[1-9][0-9]*$"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "description"
+      ],
+      "additionalProperties": false
     }
   }
 }
