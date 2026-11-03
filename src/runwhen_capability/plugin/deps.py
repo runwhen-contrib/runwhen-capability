@@ -10,7 +10,7 @@ the pieces `validate_tree(tree, dependencies={name: dep})` needs:
     load_dependency("kubernetes")                    # the highest version in the cache
 
 The cache is `$RUNWHEN_PLUGIN_CACHE` (default `~/.cache/runwhen/plugins`), laid out as
-`<name>/<version>.compiled.json`; `rwtask pull` (AUT-1) fills it later.
+`<name>/<version>.compiled.json`; `rwtask pull` (AUT-1, pull.py) fills it.
 """
 
 from __future__ import annotations
@@ -121,8 +121,13 @@ def _from_file(path: Path) -> CompiledDependency:
         raise DependencyError(f"{path}: {exc}") from exc
 
 
+def cache_root(cache_dir: Path | None = None) -> Path:
+    """The plugin cache directory: `cache_dir`, else $RUNWHEN_PLUGIN_CACHE, else the default."""
+    return (cache_dir or Path(os.environ.get(CACHE_ENV, DEFAULT_CACHE))).expanduser()
+
+
 def _from_cache(name: str, version: str | None, cache_dir: Path | None) -> CompiledDependency:
-    root = (cache_dir or Path(os.environ.get(CACHE_ENV, DEFAULT_CACHE))).expanduser() / name
+    root = cache_root(cache_dir) / name
     if version is None:
         present = (
             [p.name[: -len(_SUFFIX)] for p in root.glob(f"*{_SUFFIX}")] if root.is_dir() else []

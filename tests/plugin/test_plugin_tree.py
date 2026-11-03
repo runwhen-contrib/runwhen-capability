@@ -327,3 +327,18 @@ def test_data_of_helper_sanity():
     edited = edit(kube_entries(), "plugin.yaml", "0.1.0", "0.2.0")
     assert load_entries(edited).plugin["version"] == "0.2.0"
     assert TreeEntry("a", b"").path == "a"
+
+
+def test_load_entries_drops_the_lock_and_editor_schemas_like_root_tests():
+    from runwhen_capability.contracts import TreeEntry
+    from runwhen_capability.plugin import load_entries
+
+    entries = [
+        TreeEntry("plugin.yaml", b"name: p\nversion: 0.1.0\ndescription: d\n"),
+        TreeEntry("runwhen.lock", b"lockfileVersion: 1\n"),
+        TreeEntry(".runwhen/schemas/tasks.schema.json", b"{}"),
+        TreeEntry(".runwhen/README", b"x"),
+    ]
+    tree = load_entries(entries)
+    assert not [d for d in tree.diagnostics if d.code == "E_PATH_NOT_ALLOWED"]
+    assert set(tree.files) == {"plugin.yaml"}

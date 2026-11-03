@@ -7,6 +7,17 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `rwtask pull [--plugin-dir DIR] [--from git+URL|DIR | --registry URL] [--frozen] [name[@range] ...]`
+  (AUT-1) resolves a plugin's `requires`/`extends` (not `platform`) to exact versions and fills the
+  plugin cache (`<name>/<version>.compiled.json` + `.tar`, written atomically; a cached archive that
+  hashes differently is an error). Git sources use tags `<name>/v<semver>` with the plugin at
+  `plugins/<name>` (shallow, blob-filtered fetch; exec bits kept); a registry source verifies each
+  archive's sha256. The result is pinned in `runwhen.lock` (range, version, archive sha256,
+  source), which `--frozen` installs as is and fails on if missing or stale (CI), and `rwtask
+  validate|compile` now load the pinned versions from the cache when no `--with` names them (a
+  cached archive that differs from the lock exits 2). `pull` also writes self-contained editor
+  schemas to `.runwhen/schemas/` with a README for yaml-language-server. `runwhen.lock` is not part
+  of the plugin archive. Library: `plugin.pull`, `plugin.lock`, `plugin.editor`.
 - `rwtask validate|compile <dir> --with SPEC` (repeatable) validates a plugin against the plugins it
   `requires`/`extends` (INT-2): SPEC is a plugin directory, a `*.compiled.json` or `name[@version]`
   from `$RUNWHEN_PLUGIN_CACHE` (default `~/.cache/runwhen/plugins`). The required integration's

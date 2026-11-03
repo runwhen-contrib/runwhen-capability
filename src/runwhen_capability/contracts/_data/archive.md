@@ -31,8 +31,10 @@ bytes for the same version is rejected with `E_VERSION_CONFLICT`; the first arch
   working copy: untracked and ignored files can never leak in.
 - There is **no wrapper directory**: `plugin.yaml` is at the archive root, next to `integration/`,
   `skills/`, `rules/`, `knowledge/`, `runtimes/`-free (runtimes are images, D34).
-- **Excluded:** `tests/` at the archive root (recorded fixtures are CI evidence and can be large; no
-  consumer of the archive needs them), and nothing else.
+- **Excluded**, all at the archive root only: `tests/` (recorded fixtures are CI evidence and can be
+  large; no consumer of the archive needs them), `runwhen.lock` and `.runwhen/` (the author's pinned
+  dependencies and editor schemas written by `rwtask pull`, AUT-1; contracts-v3 addendum), and
+  nothing else. `rwtask compile`, `rwtask pull` and the registry apply the same exclusions.
 - **Rejected** (`E_INVALID_PLUGIN`, the version is not ingested): symlinks, submodules (gitlinks),
   any path that after normalisation is absolute, contains `..`, `\`, a NUL or a control character,
   is not valid UTF-8 NFC, exceeds 255 bytes, or collides case-insensitively with another path.
