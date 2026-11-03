@@ -124,7 +124,37 @@ What a script sees (the runner and `rwtask run` set the same names):
 | Settings | `ctx.settings.<snake_name>` | `RW_SETTING_<NAME>` |
 | Credential | the tool reads its standard form (`$KUBECONFIG`, `PG*`, `REDIS_URL`) | same |
 | Dry run | `ctx.dry_run` | `RW_DRY_RUN=1` |
-| Outputs | the returned dict; `ctx.error(code, msg, scope=, hint=, details=)`; `raise RwError(code, msg)` | `rw_output_append <name> <json>`; `rw_error <code> "<msg>"`; files in `$RW_OUT` |
+| Contract | `RW_TASK_CONTRACT=v13` | `RW_TASK_CONTRACT=v13` |
+| Outputs | the returned dict; `ctx.error(code, msg, scope=, hint=, details=)`; `raise RwError(code, msg)` | `rw_output_append <name> <json>`; `rw_output_set <name> <json>`; `rw_error <code> <msg> [scope]`; files in `$RW_OUT` |
+| Files | `$RW_OUT` (scratch and artifact files), `$RW_LIB_DIR` | `$RW_OUT`, `$RW_LIB_DIR` |
+
+**`RW_TASK_CONTRACT=v13`** is how a script tells the V13 contract from a classic
+bundle's, and both the runner and `rwtask run` set it. Under it `ctx.run` raises
+`RwCommandError` (an `RwError` whose code comes from the command's stderr) on a
+non-zero exit by default; classic bundles keep returning the exit status unless
+`check=True`. An explicit `check=` always wins.
+
+**bash.** A task runs under `set -euo pipefail` with `rw.sh` already loaded: call
+the helpers without sourcing anything.
+
+| Helper | What it does |
+|---|---|
+| `rw_output_append <name> <json>` | append one JSON value to a list-shaped output |
+| `rw_output_set <name> <json>` | set (replace) an output's value |
+| `rw_error <code> <msg> [scope]` | record a structured error (`code` is one of the closed list under Result envelope) and carry on; a clean exit with errors is `partial`, the exit status alone decides `failed` |
+| `rw_skip [reason]` | end the task `skipped`, exit 0 |
+| `rw_artifact <name> <path>` | register a file as an artifact output (or write it to `$RW_OUT/<name>`) |
+
+`$RW_OUT` is a directory fresh for this task, free to write to; the file named
+after an artifact output is what the platform stores. `$RW_LIB_DIR` is the
+skill's `lib/` directory, for sourcing shared code (`source "$RW_LIB_DIR/x.sh"`).
+Stdout and stderr are logs and are never parsed for outputs.
+
+**Testing a script.** `runwhen_capability.testing` (`make_context`, `run_main`,
+`stub_commands`) builds the same context and environment the runner does, so a
+Python script's unit test sees `ctx.resource`, `ctx.settings`, `ctx.run` and
+`ctx.error` with the V13 semantics and no cluster. `rwtask test` replays
+recorded CLI calls through PATH shims, for bash and Python scripts alike.
 
 `<NAME>` is the camelCase name in SCREAMING_SNAKE (`latencyThresholdMs` →
 `RW_SETTING_LATENCY_THRESHOLD_MS`). Identity fields are the integration's
