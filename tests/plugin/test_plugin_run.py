@@ -3,11 +3,13 @@ Every envelope is checked against the result-envelope contract."""
 
 from __future__ import annotations
 
+import re
 import shutil
 import stat
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -794,3 +796,102 @@ def test_a_go_binary_starts_under_a_realistic_memory_limit(tmp_path):
     )
     assert validate_contract("result-envelope", outcome.envelope) == []
     assert outcome.envelope["status"] == "ok", outcome.envelope["errors"]
+
+
+# -- the run's reference time (RW_NOW, RW_NOW_EPOCH, ctx.now) -------------------------------
+
+_NOW_FORMAT = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+
+_NOW_PY = b"""\
+import os
+
+
+def main(ctx):
+    return {
+        "out": {
+            "env": os.environ.get("RW_NOW", "unset"),
+            "epoch": os.environ.get("RW_NOW_EPOCH", "unset"),
+            "ctx": ctx.now().isoformat(),
+            "tz": str(ctx.now().utcoffset()),
+        }
+    }
+"""
+
+_NOW_SH = b"""\
+rw_output_set out "{\\"env\\":\\"${RW_NOW-unset}\\",\\"epoch\\":\\"${RW_NOW_EPOCH-unset}\\"}"
+"""
+
+
+def _now_task(script):
+    return {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": script,
+        "inputs": {},
+        "inputSchema": {"type": "object"},
+        "settings": {},
+        "outputs": {"out": {"jsonSchema": {"type": "object"}}},
+    }
+
+
+def _run_now(tmp_path, language="py", **spec_fields):
+    script = f"scripts/t.{language}"
+    body = _NOW_PY if language == "py" else _NOW_SH
+    outcome = execute(
+        RunSpec(task=_now_task(script), files={script: body}, **spec_fields),
+        scope_dir=tmp_path / "scope",
+    )
+    assert outcome.envelope["errors"] == [], outcome.log_tail
+    return outcome.envelope["outputs"]["out"]
+
+
+def test_a_python_task_gets_one_reference_time_for_the_whole_run(tmp_path):
+    before = datetime.now(UTC).replace(microsecond=0)
+    out = _run_now(tmp_path)
+    after = datetime.now(UTC)
+    assert _NOW_FORMAT.match(out["env"]), out
+    stamp = datetime.fromisoformat(out["env"])
+    assert before <= stamp <= after
+    assert out["epoch"] == str(int(stamp.timestamp()))
+    assert datetime.fromisoformat(out["ctx"]) == stamp
+    assert out["tz"] == "0:00:00"
+
+
+def test_a_bash_task_sees_rw_now_and_rw_now_epoch(tmp_path):
+    out = _run_now(tmp_path, "sh")
+    assert _NOW_FORMAT.match(out["env"]), out
+    assert out["epoch"] == str(int(datetime.fromisoformat(out["env"]).timestamp()))
+
+
+def test_an_explicit_now_is_what_the_task_sees(tmp_path):
+    fixed = datetime(2026, 11, 4, 9, 14, 2, 123456, tzinfo=UTC)
+    out = _run_now(tmp_path, now=fixed)
+    assert out["env"] == "2026-11-04T09:14:02.123Z"  # millisecond precision, truncated
+    assert out["epoch"] == "1793783642"
+    assert out["ctx"] == "2026-11-04T09:14:02.123000+00:00"
+
+
+def test_an_explicit_now_in_another_zone_is_given_in_utc(tmp_path):
+    fixed = datetime(2026, 11, 4, 11, 14, 2, tzinfo=timezone(timedelta(hours=2)))
+    assert _run_now(tmp_path, now=fixed)["env"] == "2026-11-04T09:14:02.000Z"
+
+
+def test_a_naive_explicit_now_is_refused():
+    with pytest.raises(ValueError, match="timezone"):
+        RunSpec(task={}, files={}, now=datetime(2026, 11, 4, 9, 0, 0))
+
+
+def test_a_task_cannot_be_given_rw_now_through_extra_env(tmp_path):
+    for name in ("RW_NOW", "RW_NOW_EPOCH"):
+        with pytest.raises(ValueError, match="may not set"):
+            execute(
+                RunSpec(task=_now_task("scripts/t.py"), files={"scripts/t.py": _NOW_PY}),
+                scope_dir=tmp_path / "scope",
+                extra_env={name: "x"},
+            )
+
+
+def test_a_host_rw_now_is_not_inherited(tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_NOW", "1999-01-01T00:00:00.000Z")
+    assert _run_now(tmp_path)["env"] != "1999-01-01T00:00:00.000Z"

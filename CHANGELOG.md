@@ -7,6 +7,15 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- A reference time for every V13 task run (lane F): the executor (`plugin/run.py` `execute`, so
+  `rwtask run`, `rwtask test` and the lease executor) sets `RW_NOW` (RFC 3339 UTC, milliseconds,
+  `Z`) and `RW_NOW_EPOCH` (integer seconds) once at the start of the run, or from the new
+  `RunSpec.now`; `ctx.now()` returns it as an aware UTC datetime (the wall clock without
+  `RW_NOW`). `rwtask test --record` writes it as the scenario's optional `now:` and replay runs
+  the task at that time, so an argv that carries the time (`kubectl.kubernetes.io/restartedAt`,
+  `reconcile.fluxcd.io/requestedAt`) replays exactly; a scenario without `now` replays with a
+  fresh time, as before. `runwhen_capability.testing.make_context(..., now=)` sets it likewise.
+  `RW_NOW`/`RW_NOW_EPOCH` are reserved and standard bash environment for the validator.
 - `rwtask pull [--plugin-dir DIR] [--from git+URL|DIR | --registry URL] [--frozen] [name[@range] ...]`
   (AUT-1) resolves a plugin's `requires`/`extends` (not `platform`) to exact versions and fills the
   plugin cache (`<name>/<version>.compiled.json` + `.tar`, written atomically; a cached archive that

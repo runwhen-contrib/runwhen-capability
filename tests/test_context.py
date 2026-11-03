@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import UTC, datetime
 
 import pytest
 
@@ -328,3 +329,37 @@ def test_an_explicit_check_wins_under_either_contract(tmp_path, monkeypatch):
     monkeypatch.delenv("RW_TASK_CONTRACT")
     with pytest.raises(RwCommandError):
         _ctx(tmp_path).run([sys.executable, "-c", "raise SystemExit(4)"], check=True)
+
+
+# -- ctx.now(): the run's reference time ---------------------------------------------
+
+
+def test_now_is_rw_now_parsed_as_an_aware_utc_datetime(tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_NOW", "2026-11-04T09:14:02.123Z")
+    ctx = _ctx(tmp_path)
+    assert ctx.now() == datetime(2026, 11, 4, 9, 14, 2, 123000, tzinfo=UTC)
+    assert ctx.now().utcoffset().total_seconds() == 0
+    assert ctx.now() == ctx.now()  # one reference time, however often it is asked
+
+
+def test_now_is_read_when_the_context_is_built(tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_NOW", "2026-11-04T09:14:02.123Z")
+    ctx = _ctx(tmp_path)
+    monkeypatch.setenv("RW_NOW", "2030-01-01T00:00:00.000Z")
+    assert ctx.now().year == 2026
+
+
+def test_now_without_rw_now_is_the_wall_clock(tmp_path, monkeypatch):
+    monkeypatch.delenv("RW_NOW", raising=False)
+    ctx = _ctx(tmp_path)
+    before = datetime.now(UTC)
+    got = ctx.now()
+    assert before <= got <= datetime.now(UTC)
+    assert got.tzinfo is not None and got.utcoffset().total_seconds() == 0
+
+
+def test_now_refuses_an_rw_now_that_is_not_a_utc_timestamp(tmp_path, monkeypatch):
+    for bad in ("yesterday", "2026-11-04T09:14:02", "2026-11-04T09:14:02+02:00", "1793783642"):
+        monkeypatch.setenv("RW_NOW", bad)
+        with pytest.raises(ValueError, match="RW_NOW"):
+            _ctx(tmp_path).now()

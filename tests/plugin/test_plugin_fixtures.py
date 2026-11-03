@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -606,3 +607,36 @@ def test_dry_run_loads_dumps_and_defaults_false(tmp_path):
     text = dump_scenario(**kw, dry_run=True)
     assert "dryRun: true\n" in text
     assert load_scenario(write(tmp_path, text, "f.yaml")).dry_run is True
+
+
+# -- now (the run's reference time) --------------------------------------------------------------
+
+
+def test_now_loads_dumps_and_defaults_to_none(tmp_path):
+    assert load_scenario(write(tmp_path, "expect: {status: ok}\n")).now is None
+    text = 'now: "2026-11-04T09:14:02.123Z"\nexpect: {status: ok}\n'
+    scenario = load_scenario(write(tmp_path, text, "n.yaml"))
+    assert scenario.now == datetime(2026, 11, 4, 9, 14, 2, 123000, tzinfo=UTC)
+    kw = dict(resource=None, inputs={}, settings={}, identity={}, calls=[], expect={"status": "ok"})
+    assert "now" not in dump_scenario(**kw)
+    dumped = dump_scenario(**kw, now=scenario.now)
+    assert (
+        'now: "2026-11-04T09:14:02.123Z"\n' in dumped
+        or "now: '2026-11-04T09:14:02.123Z'\n" in dumped
+    )
+    assert load_scenario(write(tmp_path, dumped, "d.yaml")).now == scenario.now
+
+
+def test_an_unquoted_now_is_still_text(tmp_path):
+    # the contracts loader is YAML 1.2 core: no timestamp type, so quoting is optional
+    text = "now: 2026-11-04T09:14:02.123Z\nexpect: {status: ok}\n"
+    assert load_scenario(write(tmp_path, text)).now.year == 2026
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["yesterday", "2026-11-04T09:14:02", "2026-11-04T09:14:02+02:00", "2026-13-04T09:14:02Z"],
+)
+def test_now_must_be_a_utc_rfc3339_timestamp(tmp_path, value):
+    with pytest.raises(FixtureError, match="now"):
+        load_scenario(write(tmp_path, f'now: "{value}"\nexpect: {{status: ok}}\n'))

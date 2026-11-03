@@ -87,6 +87,8 @@ _STANDARD_BASH_ENV = frozenset(
         "RW_SETTINGS_JSON",
         "RW_DRY_RUN",
         "RW_TASK_CONTRACT",
+        "RW_NOW",
+        "RW_NOW_EPOCH",
         # `rwtask test`'s PATH shims (plugin/shims.py)
         "RW_SHIM_MODE",
         "RW_SHIM_LOG",

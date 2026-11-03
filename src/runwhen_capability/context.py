@@ -14,6 +14,7 @@ import signal
 import subprocess
 import threading
 from collections.abc import Iterator, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,7 @@ from .errors import CredentialNotFoundError, OutputTooLargeError, SkipTask
 from .findings import FindingsClient
 from .git import GitClient
 from .models import InputArtifactDecl, OutputDecl
+from .reftime import NOW_ENV, parse_now
 from .repo_fs import RepoFsClient
 from .rwerrors import ERROR_CODES, RwCommandError, RwError, classify_command_error
 from .sarif import SARIF_BYTE_BUDGET, SarifClient
@@ -257,6 +259,7 @@ class Context:
         self.resource: AttrView | None = _json_object_env("RW_RESOURCE_JSON", snake=False)
         self.settings: AttrView = _json_object_env("RW_SETTINGS_JSON", snake=True) or AttrView({})
         self.dry_run: bool = os.environ.get("RW_DRY_RUN") == "1"
+        self._reference_time: str | None = os.environ.get(NOW_ENV) or None
         # "v13": the host runs this task under the V13 contract (D42), where ctx.run
         # fails on a non-zero exit unless the task says otherwise.
         self._v13_contract = os.environ.get("RW_TASK_CONTRACT") == "v13"
@@ -347,6 +350,21 @@ class Context:
                 os.close(fd)
         except OSError as exc:
             self.log.warning("could not write the error side channel: %s", exc)
+
+    def now(self) -> datetime:
+        """The task run's reference time, an aware UTC datetime: `RW_NOW`, which the
+        executor sets once when the run starts (CONTRACTS.md "What a script sees"). Use it
+        for anything that ends up in a command or an output, so that a replay
+        (`rwtask test`) reproduces the same argv and the same result; use
+        `time.monotonic()` for durations. Without `RW_NOW` (a classic bundle, a plain unit
+        test) it is the wall clock, read afresh on each call. ValueError when `RW_NOW` is
+        not a UTC RFC 3339 timestamp."""
+        if self._reference_time is None:
+            return datetime.now(UTC)
+        try:
+            return parse_now(self._reference_time)
+        except ValueError as exc:
+            raise ValueError(f"{NOW_ENV}: {exc}") from None
 
     def run(
         self,
