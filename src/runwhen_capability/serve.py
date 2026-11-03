@@ -493,6 +493,8 @@ def _poll_once(
                 scope_dir=scope_dir,
                 credentials=task_request.credentials,
                 materialized=task_request.materialized,
+                relay=relay_client,
+                output_decls=task_request.outputs,
                 deadline_s=task_request.deadlineMs / 1000,
                 log=log.getChild(task_request.requestId),
             )

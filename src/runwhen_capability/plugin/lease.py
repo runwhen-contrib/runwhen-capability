@@ -40,16 +40,28 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
+from ..context import Context
 from ..contracts import ArchiveError, TreeEntry, archive_sha256, check, schema, validate
 from ..contracts import archive as archive_mod
 from ..envelope import derive_envelope
-from .run import RunSpec, _duration_seconds, check_extra_env, execute
+from ..errors import ArtifactError
+from ..models import OutputDecl
+from ..relay import TRANSPORT_ERROR, RelayClient
+from .run import (
+    ArtifactUploader,
+    ArtifactUploadError,
+    RunSpec,
+    _duration_seconds,
+    check_extra_env,
+    execute,
+)
 
 _log = logging.getLogger("runwhen_capability.plugin.lease")
 
@@ -175,6 +187,71 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
         dry_run=False,
         timeout_s=_duration_seconds(lease["limits"]["timeout"]),
     )
+
+
+# -- artifacts ----------------------------------------------------------------------------------
+
+_ARTIFACT_REF_RE = re.compile(
+    schema("common")["$defs"]["artifactRef"]["properties"]["artifact"]["pattern"]
+)
+
+
+def relay_uploader(
+    relay: RelayClient,
+    *,
+    plugin: str,
+    task_name: str,
+    scope_dir: Path,
+    output_decls: Sequence[OutputDecl],
+    deadline_at: float | None = None,
+) -> ArtifactUploader:
+    """An `execute` artifact uploader that stores each artifact output through the
+    runner's relay -- the same `ctx.artifacts.add_file` call (busy retries included) that
+    the bundle path's `_upload_artifacts` makes -- and returns the envelope value
+    `{artifact: <relay ref>, contentType, size}` (`truncated: true` when the relay says it
+    stored less). The relay's ref must satisfy the contract's artifactRef
+    (`^art_[A-Za-z0-9_-]+$`); one that does not is an `internal` error and the output is
+    dropped, rather than a value papi would reject. The task name the relay sees is the one
+    the request's own `outputs` declare the artifact under, else the lease's task name."""
+    declared = {d.name: d.task for d in output_decls if d.artifact}
+
+    def upload(name: str, handle: BinaryIO, content_type: str) -> dict:
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            raise ArtifactUploadError(
+                "timeout", f"the request's deadline passed before artifact {name!r} was uploaded"
+            )
+        task = declared.get(name, task_name)
+        ctx = Context(
+            capability=plugin,
+            operation=task,
+            workdir=scope_dir,
+            relay=relay,
+            task=task,
+            outputs=output_decls,
+        )
+        try:
+            ref = ctx.artifacts.add_file(handle, name, content_type=content_type)
+        except ArtifactError as exc:
+            code = "unreachable" if exc.code == TRANSPORT_ERROR else "storage"
+            raise ArtifactUploadError(code, f"artifact {name!r}: {exc.code}: {exc}") from None
+        except OSError as exc:
+            raise ArtifactUploadError("storage", f"artifact {name!r}: {exc}") from None
+        if not _ARTIFACT_REF_RE.match(ref.ref):
+            raise ArtifactUploadError(
+                "internal",
+                f"artifact {name!r}: the relay returned the ref {ref.ref!r}, which is not an "
+                f"artifactRef ({_ARTIFACT_REF_RE.pattern})",
+            )
+        value: dict[str, Any] = {
+            "artifact": ref.ref,
+            "contentType": content_type,
+            "size": ref.size_bytes,
+        }
+        if ref.truncated:
+            value["truncated"] = True
+        return value
+
+    return upload
 
 
 # -- credentials ---------------------------------------------------------------------------
@@ -305,12 +382,16 @@ def run_lease(
     deadline_s: float | None = None,
     archive_cache: Path | None = None,
     secrets_root: Path | None = None,
+    relay: RelayClient | None = None,
+    output_decls: Sequence[OutputDecl] = (),
     log: logging.Logger | None = None,
 ) -> dict:
     """Runs one lease and returns its result envelope (it passes `result-envelope`).
     Never raises for a bad lease, bad code or a failing task. `deadline_s` (the
     request's deadline) caps `limits.timeout`. `materialized` is the poll response's
-    `materialized[]`; `secrets_root` is where its files go (default: credentials_dir())."""
+    `materialized[]`; `secrets_root` is where its files go (default: credentials_dir()).
+    With a `relay` (and the request's `output_decls`), artifact outputs are stored through
+    it; without one they stay in the scope."""
     log = log or _log
     credentials = dict(credentials or {})
     violations = validate("lease", doc)
@@ -345,7 +426,24 @@ def run_lease(
             extra_env[name] = str(task_dir / name)
         extra_env.update(parsed.env)
         check_extra_env(extra_env)
-        outcome = execute(spec, scope_dir=scope_dir, extra_env=extra_env, redact=redact, log=log)
+        uploader = None
+        if relay is not None:
+            uploader = relay_uploader(
+                relay,
+                plugin=doc["task"]["plugin"],
+                task_name=doc["task"]["name"],
+                scope_dir=scope_dir,
+                output_decls=output_decls,
+                deadline_at=None if deadline_s is None else time.monotonic() + deadline_s,
+            )
+        outcome = execute(
+            spec,
+            scope_dir=scope_dir,
+            extra_env=extra_env,
+            redact=redact,
+            artifact_uploader=uploader,
+            log=log,
+        )
         envelope = outcome.envelope
         check("result-envelope", envelope)
         return envelope
@@ -370,6 +468,7 @@ __all__ = [
     "credentials_dir",
     "failed_envelope",
     "load_code",
+    "relay_uploader",
     "run_lease",
     "runspec_from_lease",
     "wipe_stale_credentials",

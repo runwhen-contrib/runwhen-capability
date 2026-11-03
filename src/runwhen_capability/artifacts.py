@@ -178,6 +178,9 @@ class ArtifactRef(BaseModel):
     ref: str
     size_bytes: int
     sha256: str
+    # True when the relay says it stored less than was sent (read only by the V13 path,
+    # which reports it as `truncated: true` in the result envelope).
+    truncated: bool = False
 
     @model_serializer
     def _serialize(self) -> dict[str, str]:
@@ -197,7 +200,10 @@ def _ref_from(created: dict) -> ArtifactRef:
     """The relay's 201 JSON as an ArtifactRef."""
     try:
         return ArtifactRef(
-            ref=created["artifactRef"], size_bytes=created["sizeBytes"], sha256=created["sha256"]
+            ref=created["artifactRef"],
+            size_bytes=created["sizeBytes"],
+            sha256=created["sha256"],
+            truncated=created.get("truncated") is True,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ArtifactError("E_ARTIFACT_RESPONSE", f"unexpected relay answer: {created!r}") from exc

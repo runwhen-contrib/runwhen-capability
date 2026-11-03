@@ -150,16 +150,20 @@ def test_an_inline_python_lease_runs_end_to_end_and_completes_with_the_bare_enve
     assert not (poll.workdir / "scope-1").exists()  # a lease's scope is always wiped
 
 
-def test_an_inline_bash_lease_runs_with_a_base64_file(poll):
+def test_an_inline_bash_lease_runs_with_a_base64_file(relayed):
     script = TASKS["sh-ok"]["script"]
     lease = make_lease(
         "sh-ok", code=inline_code(base64_path=script), inputs={"count": 1, "note": "hi"}
     )
-    envelope = envelope_of(poll(lease))
-    assert envelope["status"] == "ok"
+    decl = {"task": "sh-ok", "name": "events", "artifact": True, "contentType": "application/json"}
+    body, [put] = relayed(lease, created(ref="art_events1", size=60), [decl])
+    envelope = envelope_of(body)
+    assert envelope["status"] == "ok", envelope["errors"]
     assert envelope["outputs"]["probe"] == [
         {"namespace": "runwhen", "name": "runwhen-papi", "threshold": 1500, "note": "hi"}
     ]
+    assert envelope["outputs"]["events"]["artifact"] == "art_events1"
+    assert put.path.endswith("/artifacts/events")
 
 
 def test_a_lease_is_refused_unless_plugin_code_is_allowed(poll):
@@ -447,3 +451,129 @@ def test_materialized_is_ignored_for_a_classic_request(poll):
     )  # a packaged request against the echo capability
     assert body["status"] == "ok"
     assert not poll.creds.exists()  # nothing was written for it
+
+
+# -- artifact outputs through the relay -----------------------------------------------------------
+
+
+@pytest.fixture
+def relayed(relay_server, tmp_path, monkeypatch):
+    """Serves one polled lease against the real local relay, which scripts the artifact PUT.
+    Returns (the POSTed result body, the recorded artifact PUTs)."""
+    from relay_server import Response
+
+    token = tmp_path / "token"
+    token.write_text("test-token")
+    monkeypatch.setenv("RW_CREDENTIALS_DIR", str(tmp_path / "creds"))
+
+    def go(lease, put: Response | None, decls=None):
+        relay_server.script(
+            "POST",
+            "/v1/tasks/next",
+            Response(
+                200,
+                json={
+                    "requestId": "req-1",
+                    "request": lease,
+                    "credentials": {},
+                    "scopeId": "scope-1",
+                    "deadlineMs": 30000,
+                    "outputs": decls or [],
+                },
+            ),
+        )
+        if put is not None:
+            relay_server.script("PUT", "/v1/tasks/req-1/artifacts/", put)
+        relay_server.script("POST", "/v1/tasks/req-1/result", Response(200, json={}))
+        serve(
+            relay=relay_server.url,
+            pool_id="pool-1",
+            workdir=tmp_path / "work",
+            capability_dir=ECHO,
+            token_file=token,
+            max_iterations=1,
+            allow_bundles=True,
+        )
+        [result] = [r for r in relay_server.requests if r.path.endswith("/result")]
+        puts = [r for r in relay_server.requests if r.method == "PUT"]
+        return json.loads(result.body), puts
+
+    return go
+
+
+def created(ref="art_dump1", size=7, **extra):
+    from relay_server import Response
+
+    return Response(201, json={"artifactRef": ref, "sizeBytes": size, "sha256": "ab" * 32, **extra})
+
+
+DUMP_DECL = {"task": "py-artifact", "name": "dump", "artifact": True, "contentType": "text/plain"}
+
+
+def test_an_artifact_output_is_uploaded_through_the_relay(relayed):
+    body, [put] = relayed(make_lease("py-artifact"), created(), [DUMP_DECL])
+    envelope = envelope_of(body)
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert envelope["outputs"]["dump"] == {
+        "artifact": "art_dump1",
+        "contentType": "text/plain",
+        "size": 7,
+    }
+    assert envelope["outputs"]["n"] == {"v": 1}
+    assert put.path == "/v1/tasks/req-1/artifacts/dump"
+    assert put.body == b"a dump\n"  # the file, not the scratch file next to it
+    assert put.header("content-type") == "text/plain"
+    assert put.header("x-rw-task") == "py-artifact"
+    assert put.header("authorization") == "Bearer test-token"
+    assert "declaredButNeverWritten" not in envelope["outputs"]
+
+
+def test_the_relays_task_name_comes_from_the_requests_own_declaration(relayed):
+    decl = {**DUMP_DECL, "task": "runmini:probe/py-artifact"}
+    body, [put] = relayed(make_lease("py-artifact"), created(), [decl])
+    assert envelope_of(body)["status"] == "ok"
+    assert put.header("x-rw-task") == "runmini:probe/py-artifact"
+
+
+def test_a_truncated_artifact_is_marked_truncated(relayed):
+    body, _ = relayed(make_lease("py-artifact"), created(truncated=True), [DUMP_DECL])
+    assert envelope_of(body)["outputs"]["dump"]["truncated"] is True
+
+
+def test_a_relay_ref_that_is_not_an_artifact_ref_is_an_internal_error(relayed):
+    body, _ = relayed(make_lease("py-artifact"), created(ref="01HZX-not-art-prefixed"), [DUMP_DECL])
+    envelope = envelope_of(body)
+    assert envelope["status"] == "partial"
+    assert "dump" not in envelope["outputs"]
+    [error] = envelope["errors"]
+    assert error["code"] == "internal"
+    assert error["scope"] == "dump"
+    assert "01HZX-not-art-prefixed" in error["message"]
+    assert "^art_" in error["message"]
+
+
+def test_artifacts_switched_off_on_the_runner_is_a_storage_error(relayed):
+    from relay_server import Response
+
+    off = Response(422, json={"code": "E_ARTIFACTS_DISABLED", "message": "artifacts are disabled"})
+    body, _ = relayed(make_lease("py-artifact"), off, [DUMP_DECL])
+    envelope = envelope_of(body)
+    assert envelope["status"] == "partial"
+    assert [e["code"] for e in envelope["errors"]] == ["storage"]
+    assert "E_ARTIFACTS_DISABLED" in envelope["errors"][0]["message"]
+    assert envelope["outputs"] == {"n": {"v": 1}}
+
+
+def test_an_artifact_over_the_relays_limit_is_a_storage_error(relayed):
+    from relay_server import Response
+
+    big = Response(413, json={"code": "E_ARTIFACT_TOO_LARGE", "maxBytes": 3})
+    envelope = envelope_of(relayed(make_lease("py-artifact"), big, [DUMP_DECL])[0])
+    assert [e["code"] for e in envelope["errors"]] == ["storage"]
+    assert "E_ARTIFACT_TOO_LARGE" in envelope["errors"][0]["message"]
+
+
+def test_nothing_is_uploaded_for_a_task_that_failed_or_wrote_no_artifact(relayed):
+    body, puts = relayed(make_lease("py-nothing"), None, [DUMP_DECL])
+    assert envelope_of(body)["status"] == "ok"
+    assert puts == []
