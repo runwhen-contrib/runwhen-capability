@@ -44,8 +44,11 @@ bytes for the same version is rejected with `E_VERSION_CONFLICT`; the first arch
 2. **Header fields:**
    - `name`/`prefix`: the relative path, split at a `/` per ustar rules (`name` ≤ 100 bytes,
      `prefix` ≤ 155 bytes, the longest `prefix` that fits). A path that cannot be split is rejected.
+     Python 3.12's `tarfile` picks the *shortest* valid prefix, so a writer implements the
+     longest-prefix rule itself; the golden vectors include a path with several valid splits.
    - `mode`: `0000755` if git records the file as executable (`100755`), else `0000644`.
-   - `uid`, `gid`, `mtime`, `devmajor`, `devminor`: `0`. `uname`, `gname`, `linkname`: empty.
+   - `uid`, `gid`, `mtime`: `0`. `devmajor`, `devminor`: all NUL, as `tarfile` writes them for
+     regular files (readers see 0). `uname`, `gname`, `linkname`: empty.
    - `magic` `ustar\0`, `version` `00`; numeric fields octal, zero-padded, NUL-terminated, as
      Python's `tarfile.USTAR_FORMAT` writes them.
 3. **Content:** the file's bytes as stored in git (no line-ending conversion), padded with zeros to a
