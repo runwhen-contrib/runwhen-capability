@@ -9,6 +9,7 @@
     rwtask export <dir> [--name NAME ...] [--force]
     rwtask test <dir> [--task NAME]
     rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
+    rwtask validate <dir>
 
 See serve.py, run_local.py, label.py, schemas.py, gitops.py and port/.
 """
@@ -269,6 +270,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     port_p.add_argument("--force", action="store_true", help="overwrite files that already exist")
 
+    validate_p = sub.add_parser(
+        "validate",
+        help="validate a V13 plugin directory (has plugin.yaml) or one skill directory "
+        "(has SKILL.md); prints file:path: CODE message, exit 1 on any error",
+    )
+    validate_p.add_argument("dir", help="plugin directory, or a skill directory")
+
     return parser
 
 
@@ -330,6 +338,15 @@ def _port(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     for warning in draft.warnings:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
+
+
+def _format_plugin_diagnostic(diag) -> str:
+    where = diag.file or ""
+    if diag.path:
+        where = f"{where}:{diag.path}"
+    prefix = "warning: " if diag.severity == "warning" else ""
+    head = f"{where}: " if where else ""
+    return f"{prefix}{head}{diag.code} {diag.message}"
 
 
 def _gitops_config(parser: argparse.ArgumentParser, args: argparse.Namespace, command: str):
@@ -620,6 +637,28 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"FAIL  {label}: {result.detail}")
         print(f"{passed} passed, {failed} failed, {no_test} no test")
         return 1 if failed else 0
+
+    if args.command == "validate":
+        from .plugin import load_dir, load_skill_dir, validate_tree
+
+        directory = Path(args.dir)
+        if (directory / "plugin.yaml").is_file():
+            tree = load_dir(directory)
+        elif (directory / "SKILL.md").is_file():
+            tree = load_skill_dir(directory)
+        else:
+            print(
+                f"rwtask validate: {directory} has neither a plugin.yaml nor a SKILL.md",
+                file=sys.stderr,
+            )
+            return 1
+        diagnostics = validate_tree(tree)
+        for diag in diagnostics:
+            print(_format_plugin_diagnostic(diag))
+        errors = sum(d.severity == "error" for d in diagnostics)
+        warnings = len(diagnostics) - errors
+        print(f"rwtask validate: {errors} error(s), {warnings} warning(s)", file=sys.stderr)
+        return 1 if errors else 0
 
     parser.error(f"unknown command {args.command!r}")
     return 2

@@ -28,6 +28,7 @@ class PluginInvalid(ValueError):
 
 
 from .tree import PluginTree, SkillTree, load_dir, load_entries, load_skill_dir  # noqa: E402
+from .validate import validate_entries, validate_tree  # noqa: E402
 
 __all__ = [
     "PluginInvalid",
@@ -36,4 +37,6 @@ __all__ = [
     "load_dir",
     "load_entries",
     "load_skill_dir",
+    "validate_entries",
+    "validate_tree",
 ]
