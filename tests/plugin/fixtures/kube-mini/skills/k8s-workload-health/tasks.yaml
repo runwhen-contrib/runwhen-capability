@@ -1,0 +1,31 @@
+apiVersion: runwhen.com/tasks/v1
+runtime: kubernetes@1
+defaults:
+  credentials: kubernetes/kubeconfig
+  timeout: 120s
+tasks:
+  - name: rollout-status
+    title: Rollout status
+    description: Is the latest rollout progressing, stuck or failed, and why?
+    script: scripts/rollout_status.py
+    readOnly: true
+    permissions:
+      - { apiGroups: [apps], resources: [deployments, replicasets], verbs: [get, list] }
+    inputs:
+      since: { type: duration, default: 30m, description: Look-back window }
+    outputs:
+      rollout: { schema: ./schemas/rollout.v1.json, description: Rollout state per ReplicaSet }
+      summary: { schema: "{ stuck: boolean, reason: string? }" }
+  - name: restart
+    title: Restart workload
+    description: Rolling restart of the workload.
+    script: scripts/restart.sh
+    readOnly: false
+    effects: ["Restarts every pod of the workload, one at a time"]
+    destructive: false
+    idempotent: true
+    permissions: [{ apiGroups: [apps], resources: [deployments], verbs: [patch] }]
+    inputs:
+      reason: { type: string, description: Why; recorded as an annotation }
+    outputs:
+      result: { schema: "{ restartedAt: datetime, pods: integer }" }
