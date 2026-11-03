@@ -13,21 +13,24 @@ Relay HTTP contract (this is the wire the runner must implement to match):
         body: {"status": "ok"|"failed"|"timeout", "result": {...}, "error": "..."}
            ("result" is a ResultEnvelope, present only on status "ok")
 
-Both relay calls carry `Authorization: Bearer <token>`, where <token> is read
-fresh from the executor token file rather than cached at startup -- reading
-is cheap and it lets a rotated or late-mounted token recover on its own
-instead of wedging the pod. The two calls read it at different points,
-though, not once per poll: GetTask reads it right before the poll, but
-PutResult reads it AGAIN right before posting the result, because a
-request can run for up to the manifest's requestTimeoutSeconds (often
-minutes) between those two points -- long enough for a token to rotate mid-request,
-which would otherwise mean the POST silently used the stale one and lost
-an already-computed result to a 401. If that second read is briefly
-unreadable, PutResult falls back to the token GetTask used rather than
-dropping the result (see _post_result). The token file path comes from
---token-file, else the EXECUTOR_TOKEN_FILE env var, else DEFAULT_TOKEN_FILE.
-A missing/unreadable token file at GetTask time is logged and the loop
-keeps polling -- it never falls back to an unauthenticated request.
+Every relay call carries `Authorization: Bearer <token>`. The token is read at start-up
+from the executor token file -- --token-file, else the RW_EXECUTOR_TOKEN_FILE env var, else
+the legacy EXECUTOR_TOKEN_FILE, else DEFAULT_TOKEN_FILE -- and the file is then unlinked
+(S1 / SEC-2): task processes run as the same uid in the same pod, so a token that stays on
+disk is a token any task can `cat`. What happens next depends on whether the unlink worked,
+and is logged once:
+
+- It worked (the runner's own tmpfs copy, which the runner never rotates in place; a
+  restart is a new pod): the token lives in memory only and is never read again.
+- It was refused (a read-only Secret volume, EACCES -- today's runner): the file cannot be
+  hidden anyway, and the kubelet refreshes a mounted Secret in place when it rotates, so
+  the file is re-read right before every relay call. If that re-read fails or finds the
+  file empty, the last token read is used, and logged, rather than dropping a result
+  already computed (see relay.TokenSource).
+
+A missing, unreadable or empty token file at start-up is an error (the process exits), never
+a poll without a token. Before it reads the token the process also makes itself non-dumpable
+(`_make_non_dumpable`), in both modes, so a task cannot read the in-memory copy out of /proc.
 
 A request may carry `maxResultBytes`. The result body is serialised (compact
 JSON) before it is posted, and an `ok` result whose body is larger than that
@@ -88,10 +91,12 @@ a crash.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
 import shutil
+import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -109,13 +114,17 @@ from .plugin.lease import (
     run_lease,
     wipe_stale_credentials,
 )
-from .relay import RelayClient
+from .relay import RelayClient, TokenSource
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
 RETRY_DELAY = 5  # seconds, on a poll/post transport failure
 
 DEFAULT_TOKEN_FILE = "/var/run/executor/token"
+TOKEN_FILE_ENV = "RW_EXECUTOR_TOKEN_FILE"
+LEGACY_TOKEN_FILE_ENV = "EXECUTOR_TOKEN_FILE"
+
+_PR_SET_DUMPABLE = 4  # <linux/prctl.h>
 
 PLUGIN_CODE_NOT_ALLOWED = (
     "this executor does not run plugin code (start with --allow-bundles, or RW_ALLOW_BUNDLES=1)"
@@ -163,17 +172,15 @@ def serve(
     filesystem. A V13 lease (plugin code carried inline or by archive) needs the
     same opt-in and is refused the same way, as a failed envelope."""
     log = log or logging.getLogger("runwhen_capability.serve")
+    # First, before the token is in memory: see _make_non_dumpable.
+    _make_non_dumpable(log)
+    tokens = _load_executor_token(_resolve_token_file(token_file), log)
+
     session = session or requests.Session()
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     _wipe_stale_bundle_scopes(workdir, log)
     wipe_stale_credentials()
-
-    token_file = (
-        Path(token_file)
-        if token_file
-        else Path(os.environ.get("EXECUTOR_TOKEN_FILE", DEFAULT_TOKEN_FILE))
-    )
 
     cap_dir = Path(capability_dir) if capability_dir else discover_capability_dir()
     capability = load_capability(cap_dir)
@@ -199,12 +206,85 @@ def serve(
             pool_id,
             workdir,
             capability,
-            token_file,
+            tokens,
             log,
             stateful_scopes,
             max_stateful_scopes,
             allow_bundles,
         )
+
+
+def _make_non_dumpable(log: logging.Logger | None = None) -> bool:
+    """Marks this process non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`) and says whether it
+    worked. Linux only; elsewhere it does nothing.
+
+    Why: the executor token lives in this process's memory, and task children run as the
+    same uid. A dumpable process's /proc/<pid>/mem and /proc/<pid>/environ are readable by
+    every process of its uid (and it can be ptrace-attached by one), so a task could lift
+    the token out of the serve process. Non-dumpable makes those files root-owned and the
+    attach refuse, unless the reader has CAP_SYS_PTRACE -- which a task does not. Children
+    are not affected: the flag is reset to dumpable on every execve, which is fine, since
+    they hold no token (not in env, argv or an open fd). Called first in `serve`, before the
+    token is read, so there is no window in which it is in memory and the process is
+    dumpable. A failure is logged with its errno and serve carries on: it hardens, it is not
+    what the token's confidentiality rests on alone (the file is unlinked, the env stripped)."""
+    log = log or logging.getLogger("runwhen_capability.serve")
+    if not sys.platform.startswith("linux"):
+        log.debug("not making the process non-dumpable: not Linux (%s)", sys.platform)
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
+    except (OSError, AttributeError) as exc:
+        log.warning("could not make the process non-dumpable: %s", exc)
+        return False
+    if result != 0:
+        err = ctypes.get_errno()
+        log.warning(
+            "could not make the process non-dumpable: prctl(PR_SET_DUMPABLE, 0) failed, "
+            "errno %d (%s)",
+            err,
+            os.strerror(err),
+        )
+        return False
+    return True
+
+
+def _resolve_token_file(token_file: Path | None) -> Path:
+    """--token-file, else $RW_EXECUTOR_TOKEN_FILE, else the legacy $EXECUTOR_TOKEN_FILE,
+    else DEFAULT_TOKEN_FILE. An empty variable counts as unset."""
+    if token_file:
+        return Path(token_file)
+    return Path(
+        os.environ.get(TOKEN_FILE_ENV)
+        or os.environ.get(LEGACY_TOKEN_FILE_ENV)
+        or DEFAULT_TOKEN_FILE
+    )
+
+
+def _load_executor_token(path: Path, log) -> TokenSource:
+    """Reads the executor token (whitespace stripped) and tries to unlink the file; returns
+    the `TokenSource` every relay call uses (see the module docstring for the two modes).
+    A missing, unreadable or empty file ends the process with a clear message
+    (SystemExit): serving without a token would only fail every poll. Unlink worked: a
+    fixed, in-memory token. Unlink refused (a read-only Secret volume, EACCES): logged, and
+    a source that re-reads the file on every call, so a rotation in place is picked up."""
+    try:
+        token = Path(path).read_text().strip()
+    except OSError as exc:
+        log.error("could not read executor token from %s: %s", path, exc)
+        raise SystemExit(f"rwtask serve: could not read executor token from {path}: {exc}") from exc
+    if not token:
+        log.error("executor token file %s is empty", path)
+        raise SystemExit(f"rwtask serve: executor token file {path} is empty")
+    try:
+        os.unlink(path)
+    except OSError:
+        log.info("executor token file left in place (read-only mount): %s", path)
+        log.info("executor token mode: re-reading %s on every relay call (rotation in place)", path)
+        return TokenSource(token, path, log)
+    log.info("executor token mode: held in memory only; the token file was removed")
+    return TokenSource(token, None, log)
 
 
 def _wipe_stale_bundle_scopes(workdir: Path, log) -> None:
@@ -295,21 +375,14 @@ def _post_result(
     relay: str,
     request_id: str,
     body: bytes,
-    token_file: Path,
-    fallback_token: str,
+    tokens: TokenSource,
     log,
 ) -> None:
-    """POSTs one PutResult; `body` is the JSON that `_encode_result` made.
-    Re-reads the bearer token from `token_file` immediately before posting,
-    rather than reusing the one the poll started with: a request can run up
-    to the manifest's requestTimeoutSeconds before this runs, so a
-    mid-request rotation would otherwise mean the POST carries a now-stale
-    token and gets a 401 -- silently losing a result that was already
-    computed, which defeats the whole reason the token is re-read per poll
-    rather than cached at startup (see the module docstring). If the token
-    file is briefly unreadable right at this moment, falls back to
-    `fallback_token` -- the token the poll already had -- and logs the
-    fallback, rather than dropping a result in hand over a transient read.
+    """POSTs one PutResult; `body` is the JSON that `_encode_result` made. The token comes
+    from `tokens.get()` immediately before posting: in the re-reading mode a request can
+    run up to the manifest's requestTimeoutSeconds before this runs, long enough for the
+    mounted Secret to rotate, and a stale token would lose a result already computed to a
+    401. If that re-read fails, `get()` falls back to the last token read, and says so.
 
     The timeout grows by a second per MiB of body: a result near the cap
     takes real time to upload, and the flat RESULT_TIMEOUT is sized for a
@@ -319,15 +392,7 @@ def _post_result(
     lease expiry is what recovers the request -- but it is never treated as
     a delivered result: an unlogged 401/500 here is a result that vanished
     with nothing to explain it."""
-    token = _read_token(token_file, log)
-    if token is None:
-        log.warning(
-            "could not re-read executor token before posting result for %s; "
-            "falling back to the token this poll started with",
-            request_id,
-        )
-        token = fallback_token
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {tokens.get()}", "Content-Type": "application/json"}
 
     try:
         resp = session.post(
@@ -346,14 +411,6 @@ def _post_result(
             request_id,
             resp.status_code,
         )
-
-
-def _read_token(token_file: Path, log) -> str | None:
-    try:
-        return token_file.read_text().strip()
-    except OSError as exc:
-        log.error("could not read executor token from %s: %s", token_file, exc)
-        return None
 
 
 def _retain_or_wipe_scope(
@@ -390,17 +447,13 @@ def _poll_once(
     pool_id: str,
     workdir: Path,
     capability,
-    token_file: Path,
+    tokens: TokenSource,
     log,
     stateful_scopes: OrderedDict[str, None],
     max_stateful_scopes: int,
     allow_bundles: bool = False,
 ) -> None:
-    token = _read_token(token_file, log)
-    if token is None:
-        time.sleep(RETRY_DELAY)
-        return
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {tokens.get()}"}
 
     try:
         resp = session.post(
@@ -443,8 +496,7 @@ def _poll_once(
             _encode_result(
                 {"status": "failed", "error": f"invalid scopeId {task_request.scopeId!r}"}, log
             ),
-            token_file,
-            token,
+            tokens,
             log,
         )
         return
@@ -465,8 +517,7 @@ def _poll_once(
             relay,
             task_request.requestId,
             _encode_result({"status": "failed", "error": BUNDLES_NOT_ALLOWED}, log),
-            token_file,
-            token,
+            tokens,
             log,
         )
         return
@@ -483,14 +534,14 @@ def _poll_once(
             failed_envelope("invalid_input", PLUGIN_CODE_NOT_ALLOWED), task_request.request.doc
         )
         body = _encode_result({"status": "ok", "result": envelope}, log)
-        _post_result(session, relay, task_request.requestId, body, token_file, token, log)
+        _post_result(session, relay, task_request.requestId, body, tokens, log)
         return
 
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
     # One client per request: it carries the request id the artifact routes
-    # are scoped to, and re-reads the token file on every call.
-    relay_client = RelayClient(relay, token_file, task_request.requestId, session)
+    # are scoped to, and the executor's token source.
+    relay_client = RelayClient(relay, None, task_request.requestId, session, token_source=tokens)
     try:
         if is_lease:
             # A V13 lease: plugin code pinned by hash, the same hardened child runner
@@ -555,4 +606,4 @@ def _poll_once(
             )
 
     body = _encode_result(payload, log, task_request.maxResultBytes)
-    _post_result(session, relay, task_request.requestId, body, token_file, token, log)
+    _post_result(session, relay, task_request.requestId, body, tokens, log)

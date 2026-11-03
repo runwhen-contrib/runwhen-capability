@@ -46,6 +46,21 @@ with the wheel and sdist attached to the GitHub Release.
   its own fails `internal` with the hint "the task exceeded its memory limit (<quantity>)". `cpu` stays
   advisory. `plugin.run.parse_quantity_bytes` reads the quantity.
 
+### Security
+
+- `rwtask serve` reads the executor token at start-up and unlinks the file (S1 / SEC-2): a task in
+  the same pod can no longer `cat` it. The path comes from `--token-file`, else
+  `RW_EXECUTOR_TOKEN_FILE`, else the legacy `EXECUTOR_TOKEN_FILE`, else
+  `/var/run/executor/token`. If the unlink worked the token lives in memory only. If it is refused
+  (a read-only Secret mount, as on today's runner) the file stays and is re-read before every relay
+  call, so a Secret rotated in place is still picked up (the last token read is the fallback when a
+  re-read fails). Which mode is active is logged once. A missing, unreadable or empty token file is a
+  start-up error (exit), not a logged retry loop. `serve` also makes itself non-dumpable
+  (`prctl(PR_SET_DUMPABLE, 0)`, Linux) in both modes so a task cannot read the token from
+  `/proc/<pid>/mem` or `environ`. `RW_EXECUTOR_TOKEN_FILE` is host-only like `EXECUTOR_TOKEN_FILE`.
+  `RelayClient` takes `token=`, `token_source=` (new `relay.TokenSource`) or a `token_file`, which it
+  reads once at construction.
+
 ### Fixed
 
 - `ctx.settings` snake_cases only the top-level setting names. It used to rewrite keys at every depth,

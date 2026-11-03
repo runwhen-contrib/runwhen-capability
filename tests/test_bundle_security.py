@@ -73,7 +73,11 @@ import json, os, stat, sys
 def main(ctx, token=None):
     info = {
         "env": sorted(k for k in os.environ if k.startswith("RW_")),
-        "hostOnly": [k for k in ("EXECUTOR_TOKEN_FILE", "RELAY_URL", "POOL_ID") if k in os.environ],
+        "hostOnly": [
+            k
+            for k in ("EXECUTOR_TOKEN_FILE", "RW_EXECUTOR_TOKEN_FILE", "RELAY_URL", "POOL_ID")
+            if k in os.environ
+        ],
         "home": os.environ["HOME"],
         "tmpdir": os.environ["TMPDIR"],
         "stdin": sys.stdin.read(),
@@ -105,6 +109,7 @@ def test_bundle_files_are_private_to_the_host_user(tmp_path):
 
 def test_a_python_task_sees_a_private_home_tmpdir_and_no_host_or_wrapper_env(tmp_path, monkeypatch):
     monkeypatch.setenv("EXECUTOR_TOKEN_FILE", "/var/run/executor/token")
+    monkeypatch.setenv("RW_EXECUTOR_TOKEN_FILE", "/run/rw/executor/token")
     monkeypatch.setenv("RELAY_URL", "http://relay")
     monkeypatch.setenv("POOL_ID", "pool-1")
     monkeypatch.setenv("RW_HOST_SETTING", "x")

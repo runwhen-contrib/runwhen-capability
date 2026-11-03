@@ -125,7 +125,7 @@ tasks:
     script: scripts/sh_env.sh
     readOnly: true
     outputs:
-      env: { schema: "{ relay: string, pool: string, token: string, contract: string, home: string }" }
+      env: { schema: "{ relay: string, pool: string, token: string, rwtoken: string, contract: string, home: string }" }
   - name: sh-nested
     title: Bash, nested shell
     description: A shell it starts is not forced into strict mode.

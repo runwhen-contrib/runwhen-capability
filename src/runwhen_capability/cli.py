@@ -79,7 +79,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve_p = sub.add_parser("serve", help="long-poll the runner and execute requests")
     # --relay/--pool are optional on the CLI and default to RELAY_URL/POOL_ID,
-    # mirroring --token-file/EXECUTOR_TOKEN_FILE. The runner launches this image
+    # mirroring --token-file/RW_EXECUTOR_TOKEN_FILE. The runner launches this image
     # with no args at all -- it injects these as env vars, because a runner that
     # had to pass capability CLI flags would be encoding knowledge of the
     # capability, which the executor contract forbids. The image's own CMD
@@ -105,8 +105,9 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_p.add_argument(
         "--token-file",
         default=None,
-        help="path to the executor bearer token; default: the EXECUTOR_TOKEN_FILE "
-        "env var, else /var/run/executor/token",
+        help="path to the executor bearer token (read once at start-up, then unlinked); "
+        "default: the RW_EXECUTOR_TOKEN_FILE env var, else EXECUTOR_TOKEN_FILE, "
+        "else /var/run/executor/token",
     )
     serve_p.add_argument(
         "--allow-bundles",

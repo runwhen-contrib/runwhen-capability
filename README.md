@@ -201,7 +201,7 @@ Each code the runner can return has its own subclass, so a task can catch just o
 rwtask run <capability-dir> --request request.json [--credentials creds.json]
 rwtask run --local <bundle-dir> --task <name> [--inputs '<json>'] [--credentials creds.json]
 rwtask serve [--capability-dir DIR] [--allow-bundles]
-             # RELAY_URL, POOL_ID, EXECUTOR_TOKEN_FILE from the env
+             # RELAY_URL, POOL_ID, RW_EXECUTOR_TOKEN_FILE (legacy: EXECUTOR_TOKEN_FILE) from the env
 rwtask plan <dir> [--prune]
 rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]
 rwtask export <dir> [--name NAME ...] [--force]
