@@ -48,6 +48,8 @@ INTEGRATION_FILES = (
     "integration/facets.yaml",
     "integration/dependencies.yaml",
 )
+# `rwtask pull`'s lockfile: authoring state next to plugin.yaml, never part of the archive.
+LOCK_FILE = "runwhen.lock"
 _ROOT_FILES = frozenset({"plugin.yaml", "README.md", "LICENSE", "CHANGELOG.md", "connections.yaml"})
 _SKILL_FILES = frozenset({"SKILL.md", "tasks.yaml"})
 _SKILL_DIRS = frozenset({"scripts", "lib", "schemas", "references", "assets", "tests"})
@@ -271,8 +273,8 @@ def _load_collection(
 def _read_dir(root: Path, *, skip_root_tests: bool) -> tuple[list[TreeEntry], list[Diagnostic]]:
     """Every regular file under `root`, in sorted order. Symlinks and other
     non-regular files are E_PATH_NOT_ALLOWED and never followed. Root-level
-    dotfiles and dot-directories (.git, .github) are skipped, and the root
-    `tests/` directory when `skip_root_tests`."""
+    dotfiles and dot-directories (.git, .github), the root `runwhen.lock` and the
+    root `tests/` directory (when `skip_root_tests`) are skipped."""
     entries: list[TreeEntry] = []
     diags: list[Diagnostic] = []
 
@@ -282,7 +284,9 @@ def _read_dir(root: Path, *, skip_root_tests: bool) -> tuple[list[TreeEntry], li
         for child in children:
             child_rel = f"{rel}{child.name}"
             if not rel and (
-                child.name.startswith(".") or (skip_root_tests and child.name == "tests")
+                child.name.startswith(".")
+                or child.name == LOCK_FILE
+                or (skip_root_tests and child.name == "tests")
             ):
                 continue
             mode = child.stat(follow_symlinks=False).st_mode

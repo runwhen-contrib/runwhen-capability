@@ -26,8 +26,8 @@ import yaml
 from ..contracts import archive, load_yaml
 from .deps import CompiledDependency, DependencyError, cache_root, load_dependency
 from .semver import parse_version
+from .tree import LOCK_FILE
 
-LOCK_FILE = "runwhen.lock"
 LOCKFILE_VERSION = 1
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
 _HEADER = "# Written by `rwtask pull`; commit it. `rwtask pull --frozen` installs exactly this.\n"

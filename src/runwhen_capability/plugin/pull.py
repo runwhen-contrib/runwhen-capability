@@ -39,7 +39,7 @@ from . import PluginInvalid
 from .compile import compile_entries
 from .deps import cache_root
 from .semver import highest, parse_version, satisfies, version_key
-from .tree import load_dir
+from .tree import LOCK_FILE, load_dir
 
 GIT_TIMEOUT_SECONDS = 120
 HTTP_TIMEOUT_SECONDS = 30
@@ -153,9 +153,9 @@ def _write_atomic(path: Path, data: bytes) -> None:
 
 def _publishable(path: str) -> bool:
     """What `rwtask compile` leaves out of an archive: root-level dotfiles and
-    dot-directories and the root `tests/` directory."""
+    dot-directories, runwhen.lock and the root `tests/` directory."""
     top = path.split("/", 1)[0]
-    return not top.startswith(".") and top != "tests"
+    return not top.startswith(".") and top not in ("tests", LOCK_FILE)
 
 
 def _fetched_from_entries(entries: list[TreeEntry], ref: str) -> Fetched:

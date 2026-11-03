@@ -336,3 +336,83 @@ def test_the_editor_schemas_are_refreshed_by_a_frozen_pull(ops_dir, cache, remot
     stale.write_text("{}")
     assert run_pull(ops_dir, "--frozen") == 0
     assert "properties" in json.loads(stale.read_text())
+
+
+# -- validate and compile read the lock ----------------------------------------------------
+
+
+def test_validate_loads_the_locked_dependency_without_with(ops_dir, cache, remote, capsys):
+    assert main(["validate", str(ops_dir)]) == 0  # no lock yet: the dependency is unchecked
+    assert "W_TYPE_UNCHECKED" in capsys.readouterr().out
+    assert run_pull(ops_dir, "--from", f"git+{remote}") == 0
+    capsys.readouterr()
+    assert main(["validate", str(ops_dir)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "" and "0 error(s), 0 warning(s)" in captured.err
+
+
+def test_validate_finds_a_dependency_error_through_the_lock(ops_dir, cache, remote, capsys):
+    assert run_pull(ops_dir, "--from", f"git+{remote}") == 0
+    tasks = ops_dir / "skills/papi-recovery/tasks.yaml"
+    tasks.write_text(tasks.read_text().replace("verbs: [patch]", "verb: [patch]"))
+    capsys.readouterr()
+    assert main(["validate", str(ops_dir)]) == 1
+    assert "E_PERMISSION_SCHEMA" in capsys.readouterr().out
+
+
+def test_a_cached_archive_that_differs_from_the_lock_exits_2(ops_dir, cache, remote, capsys):
+    assert run_pull(ops_dir, "--from", f"git+{remote}") == 0
+    (cache / "kubernetes" / "0.1.0.tar").write_bytes(
+        archive.build([archive.TreeEntry("plugin.yaml", b"x: 1\n")])
+    )
+    capsys.readouterr()
+    assert main(["validate", str(ops_dir)]) == 2
+    err = capsys.readouterr().err
+    assert "rwtask validate: the cached kubernetes@0.1.0" in err and "runwhen.lock" in err
+    assert main(["compile", str(ops_dir), "--out", str(ops_dir / "dist")]) == 2
+    assert "rwtask compile: the cached kubernetes@0.1.0" in capsys.readouterr().err
+
+
+def test_a_locked_version_missing_from_the_cache_exits_2(ops_dir, cache, remote, capsys):
+    assert run_pull(ops_dir, "--from", f"git+{remote}") == 0
+    shutil.rmtree(cache)
+    capsys.readouterr()
+    assert main(["validate", str(ops_dir)]) == 2
+    assert "not in the plugin cache" in capsys.readouterr().err
+
+
+def test_an_explicit_with_wins_over_the_lock(ops_dir, cache, remote, tmp_path, capsys):
+    assert run_pull(ops_dir, "--from", f"git+{remote}") == 0
+    (cache / "kubernetes" / "0.1.0.tar").write_bytes(b"corrupt")  # the lock entry is unusable
+    capsys.readouterr()
+    kube = tmp_path / "kube"
+    for entry in kube_entries():
+        target = kube / entry.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(entry.data)
+    assert main(["validate", str(ops_dir), "--with", str(kube)]) == 0
+    assert main(["validate", str(ops_dir)]) == 2
+
+
+def test_compile_uses_the_lock_too(ops_dir, cache, remote, capsys):
+    assert run_pull(ops_dir, "--from", f"git+{remote}") == 0
+    out = ops_dir / "dist"
+    capsys.readouterr()
+    assert main(["compile", str(ops_dir), "--out", str(out)]) == 0
+    assert "W_TYPE_UNCHECKED" not in capsys.readouterr().out
+    assert (out / "runwhen-platform-ops-0.1.0.tar").is_file()
+
+
+def test_a_malformed_lock_exits_2(ops_dir, capsys):
+    (ops_dir / LOCK_FILE).write_text("lockfileVersion: 9\n")
+    assert main(["validate", str(ops_dir)]) == 2
+    assert "lockfileVersion must be 1" in capsys.readouterr().err
+
+
+def test_the_lock_is_not_part_of_the_plugin(ops_dir, cache, remote):
+    from runwhen_capability.plugin import load_dir
+
+    assert run_pull(ops_dir, "--from", f"git+{remote}") == 0
+    tree = load_dir(ops_dir)
+    assert LOCK_FILE not in tree.files
+    assert not [d for d in tree.diagnostics if d.code == "E_PATH_NOT_ALLOWED"]

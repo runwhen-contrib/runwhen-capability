@@ -66,7 +66,9 @@ def _add_with_arg(subparser: argparse.ArgumentParser) -> None:
         metavar="SPEC",
         help="a required (requires/extends) integration to validate against, repeatable: a "
         "plugin directory, a <name>-<version>.compiled.json file, or <name>[@<version>] from "
-        "the plugin cache ($RUNWHEN_PLUGIN_CACHE, default ~/.cache/runwhen/plugins)",
+        "the plugin cache ($RUNWHEN_PLUGIN_CACHE, default ~/.cache/runwhen/plugins). Without "
+        "--with, the versions pinned in the plugin's runwhen.lock (`rwtask pull`) are used; "
+        "--with for a name overrides its lock entry",
     )
 
 
@@ -735,6 +737,20 @@ def _load_dependencies(who: str, specs: list[str]):
             return None
         dependencies[dep.name] = dep
     return dependencies
+
+
+def _add_locked_dependencies(who: str, directory: Path, dependencies: dict):
+    """`dependencies` plus the ones `directory`'s runwhen.lock pins, read from the plugin
+    cache (an explicit `--with` for a name wins), or None after printing why the lock does
+    not match the cache (the caller exits 2). Without a runwhen.lock: `dependencies`."""
+    from .plugin.lock import LockError, load_locked_dependencies
+
+    try:
+        locked = load_locked_dependencies(directory, skip=set(dependencies))
+    except LockError as exc:
+        print(f"{who}: {exc}", file=sys.stderr)
+        return None
+    return {**(locked or {}), **dependencies}
 
 
 def _format_plugin_diagnostic(diag) -> str:
@@ -1574,6 +1590,9 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         directory = Path(args.dir)
         if (directory / "plugin.yaml").is_file():
+            dependencies = _add_locked_dependencies("rwtask validate", directory, dependencies)
+            if dependencies is None:
+                return 2
             tree = load_dir(directory)
         elif (directory / "SKILL.md").is_file():
             tree = load_skill_dir(directory)
@@ -1602,6 +1621,9 @@ def main(argv: list[str] | None = None) -> int:
         if not (directory / "plugin.yaml").is_file():
             print(f"rwtask compile: {directory} has no plugin.yaml", file=sys.stderr)
             return 1
+        dependencies = _add_locked_dependencies("rwtask compile", directory, dependencies)
+        if dependencies is None:
+            return 2
         tree = load_dir(directory)
         diagnostics = validate_tree(tree, dependencies=dependencies)
         for diag in diagnostics:
