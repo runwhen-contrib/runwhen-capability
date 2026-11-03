@@ -1,4 +1,4 @@
-"""Canonical JSON and the three hashes the V13 contracts pin down.
+"""Canonical JSON and the two hashes the V13 contracts pin down.
 
 These are contracts, not conveniences: the registry, the executor and the SDK
 (and any Go implementation) must agree byte for byte, so each algorithm is
@@ -9,7 +9,6 @@ spelled out here and replayed from contracts/vectors/*.json by the tests.
   NaN/Infinity.
 - `permission_hash`: identity of one permission rule, insensitive to list order,
   duplicates and keys that are absent, None or an empty list.
-- `tree_hash`: identity of a file tree (path, content and exec bit).
 - `task_hash`: identity of one compiled task plus the files it depends on.
 """
 
@@ -18,8 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from decimal import Decimal
 from typing import Any
 
@@ -97,36 +95,10 @@ def permission_hash(rule: Mapping[str, Any]) -> str:
     return _sha256_tag(canonical_json(normalize_permission(rule)))
 
 
-@dataclass(frozen=True)
-class TreeEntry:
-    """One file of a tree: POSIX path relative to the tree root, its bytes, and
-    whether the exec bit is set."""
-
-    path: str
-    data: bytes
-    executable: bool = False
-
-
-def tree_hash(entries: Iterable[TreeEntry]) -> str:
-    """ "sha256:" + hex of sha256 over one line per entry, sorted by the path's
-    UTF-8 bytes: `<sha256(data) hex> <755|644> <path>\\n`. Raises ValueError on
-    an invalid path (see `_check_path`) or a duplicate path."""
-    lines: dict[bytes, bytes] = {}
-    for entry in entries:
-        _check_path(entry.path)
-        key = entry.path.encode("utf-8")
-        if key in lines:
-            raise ValueError(f"duplicate path in tree: {entry.path!r}")
-        mode = "755" if entry.executable else "644"
-        digest = hashlib.sha256(entry.data).hexdigest()
-        lines[key] = f"{digest} {mode} {entry.path}\n".encode()
-    return _sha256_tag(b"".join(lines[key] for key in sorted(lines)))
-
-
 def task_hash(compiled_task: Mapping[str, Any], files: Mapping[str, bytes]) -> str:
     """ "sha256:" + hex of sha256(canonical_json({"task": <compiled_task without
     its "hash" key>, "files": {path: sha256(data) hex}})). Paths are validated
-    like `tree_hash`'s."""
+    like an archive's (relative POSIX, no empty, '.' or '..' segment)."""
     task = {key: value for key, value in compiled_task.items() if key != "hash"}
     digests: dict[str, str] = {}
     for path, data in files.items():

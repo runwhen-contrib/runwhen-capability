@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Write the cross-language hash vectors, contracts/vectors/*.json.
+"""Write the cross-language vectors: contracts/vectors/*.json (hashes) and
+contracts/vectors/archive/ (golden plugin archives).
 
 Each file is {"description": ..., "cases": [{"name", "input", "expected"}]} so
 a Go (or any other) implementation can replay it. Bytes are carried as
-base64 (`dataBase64`). The case lists below are fixed; `expected` is computed
+base64 (`dataBase64`). Each archive case is a <case>.json (entries, sha256, size)
+plus the exact bytes <case>.tar. The case lists below are fixed; `expected` is computed
 by the Python reference implementation, and a test fails if the committed
 files differ from a fresh run. Run from the repo root:
 
@@ -24,11 +26,12 @@ from typing import Any
 
 from runwhen_capability.contracts import (
     TreeEntry,
+    archive_sha256,
     canonical_json,
     permission_hash,
     task_hash,
-    tree_hash,
 )
+from runwhen_capability.contracts.archive import build as build_archive
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "contracts" / "vectors"
@@ -96,24 +99,6 @@ def _file(path: str, data: bytes, executable: bool | None = False) -> dict[str, 
         entry["executable"] = executable
     return entry
 
-
-TREE_INPUTS: list[tuple[str, list[dict[str, Any]]]] = [
-    ("empty tree", []),
-    ("single file", [_file("SKILL.md", b"# skill\n")]),
-    (
-        "input order does not matter",
-        [_file("b.txt", b"b"), _file("a.txt", b"a"), _file("lib/c.py", b"c = 1\n")],
-    ),
-    ("executable bit", [_file("run.sh", b"#!/bin/sh\necho hi\n", True)]),
-    ("same file without the executable bit", [_file("run.sh", b"#!/bin/sh\necho hi\n", False)]),
-    ("empty file", [_file("lib/__init__.py", b"")]),
-    (
-        "paths sort by utf-8 bytes, not locale",
-        [_file("a", b"1"), _file("Z", b"2"), _file("é", b"3"), _file("a/b", b"4")],
-    ),
-    ("binary content", [_file("data.bin", bytes(range(256)))]),
-    ("unicode path", [_file("docs/naïve.md", "naïve\n".encode())]),
-]
 
 TASK = {
     "name": "restart-count",
@@ -204,6 +189,83 @@ TASK_INPUTS: list[tuple[str, dict[str, Any]]] = [
 ]
 
 
+_LONG_DIR = "/".join(["skills", "d" * 40, "e" * 40])  # 88 bytes
+_LONG_PATH = f"{_LONG_DIR}/{'f' * 30}.md"  # 122 bytes: needs the ustar prefix field
+
+# case -> (description, entries in the order they are given to build())
+ARCHIVE_CASES: dict[str, tuple[str, list[TreeEntry]]] = {
+    "single-file": (
+        "One regular file.",
+        [TreeEntry("plugin.yaml", b"apiVersion: runwhen.com/plugin/v1\nname: demo\n")],
+    ),
+    "nested-executable": (
+        "Nested paths and an executable script; no directory entries are written.",
+        [
+            TreeEntry("skills/k8s/run.sh", b"#!/bin/sh\necho hi\n", executable=True),
+            TreeEntry("plugin.yaml", b"name: demo\n"),
+            TreeEntry("skills/k8s/SKILL.md", b"# k8s\n"),
+        ],
+    ),
+    "long-path-prefix-split": (
+        "A 122-byte path: written with the longest ustar prefix that fits "
+        "(prefix = the first 88 bytes, name = the last 33).",
+        [TreeEntry("plugin.yaml", b"name: demo\n"), TreeEntry(_LONG_PATH, b"long path\n")],
+    ),
+    "unicode-nfc-path": (
+        "A non-ASCII (NFC, precomposed) path, written as UTF-8.",
+        [TreeEntry("knowledge/caf\u00e9/na\u00efve.md", "na\u00efve caf\u00e9\n".encode())],
+    ),
+    "empty-file": (
+        "A zero-length file: a header and no content blocks.",
+        [TreeEntry("lib/__init__.py", b""), TreeEntry("plugin.yaml", b"name: demo\n")],
+    ),
+    "ten-files-out-of-order": (
+        "Ten files given out of order: entries are written sorted by the UTF-8 bytes of the "
+        "path (uppercase before lowercase, 'a.txt' before 'a/b.txt').",
+        [
+            TreeEntry(path, data, executable)
+            for path, data, executable in (
+                ("skills/b/SKILL.md", b"b\n", False),
+                ("a.txt", b"a\n", False),
+                ("plugin.yaml", b"name: demo\n", False),
+                ("Z.md", b"Z\n", False),
+                ("skills/a/run.sh", b"#!/bin/sh\n", True),
+                ("a/b.txt", b"a/b\n", False),
+                ("rules/no-delete.md", b"never delete\n", False),
+                ("knowledge/runbook.md", b"restart it\n", False),
+                ("integration/integration.yaml", b"name: demo\n", False),
+                ("skills/a/SKILL.md", b"a\n", False),
+            )
+        ],
+    ),
+}
+
+
+def build_archives() -> dict[str, bytes]:
+    """relative path under the vectors dir -> bytes, for each archive case."""
+    out: dict[str, bytes] = {}
+    for case, (description, entries) in ARCHIVE_CASES.items():
+        archive = build_archive(entries)
+        doc = {
+            "description": description,
+            "entries": [
+                {
+                    "path": e.path,
+                    "dataBase64": base64.b64encode(e.data).decode("ascii"),
+                    "executable": e.executable,
+                }
+                for e in entries
+            ],
+            "sha256": archive_sha256(archive),
+            "size": len(archive),
+        }
+        out[f"archive/{case}.json"] = (
+            json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+        ).encode()
+        out[f"archive/{case}.tar"] = archive
+    return out
+
+
 def _decode(file: dict[str, Any]) -> bytes:
     return base64.b64decode(file["dataBase64"])
 
@@ -234,23 +296,6 @@ def build() -> dict[str, dict[str, Any]]:
             "cases": [
                 {"name": name, "input": rule, "expected": permission_hash(rule)}
                 for name, rule in PERMISSION_INPUTS
-            ],
-        },
-        "tree-hash.json": {
-            "description": (
-                "tree_hash(input): sha256 over lines '<sha256(data)> <755|644> <path>\\n' "
-                "sorted by the path's UTF-8 bytes. Input is a list of "
-                "{path, dataBase64, executable}."
-            ),
-            "cases": [
-                {
-                    "name": name,
-                    "input": entries,
-                    "expected": tree_hash(
-                        TreeEntry(e["path"], _decode(e), e["executable"]) for e in entries
-                    ),
-                }
-                for name, entries in TREE_INPUTS
             ],
         },
         "task-hash.json": {
@@ -284,10 +329,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    args.out.mkdir(parents=True, exist_ok=True)
-    for filename, doc in build().items():
-        text = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
-        (args.out / filename).write_text(text, encoding="utf-8")
+    files = {
+        name: (json.dumps(doc, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        for name, doc in build().items()
+    }
+    files.update(build_archives())
+    for name, data in files.items():
+        target = args.out / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
     return 0
 
 

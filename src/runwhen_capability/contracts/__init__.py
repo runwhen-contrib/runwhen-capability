@@ -6,6 +6,9 @@ seam, plus an offline validator for them.
     for v in validate("tasks", doc):    # or inspect every violation
         print(v.path, v.message)
 
+The plugin archive (deterministic ustar tar, `contracts.archive.build/read/verify`)
+and the canonical-JSON hashes live alongside.
+
 The schemas are authored in the repo-level contracts/ directory and mirrored
 into `_data/` by scripts/sync_contracts.py (`make contracts-sync`).
 """
@@ -16,20 +19,21 @@ from typing import Any
 
 from . import _validate
 from ._validate import ContractError, ContractViolation, check, data_dir, schema, validate
+from .archive import ArchiveError, TreeEntry, archive_sha256
 from .hashing import (
-    TreeEntry,
     canonical_json,
     normalize_permission,
     permission_hash,
     task_hash,
-    tree_hash,
 )
 
 __all__ = [
     "SCHEMA_NAMES",
+    "ArchiveError",
     "ContractError",
     "ContractViolation",
     "TreeEntry",
+    "archive_sha256",
     "canonical_json",
     "check",
     "data_dir",
@@ -37,7 +41,6 @@ __all__ = [
     "permission_hash",
     "schema",
     "task_hash",
-    "tree_hash",
     "validate",
 ]
 
