@@ -1,0 +1,19 @@
+apiVersion: runwhen.com/integration/v1
+platform: kubernetes
+title: Kubernetes
+credentialTypes:
+  kubernetes/kubeconfig:
+    title: kubeconfig file
+    content: kubeconfig
+    materialize: { file: { env: KUBECONFIG, mode: "0600" } }
+authMethods:
+  kubeconfig:
+    title: kubeconfig Secret
+    produces: kubernetes/kubeconfig
+    accepts: [k8s-secret, vault, file]
+    native: passthrough
+permissions:
+  schema: ./schemas/rbac-rule.json
+entryPoints:
+  discovery: { task: k8s-base/discover, schedule: "*/15 * * * *" }
+  cli: { task: k8s-base/kubectl }
