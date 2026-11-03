@@ -16,14 +16,28 @@ from typing import Any
 
 from . import _validate
 from ._validate import ContractError, ContractViolation, check, data_dir, schema, validate
+from .hashing import (
+    TreeEntry,
+    canonical_json,
+    normalize_permission,
+    permission_hash,
+    task_hash,
+    tree_hash,
+)
 
 __all__ = [
     "SCHEMA_NAMES",
     "ContractError",
     "ContractViolation",
+    "TreeEntry",
+    "canonical_json",
     "check",
     "data_dir",
+    "normalize_permission",
+    "permission_hash",
     "schema",
+    "task_hash",
+    "tree_hash",
     "validate",
 ]
 

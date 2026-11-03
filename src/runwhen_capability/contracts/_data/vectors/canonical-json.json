@@ -1,0 +1,90 @@
+{
+  "description": "canonical_json(input) as a UTF-8 string: sorted keys, no whitespace, non-ASCII kept as UTF-8. Vectors contain no floats.",
+  "cases": [
+    {
+      "name": "key order",
+      "input": {
+        "b": 1,
+        "a": 2,
+        "c": {
+          "z": true,
+          "y": false
+        }
+      },
+      "expected": "{\"a\":2,\"b\":1,\"c\":{\"y\":false,\"z\":true}}"
+    },
+    {
+      "name": "unicode kept as utf-8",
+      "input": {
+        "name": "naïve",
+        "emoji": "✓ ok",
+        "cjk": "日本"
+      },
+      "expected": "{\"cjk\":\"日本\",\"emoji\":\"✓ ok\",\"name\":\"naïve\"}"
+    },
+    {
+      "name": "nested dicts and lists",
+      "input": {
+        "outer": {
+          "inner": [
+            {
+              "b": 1,
+              "a": null
+            },
+            [],
+            {}
+          ],
+          "k": "v"
+        }
+      },
+      "expected": "{\"outer\":{\"inner\":[{\"a\":null,\"b\":1},[],{}],\"k\":\"v\"}}"
+    },
+    {
+      "name": "scalars",
+      "input": [
+        true,
+        false,
+        null,
+        0,
+        -7,
+        9007199254740993,
+        "",
+        "a b"
+      ],
+      "expected": "[true,false,null,0,-7,9007199254740993,\"\",\"a b\"]"
+    },
+    {
+      "name": "string escapes",
+      "input": {
+        "s": "quote \" backslash \\ newline \n tab \t control \u0001"
+      },
+      "expected": "{\"s\":\"quote \\\" backslash \\\\ newline \\n tab \\t control \\u0001\"}"
+    },
+    {
+      "name": "empty containers",
+      "input": {
+        "a": [],
+        "b": {}
+      },
+      "expected": "{\"a\":[],\"b\":{}}"
+    },
+    {
+      "name": "list order is preserved",
+      "input": {
+        "xs": [
+          3,
+          1,
+          2,
+          "b",
+          "a"
+        ]
+      },
+      "expected": "{\"xs\":[3,1,2,\"b\",\"a\"]}"
+    },
+    {
+      "name": "top-level string",
+      "input": "just a string",
+      "expected": "\"just a string\""
+    }
+  ]
+}
