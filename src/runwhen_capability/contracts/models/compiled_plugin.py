@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, RootModel, constr
 
 from . import common, skill_frontmatter
 from . import integration as integration_1
-from . import plugin as plugin_1
 
 
 class Compiler(BaseModel):
@@ -19,19 +18,6 @@ class Compiler(BaseModel):
     )
     name: str = Field(..., max_length=128, min_length=1)
     version: str = Field(..., max_length=64, min_length=1)
-
-
-class Plugin(BaseModel):
-    """
-    plugin.yaml as authored, or the synthetic `workspace` plugin a workspace skill revision compiles to (plugin.schema keeps `workspace` reserved, so authors cannot use it).
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    name: Literal["workspace"]
-    version: str = Field(..., pattern="^0\\.0\\.0-rev\\.[1-9][0-9]*$")
-    description: str = Field(..., max_length=1024, min_length=1)
 
 
 class Role(Enum):
@@ -266,6 +252,15 @@ class CompiledOutput(RootModel[CompiledOutput1 | CompiledOutput2 | CompiledOutpu
     root: CompiledOutput1 | CompiledOutput2 | CompiledOutput3
 
 
+class WorkspacePlugin(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    name: Literal["workspace"]
+    version: str = Field(..., pattern="^0\\.0\\.0-rev\\.[1-9][0-9]*$")
+    description: str = Field(..., max_length=1024, min_length=1)
+
+
 class Skill(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -297,9 +292,9 @@ class CompiledPlugin(BaseModel):
     )
     apiVersion: Literal["runwhen.com/compiled-plugin/v1"]
     compiler: Compiler
-    plugin: plugin_1.Plugin | Plugin = Field(
+    plugin: Any = Field(
         ...,
-        description="plugin.yaml as authored, or the synthetic `workspace` plugin a workspace skill revision compiles to (plugin.schema keeps `workspace` reserved, so authors cannot use it).",
+        description="plugin.yaml as authored, or the synthetic `workspace` plugin a workspace skill revision compiles to (plugin.schema keeps `workspace` reserved, so authors cannot use it). Discriminated by `name`, so a broken plugin block reports the exact field.",
     )
     integration: Integration | None
     skills: list[Skill]
