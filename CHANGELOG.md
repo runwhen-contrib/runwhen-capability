@@ -3,6 +3,17 @@
 This project follows [Semantic Versioning](https://semver.org/). Releases are git tags `v<version>`
 with the wheel and sdist attached to the GitHub Release.
 
+## Unreleased
+
+### Fixed
+
+- A custom bundle's `lib/` is now usable from its tasks, as the skill spec promises. A Python task
+  imports a module from it by name (`lib/` is appended to `sys.path`, after the standard library
+  and site-packages, so it can never shadow them); a bash task sources a file from it as
+  `source "$RW_LIB_DIR/<file>"`. `RW_LIB_DIR` is set for both languages, is reserved like every
+  `RW_*` name (no input can override it), and `validate` no longer flags reading it as an
+  undeclared input.
+
 ## 0.4.0
 
 ### Added

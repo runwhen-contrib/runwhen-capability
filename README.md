@@ -226,6 +226,11 @@ with a failed result and none of its code is written or run. A bundle is arbitra
 an image built to run custom capabilities should turn this on; packaged-capability images leave
 it off.
 
+A bundle's `lib/` directory holds its shared code. A Python task imports it by module name
+(`from helpers import double` for `lib/helpers.py`): `lib/` is appended to `sys.path`, after the
+standard library and site-packages, so a `lib/json.py` never shadows `import json`. A bash task
+sources it through `$RW_LIB_DIR` (`source "$RW_LIB_DIR/common.sh"`).
+
 #### Artifact outputs
 
 A task's output is either a value checked against a `schema` or a file declared with `artifact`
