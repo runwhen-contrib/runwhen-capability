@@ -33,6 +33,7 @@ from .models import (
     TaskResult,
     TaskSpec,
 )
+from .rwerrors import RwCommandError, RwError
 
 __all__ = [
     "ArtifactRef",
@@ -42,6 +43,8 @@ __all__ = [
     "setup",
     "task",
     "SkipTask",
+    "RwError",
+    "RwCommandError",
     "Finding",
     "GrepMatch",
     "GrepResult",

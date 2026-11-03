@@ -18,6 +18,20 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 #   rw_skip [reason]          mark the task skipped and exit 0
 #   rw_artifact <name> <path> register the file at <path> as artifact <name>
 #   rw_artifact <name> -      copy stdin to $RW_ARTIFACTS_DIR/<name> and register that
+#   rw_output_append <output> <json>   the same as rw_append
+#   rw_output_set <output> <json>      the same as rw_set
+#   rw_error <code> <message> [scope]  record a structured error and carry on
+#
+# $RW_OUT is a directory, fresh for this task, that the task may write to freely;
+# nothing in it is read by the host.
+#
+# rw_error records "the task could not look at something" (never a finding): <code> is
+# one of permission_denied, not_found, unreachable, timeout, rate_limited, storage,
+# invalid_input, dependency, internal (any other is recorded as internal, with a hint),
+# <message> is one line of text, [scope] says what it was looking at. It does not exit:
+# the exit code decides failed (non-zero) or not, and recorded errors make a clean
+# exit partial. It appends one JSON line to the file $RW_ERRORS_FILE, which the host
+# reads after the task exits.
 #
 # rw_append/rw_set/rw_skip/rw_artifact write one JSON line to the private file
 # descriptor the host opened for this task ($RW_OUTPUT_FD) -- never to
@@ -94,6 +108,40 @@ rw_set() {
     value=${value//$'\n'/ }
     printf '{"op":"set","name":%s,"value":%s}\n' "$(_rw_json_string "$name")" "$value" \
         >&"${RW_OUTPUT_FD}"
+}
+
+rw_output_append() { rw_append "$@"; }
+
+rw_output_set() { rw_set "$@"; }
+
+rw_error() {
+    local code="${1:-}" message="${2:-}" scope="${3:-}" hint="" c ok=""
+    if [[ -z $code || -z $message ]]; then
+        printf 'rw_error: usage: rw_error <code> <message> [scope]\n' >&2
+        return 2
+    fi
+    if [[ -z ${RW_ERRORS_FILE:-} ]]; then
+        printf 'rw_error: RW_ERRORS_FILE is not set\n' >&2
+        return 1
+    fi
+    for c in permission_denied not_found unreachable timeout rate_limited storage \
+        invalid_input dependency internal; do
+        [[ $code == "$c" ]] && ok=1
+    done
+    if [[ -z $ok ]]; then
+        printf 'rw_error: %s is not an error code; recorded as internal\n' "$code" >&2
+        hint="invalid error code '$code'; use one of permission_denied, not_found, unreachable, "
+        hint+="timeout, rate_limited, storage, invalid_input, dependency, internal"
+        code=internal
+    fi
+    message=${message//[[:cntrl:]]/ }
+    scope=${scope//[[:cntrl:]]/ }
+    local line
+    line=$(printf '{"code":"%s","message":%s' "$code" "$(_rw_json_string "$message")")
+    [[ -n $scope ]] && line+=$(printf ',"scope":%s' "$(_rw_json_string "$scope")")
+    [[ -n $hint ]] && line+=$(printf ',"hint":%s' "$(_rw_json_string "$hint")")
+    # One write of one line: appends from concurrent processes do not interleave.
+    printf '%s}\n' "$line" >> "$RW_ERRORS_FILE"
 }
 
 rw_skip() {

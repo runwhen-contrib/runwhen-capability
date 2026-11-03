@@ -6,14 +6,16 @@ file a task reads, no environment it inspects, no path it constructs.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .artifacts import ArtifactsClient
 from .errors import CredentialNotFoundError, OutputTooLargeError, SkipTask
@@ -21,6 +23,7 @@ from .findings import FindingsClient
 from .git import GitClient
 from .models import InputArtifactDecl, OutputDecl
 from .repo_fs import RepoFsClient
+from .rwerrors import ERROR_CODES, RwCommandError, RwError, classify_command_error
 from .sarif import SARIF_BYTE_BUDGET, SarifClient
 
 if TYPE_CHECKING:
@@ -58,6 +61,76 @@ _RUN_READ_CHUNK = 65536
 # to; see `run()`'s docstring for why this is only a belt-and-braces bound,
 # not the primary fix for a grandchild holding a pipe open.
 _DRAIN_JOIN_TIMEOUT = 5
+
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _snake(name: str) -> str:
+    """camelCase -> snake_case, the spelling `ctx.settings` attributes use
+    (the same rule as custom.manifest.python_kwarg_name, which this module
+    does not import: a bundle's child process should not pay for it)."""
+    return _CAMEL_BOUNDARY.sub("_", name).lower()
+
+
+class AttrView(Mapping):
+    """A read-only view of a JSON object with attribute access
+    (`ctx.resource.namespace`, `ctx.settings.latency_threshold_ms`). Nested
+    objects are views too. A missing attribute is an AttributeError, a missing
+    key a KeyError; with `snake=True` every key (at every depth) is snake_cased."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: Mapping[str, Any], *, snake: bool = False) -> None:
+        object.__setattr__(
+            self,
+            "_data",
+            {(_snake(k) if snake else k): _wrap(v, snake) for k, v in data.items()},
+        )
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails (not for `_data`, a slot).
+        try:
+            return self._data[name]
+        except KeyError:
+            raise AttributeError(f"no field {name!r}") from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("read-only")
+
+    def __repr__(self) -> str:
+        return f"AttrView({self._data!r})"
+
+
+def _wrap(value: Any, snake: bool) -> Any:
+    if isinstance(value, Mapping):
+        return AttrView(value, snake=snake)
+    if isinstance(value, list):
+        return [_wrap(item, snake) for item in value]
+    return value
+
+
+def _json_object_env(name: str, *, snake: bool) -> AttrView | None:
+    """The JSON object in env var `name` as an AttrView; None when unset."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return AttrView(doc, snake=snake)
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -175,6 +248,15 @@ class Context:
         self.artifact_cache_dir = Path(artifact_cache_dir) if artifact_cache_dir else None
         self.deadline_at = deadline_at
 
+        # What the host (the runner, or `rwtask run`) says about this run, from the
+        # environment it set for the task process (CONTRACTS.md "What a script sees").
+        # Unlike credentials, none of it is secret.
+        self.resource: AttrView | None = _json_object_env("RW_RESOURCE_JSON", snake=False)
+        self.settings: AttrView = _json_object_env("RW_SETTINGS_JSON", snake=True) or AttrView({})
+        self.dry_run: bool = os.environ.get("RW_DRY_RUN") == "1"
+        self._errors: list[dict[str, Any]] = []
+        self._errors_file = os.environ.get("RW_ERRORS_FILE") or None
+
         self.git = GitClient(self)
         self.sarif = SarifClient(self)
         self.findings = FindingsClient(self)
@@ -216,6 +298,50 @@ class Context:
         setup already is -- see SkipTask's docstring."""
         raise SkipTask(reason)
 
+    @property
+    def errors(self) -> list[dict[str, Any]]:
+        """The structured errors this task has recorded with `ctx.error`, in
+        order. A copy: appending to it records nothing."""
+        return json.loads(json.dumps(self._errors))
+
+    def error(
+        self,
+        code: str,
+        message: str,
+        *,
+        scope: str | None = None,
+        hint: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Records a structured error (D64: the task failed to look at
+        something -- never a finding) and carries on. `code` is one of
+        rwerrors.ERROR_CODES; any other is recorded as `internal`, with a hint
+        naming the bad code. The error is appended, as one JSON line, to the
+        side channel the host reads after the task exits (`$RW_ERRORS_FILE`),
+        so it counts even if the task then crashes. A task that wants to stop
+        raises `RwError` instead."""
+        if not isinstance(code, str) or code not in ERROR_CODES:
+            note = f"invalid error code {code!r}; use one of {', '.join(ERROR_CODES)}"
+            hint = f"{note}. {hint}" if hint else note
+            code = "internal"
+        entry = RwError(code, message, scope=scope, hint=hint, details=details).to_dict()
+        line = json.dumps(entry, default=str)
+        self._errors.append(json.loads(line))
+        if self._errors_file is None:
+            return
+        try:
+            fd = os.open(
+                self._errors_file,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.write(fd, (line + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            self.log.warning("could not write the error side channel: %s", exc)
+
     def run(
         self,
         argv: list[str],
@@ -224,6 +350,7 @@ class Context:
         env: dict[str, str] | None = None,
         *,
         inherit_env: bool = True,
+        check: bool = False,
     ) -> subprocess.CompletedProcess:
         """Runs argv as a subprocess. stdout is captured (returned on
         `.stdout`); stderr is captured and forwarded line-by-line to
@@ -382,8 +509,18 @@ class Context:
         if stderr_state.get("over"):
             stderr += f"\n... stderr truncated at {_STDERR_BYTE_BUDGET} bytes"
 
+        prog = argv[0] if argv else "?"
         if stderr:
-            prog = argv[0] if argv else "?"
             for line in stderr.splitlines():
                 self.log.info("%s: %s", prog, line)
+        if check and proc.returncode != 0:
+            last = next((ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), "")
+            message = f"{prog} exited {proc.returncode}" + (f": {last[:500]}" if last else "")
+            raise RwCommandError(
+                classify_command_error(argv, proc.returncode, stderr),
+                message,
+                argv=argv,
+                returncode=proc.returncode,
+                stderr=stderr,
+            )
         return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout, stderr=stderr)

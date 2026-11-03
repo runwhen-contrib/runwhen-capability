@@ -20,6 +20,7 @@ from runwhen_capability.custom.static_checks import (
     bash_input_used,
     bash_locally_assigned_names,
     bash_output_writes,
+    bash_unknown_sdk_helpers,
     mutating_kubectl_calls,
     python_data_as_code,
     python_input_used,
@@ -379,3 +380,18 @@ def test_rw_artifact_with_a_name_that_is_not_a_plain_segment_is_flagged(name):
     quoted = f'"{name}"'
     (message,) = _messages_for(f"seq 1 3 | rw_artifact {quoted} -\n", E_OUTPUT_UNDECLARED)
     assert "not a valid artifact name" in message
+
+
+def test_the_cap5_helpers_are_known_sdk_helpers():
+    source = (
+        'source "$RW_SDK/rw.sh"\n'
+        "rw_output_append rows '{}'\n"
+        "rw_output_set total 1\n"
+        'rw_error not_found "no pod"\n'
+    )
+    assert bash_unknown_sdk_helpers(source) == []
+
+
+def test_rw_output_aliases_count_as_output_writes():
+    source = "rw_output_append rows '{}'\nrw_output_set total 1\n"
+    assert [name for _, name in bash_output_writes(source)] == ["rows", "total"]

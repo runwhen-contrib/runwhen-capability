@@ -290,3 +290,98 @@ def test_rw_artifact_without_an_artifacts_dir_fails_clearly(tmp_path):
     )
     assert "rc=1" in proc.stdout
     assert "RW_ARTIFACTS_DIR" in proc.stderr
+
+
+# -- rw_error, rw_output_append, rw_output_set (CAP-5) ----------------------------
+
+
+def _channels_bash(tmp_path, script: str, *, with_errors_file: bool = True):
+    """Runs `script` after sourcing rw.sh with the output channel on fd 7 and the
+    error side channel at <tmp>/errors.jsonl; returns the process, the output
+    events and the error entries."""
+    rw_sh = tmp_path / "rw.sh"
+    rw_sh.write_text(RW_SH)
+    events = tmp_path / "events"
+    errors = tmp_path / "errors.jsonl"
+    env = {"PATH": "/usr/bin:/bin", "RW_OUTPUT_FD": "7"}
+    if with_errors_file:
+        env["RW_ERRORS_FILE"] = str(errors)
+    proc = subprocess.run(
+        ["bash", "-c", f'exec 7>"{events}"\nsource "{rw_sh}"\n{script}'],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    read = lambda p: [json.loads(x) for x in p.read_text().splitlines()] if p.exists() else []  # noqa: E731
+    return proc, read(events), read(errors)
+
+
+def test_rw_error_appends_one_json_line(tmp_path):
+    proc, _, errors = _channels_bash(tmp_path, 'rw_error not_found "no such pod"')
+    assert proc.returncode == 0, proc.stderr
+    assert errors == [{"code": "not_found", "message": "no such pod"}]
+
+
+def test_rw_error_takes_an_optional_scope(tmp_path):
+    proc, _, errors = _channels_bash(tmp_path, 'rw_error timeout "too slow" "ns/web"')
+    assert proc.returncode == 0, proc.stderr
+    assert errors == [{"code": "timeout", "message": "too slow", "scope": "ns/web"}]
+
+
+def test_rw_error_escapes_quotes_backslashes_newlines_and_control_characters(tmp_path):
+    proc, _, errors = _channels_bash(
+        tmp_path, "rw_error internal $'say \"hi\" \\\\ \\n tab\\t esc\\x1b done'"
+    )
+    assert proc.returncode == 0, proc.stderr
+    [error] = errors
+    assert error["code"] == "internal"
+    assert error["message"].startswith('say "hi" \\ ')
+    assert "tab" in error["message"]
+    assert "done" in error["message"]
+    assert "\x1b" not in error["message"]
+
+
+def test_rw_error_appends_in_order(tmp_path):
+    proc, _, errors = _channels_bash(tmp_path, "rw_error timeout one\nrw_error storage two")
+    assert proc.returncode == 0, proc.stderr
+    assert [e["code"] for e in errors] == ["timeout", "storage"]
+
+
+def test_rw_error_with_a_code_outside_the_closed_list_records_internal_with_a_hint(tmp_path):
+    proc, _, errors = _channels_bash(tmp_path, 'rw_error E_BOOM "it broke"')
+    assert proc.returncode == 0, proc.stderr
+    [error] = errors
+    assert error["code"] == "internal"
+    assert error["message"] == "it broke"
+    assert "E_BOOM" in error["hint"]
+    assert "permission_denied" in error["hint"]
+    assert "E_BOOM" in proc.stderr
+
+
+@pytest.mark.parametrize("script", ["rw_error", "rw_error timeout", 'rw_error timeout ""'])
+def test_rw_error_usage_errors_record_nothing(tmp_path, script):
+    proc, _, errors = _channels_bash(tmp_path, script)
+    assert proc.returncode == 2
+    assert "usage" in proc.stderr
+    assert errors == []
+
+
+def test_rw_error_without_the_side_channel_fails_loudly(tmp_path):
+    proc, _, _ = _channels_bash(tmp_path, 'rw_error timeout "x"', with_errors_file=False)
+    assert proc.returncode == 1
+    assert "RW_ERRORS_FILE" in proc.stderr
+
+
+def test_rw_output_append_and_set_write_the_same_events_as_the_originals(tmp_path):
+    proc, events, _ = _channels_bash(
+        tmp_path,
+        "rw_output_append rows '{\"a\":1}'\nrw_output_set total 3\n"
+        "rw_append rows2 '{\"a\":1}'\nrw_set total2 3",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert events[0] == {"op": "append", "name": "rows", "value": {"a": 1}}
+    assert events[1] == {"op": "set", "name": "total", "value": 3}
+    assert events[2]["op"] == "append"
+    assert events[3]["op"] == "set"

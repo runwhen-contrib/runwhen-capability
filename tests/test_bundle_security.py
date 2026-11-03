@@ -120,8 +120,10 @@ def test_a_python_task_sees_a_private_home_tmpdir_and_no_host_or_wrapper_env(tmp
     assert info["env"] == [
         "RW_ARTIFACTS_DIR",
         "RW_CAPABILITY",
+        "RW_ERRORS_FILE",
         "RW_LIB_DIR",
         "RW_OPERATION",
+        "RW_OUT",
         "RW_OUTPUT_FD",
         "RW_WORKDIR",
     ]
