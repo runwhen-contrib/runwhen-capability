@@ -7,12 +7,23 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `runwhen_capability.testing`, for unit-testing a skill's scripts without a runner: `make_context(...)`
+  builds a real `Context` as the V13 executor does (and restores `os.environ` afterwards), with
+  `.errors`, `.artifact(name)` and `.envelope(outputs)` (checked against `result-envelope`);
+  `run_main(main, tc, **inputs)` calls a script's `main` as the entry point does and returns the
+  envelope; `stub_commands(tc, {argv: (rc, stdout, stderr)})` answers `ctx.run` without spawning.
+  Not exported from the package root.
 - `rwtask port <bundle-dir> --plugin <name> --into <skills-dir>` drafts a V13 `SKILL.md` and
   `tasks.yaml`, plus a porting brief, from a classic rw-cli Robot bundle. It never copies classic
   script bodies. Needs the new `port` extra (`robotframework>=7`).
 
 ### Fixed
 
+- `ctx.settings` snake_cases only the top-level setting names. It used to rewrite keys at every depth,
+  so an object-typed setting whose keys are user data (`patterns: {connRefused: ...}`) arrived with
+  its keys changed. Nested values now keep their keys verbatim (still readable as attributes where
+  the key is an identifier). Python task inputs were never affected: only the top-level input name
+  is converted.
 - A custom bundle's `lib/` is now usable from its tasks, as the skill spec promises. A Python task
   imports a module from it by name (`lib/` is appended to `sys.path`, after the standard library
   and site-packages, so it can never shadow them); a bash task sources a file from it as

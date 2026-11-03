@@ -130,6 +130,10 @@ What a script sees (the runner and `rwtask run` set the same names):
 `RW_SETTING_LATENCY_THRESHOLD_MS`). Identity fields are the integration's
 (`cluster`, `namespace`, `name` for a Kubernetes namespaced type).
 
+Only the top-level setting names are snake_cased (`ctx.settings.latency_threshold_ms`). An
+object-typed setting or input is user data: its nested keys arrive verbatim
+(`ctx.settings.patterns["connRefused"]`, also `ctx.settings.patterns.connRefused`).
+
 **Rules and knowledge.** `rules/<name>.md` (`name`, `description`; no
 `appliesTo`, D59) and `knowledge/<name>.md` (`name`, `description`, optional
 `appliesTo`, `resources`, `tags`, D61). File name equals `name`. Budget (D60,

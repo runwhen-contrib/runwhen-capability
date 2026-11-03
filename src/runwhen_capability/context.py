@@ -77,7 +77,9 @@ class AttrView(Mapping):
     """A read-only view of a JSON object with attribute access
     (`ctx.resource.namespace`, `ctx.settings.latency_threshold_ms`). Nested
     objects are views too. A missing attribute is an AttributeError, a missing
-    key a KeyError; with `snake=True` every key (at every depth) is snake_cased."""
+    key a KeyError. With `snake=True` only this object's own keys are snake_cased:
+    everything nested below them is user data and keeps its keys verbatim (a
+    setting `patterns: {connRefused: ...}` is read as `ctx.settings.patterns.connRefused`)."""
 
     __slots__ = ("_data",)
 
@@ -85,7 +87,7 @@ class AttrView(Mapping):
         object.__setattr__(
             self,
             "_data",
-            {(_snake(k) if snake else k): _wrap(v, snake) for k, v in data.items()},
+            {(_snake(k) if snake else k): _wrap(v) for k, v in data.items()},
         )
 
     def __getitem__(self, key: str) -> Any:
@@ -111,11 +113,12 @@ class AttrView(Mapping):
         return f"AttrView({self._data!r})"
 
 
-def _wrap(value: Any, snake: bool) -> Any:
+def _wrap(value: Any) -> Any:
+    """Nested values: views over dicts (keys verbatim), lists walked."""
     if isinstance(value, Mapping):
-        return AttrView(value, snake=snake)
+        return AttrView(value)
     if isinstance(value, list):
-        return [_wrap(item, snake) for item in value]
+        return [_wrap(item) for item in value]
     return value
 
 
@@ -521,18 +524,32 @@ class Context:
         if stderr_state.get("over"):
             stderr += f"\n... stderr truncated at {_STDERR_BYTE_BUDGET} bytes"
 
+        return self._finish_run(argv, proc.returncode, stdout, stderr, check)
+
+    def _finish_run(
+        self,
+        argv: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        check: bool | None,
+    ) -> subprocess.CompletedProcess:
+        """What `run()` does with a finished command: forward its stderr to
+        ctx.log, raise RwCommandError on a failure when `check` (or, if None, the
+        task contract) says to, else return the CompletedProcess. Its own method so
+        `runwhen_capability.testing`'s command stubs behave exactly as a real run."""
         prog = argv[0] if argv else "?"
         if stderr:
             for line in stderr.splitlines():
                 self.log.info("%s: %s", prog, line)
-        if (self._v13_contract if check is None else check) and proc.returncode != 0:
+        if (self._v13_contract if check is None else check) and returncode != 0:
             last = next((ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), "")
-            message = f"{prog} exited {proc.returncode}" + (f": {last[:500]}" if last else "")
+            message = f"{prog} exited {returncode}" + (f": {last[:500]}" if last else "")
             raise RwCommandError(
-                classify_command_error(argv, proc.returncode, stderr),
+                classify_command_error(argv, returncode, stderr),
                 message,
                 argv=argv,
-                returncode=proc.returncode,
+                returncode=returncode,
                 stderr=stderr,
             )
-        return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
