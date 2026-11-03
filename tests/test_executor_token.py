@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -785,22 +786,36 @@ def test_serve_with_no_token_file_loads_its_capability_and_picks_the_token_up_la
         stderr=subprocess.PIPE,
         text=True,
     )
+    lines: list[str] = []
+    reader = threading.Thread(
+        target=lambda: lines.extend(iter(serve_proc.stderr.readline, "")), daemon=True
+    )
+    reader.start()
     try:
-        time.sleep(1.5)  # long enough to have loaded the capability and tried a poll
+        # Wait for serve to say it is waiting and has loaded its capability: a fixed sleep
+        # raced a slow interpreter start on CI, so the token existed before serve looked.
+        _wait_for(
+            lambda: (
+                any("executor token not present yet" in line for line in lines)
+                and any("serving capability" in line for line in lines)
+            ),
+            "serve never logged that it is waiting for the token and serving",
+            60,
+        )
         assert serve_proc.poll() is None, "serve exited without a token"
         assert relay_server.requests == []  # nothing sent without a token
         token_file.write_text("late-executor-token\n")
         _wait_for(lambda: relay_server.requests, "serve never polled with the late token", 30)
     finally:
         serve_proc.terminate()
-        _, stderr = serve_proc.communicate(timeout=30)
+        serve_proc.wait(timeout=30)
+        reader.join(timeout=10)
+    stderr = "".join(lines)
 
     assert {r.header("Authorization") for r in relay_server.requests} == {
         "Bearer late-executor-token"
     }
     assert not token_file.exists()
-    assert "serving capability" in stderr
-    assert "executor token not present yet" in stderr
     assert " ERROR " not in stderr, stderr
 
 
