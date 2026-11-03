@@ -13,6 +13,12 @@ with the wheel and sdist attached to the GitHub Release.
   types, credential types and permission schema are then checked like the plugin's own (no more
   `W_TYPE_UNCHECKED` for it), plus `E_REQUIRES_RANGE` (npm-style ranges, new `plugin.semver`) and
   `W_DEPENDENCY_UNUSED`. Library: `plugin.load_dependency`, `validate_tree(..., dependencies=)`.
+- Every result envelope of a lease carries `provenance` (VER-6): the task ref, plugin, version and
+  task hash, the code's sha256, the runtime image and digest, `leaseId`, `taskRun`, and the first
+  credential's `connection`. It is on ok, failed and timed-out envelopes and on every refusal after
+  the lease validated (code hash mismatch, archive not in the cache, a dry run the task does not
+  support, plugin code switched off); a lease that fails its own contract gets none. `rwtask run`
+  stamps `{task, plugin, version, taskHash}` from the compiled task.
 - `runwhen_capability.testing`, for unit-testing a skill's scripts without a runner: `make_context(...)`
   builds a real `Context` as the V13 executor does (and restores `os.environ` afterwards), with
   `.errors`, `.artifact(name)` and `.envelope(outputs)` (checked against `result-envelope`);

@@ -701,7 +701,7 @@ def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
 
     import yaml
 
-    from .plugin.run import RunSpec, execute
+    from .plugin.run import RunSpec, execute, provenance_for_task
 
     ref = args.capability_dir
     if args.request or args.tasks or args.inputs or args.target or args.credentials:
@@ -759,6 +759,7 @@ def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     out = Path(args.out)
     try:
         outcome = execute(spec, scope_dir=scope_dir, inherit_home=True)
+        outcome.envelope["provenance"] = provenance_for_task(compiled, task)
         out.mkdir(parents=True, exist_ok=True)
         text = yaml.safe_dump(outcome.envelope, sort_keys=False, allow_unicode=True)
         (out / "result.yaml").write_text(text, encoding="utf-8")

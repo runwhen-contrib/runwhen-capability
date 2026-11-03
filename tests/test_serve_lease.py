@@ -622,3 +622,89 @@ def test_a_dry_run_lease_must_say_a_boolean(poll):
     envelope = envelope_of(poll({**make_lease("sh-write"), "dryRun": "yes"}))
     [error] = envelope["errors"]
     assert error["code"] == "invalid_input" and "dryRun" in error["message"]
+
+
+# -- provenance (VER-6) -------------------------------------------------------------------------
+
+
+def expected_provenance(lease: dict, **extra) -> dict:
+    """What a lease's envelope must carry, built by hand from the lease."""
+    code = lease["code"]
+    return {
+        "task": lease["task"]["ref"],
+        "plugin": "runmini",
+        "version": "0.1.0",
+        "taskHash": lease["task"]["hash"],
+        "archiveSha256": (code.get("archive") or code["inline"])["sha256"],
+        "runtime": {"image": "img", "digest": "sha256:" + "a" * 64},
+        "leaseId": "lease-1",
+        "taskRun": "run-1",
+        **extra,
+    }
+
+
+def test_an_ok_envelope_carries_the_leases_provenance(poll):
+    lease = make_lease("py-ok")
+    envelope = envelope_of(poll(lease))
+    assert envelope["status"] == "ok"
+    assert envelope["provenance"] == expected_provenance(lease)
+    assert envelope["provenance"]["taskHash"] == TASKS["py-ok"]["hash"]
+
+
+def test_a_failed_and_a_timed_out_envelope_carry_provenance(poll):
+    for name, timeout in (("py-raise", "30s"), ("py-slow", "1s")):
+        lease = make_lease(name, timeout=timeout)
+        envelope = envelope_of(poll(lease))
+        assert envelope["status"] == "failed"
+        assert envelope["provenance"] == expected_provenance(lease)
+
+
+def test_a_refusal_after_the_lease_validated_carries_provenance(poll):
+    mismatch = make_lease("py-ok")
+    mismatch["code"]["inline"]["sha256"] = "sha256:" + "0" * 64
+    envelope = envelope_of(poll(mismatch))
+    assert "code hash mismatch" in envelope["errors"][0]["message"]
+    # the lease's own claim, even though it is the one that was wrong
+    assert envelope["provenance"] == expected_provenance(mismatch)
+
+    sha = archive_sha256(archive.build(entries()))
+    missing = make_lease("py-ok", code={"archive": {"sha256": sha, "size": 123}})
+    envelope = envelope_of(poll(missing))
+    assert envelope["errors"][0]["code"] == "dependency"
+    assert envelope["provenance"] == expected_provenance(missing)
+    assert envelope["provenance"]["archiveSha256"] == sha
+
+    dry = dry_run_lease("sh-write-no-dry")
+    envelope = envelope_of(poll(dry))
+    assert envelope["errors"][0]["message"] == "task does not support dry run"
+    assert envelope["provenance"] == expected_provenance(dry)
+
+
+def test_a_lease_refused_for_the_opt_in_carries_provenance_when_it_validates(poll):
+    lease = make_lease("py-ok")
+    envelope = envelope_of(poll(lease, allow_bundles=False))
+    assert envelope["errors"][0]["code"] == "invalid_input"
+    assert envelope["provenance"] == expected_provenance(lease)
+    broken = make_lease("py-ok")
+    del broken["limits"]
+    assert "provenance" not in envelope_of(poll(broken, allow_bundles=False))
+
+
+def test_an_invalid_lease_gets_no_provenance(poll):
+    lease = make_lease("py-ok")
+    del lease["limits"]
+    envelope = envelope_of(poll(lease))
+    assert envelope["errors"][0]["code"] == "invalid_input"
+    assert "provenance" not in envelope
+
+
+def test_provenance_names_the_first_connection_of_the_credentials(poll):
+    lease = make_lease("py-ok")
+    lease["credentials"] = [
+        {"type": "runwhen/sync", "minted": {"ref": "m1", "ttlSeconds": 60}},
+        {"type": "kubernetes/kubeconfig", "connection": "prod-kube", "authPlan": AUTH_PLAN},
+        {"type": "kubernetes/kubeconfig", "connection": "other", "authPlan": AUTH_PLAN},
+    ]
+    envelope = envelope_of(poll(lease))
+    assert envelope["provenance"] == expected_provenance(lease, connection="prod-kube")
+    assert "connection" not in envelope_of(poll(make_lease("py-ok")))["provenance"]

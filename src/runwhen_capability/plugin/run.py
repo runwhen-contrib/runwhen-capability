@@ -139,6 +139,18 @@ class RunOutcome:
     log_tail: str = ""
 
 
+def provenance_for_task(plugin: Mapping[str, Any], task: Mapping[str, Any]) -> dict:
+    """The `provenance` (VER-6) of a run of the compiled `task` of the compiled `plugin`
+    document: `{task, plugin, version, taskHash}`. What `rwtask run` stamps on its
+    envelope; a lease's is plugin/lease.py's `provenance_from_lease`."""
+    return {
+        "task": task["ref"],
+        "plugin": plugin["plugin"]["name"],
+        "version": plugin["plugin"]["version"],
+        "taskHash": task["hash"],
+    }
+
+
 # -- resolve_target ---------------------------------------------------------------
 
 
