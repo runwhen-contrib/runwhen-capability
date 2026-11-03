@@ -37,18 +37,19 @@ input's body (`InputStream`), so a task that catches ArtifactError never
 sees a requests or urllib3 exception.
 
 The bearer token comes from a `TokenSource`. `rwtask serve` reads the executor token
-file at start-up and unlinks it; the source then holds the string in memory only, with no
-file for a task in the same pod to copy. If the unlink is refused (a read-only Secret
-volume, today's runner), the source re-reads the file on every call instead, so a Secret
-the kubelet refreshes in place on rotation is picked up (see serve.py). A client built
-from a plain `token` string or a `token_file` (tests, `rwtask run`) holds a fixed token:
-the file is read once, at construction.
+file (when it is there: a pod may start before its token does) and unlinks it; the source
+then holds the string in memory only, with no file for a task in the same pod to copy. If
+the unlink is refused (a read-only Secret volume, today's runner), the source re-reads the
+file on every call instead, so a Secret the kubelet refreshes in place on rotation is
+picked up (see serve.py). A client built from a plain `token` string or a `token_file`
+(tests, `rwtask run`) holds a fixed token: the file is read once, at construction.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import os
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -137,25 +138,80 @@ TRANSPORT_ERROR = "E_ARTIFACT_TRANSPORT"
 _TRANSPORT_EXCEPTIONS = (requests.RequestException, urllib3.exceptions.HTTPError, OSError)
 
 
+class TokenNotPresent(OSError):
+    """`TokenSource.get()` on a source still waiting for its token file."""
+
+
 class TokenSource:
-    """The executor's bearer token: `get()` returns the one to send.
+    """The executor's bearer token: `get()` returns the one to send. Three states:
+
+    Pending (`from_file` found no usable file): the pod started before its token did (an
+    image smoke test, a late mount). Each `get()` tries the file again and raises
+    `TokenNotPresent` while it is missing, unreadable or empty -- the serve loop skips the
+    poll and sleeps. The first successful read applies the normal rule, once: try to unlink
+    the file; if that works the source becomes fixed, if it is refused it becomes
+    re-reading.
 
     Fixed (`path=None`): `token` for the life of the process -- the file it came from is
-    gone. File-backed: `token` is what the file held at start-up and `get()` re-reads
-    `path` every time, so a rotation in place is picked up. A re-read that fails or finds
-    the file empty (a refresh caught mid-way) logs a warning and returns the last token
-    that was read, rather than sending nothing or dropping a result in hand."""
+    gone. Re-reading: `token` is what the file held and `get()` re-reads `path` every time,
+    so a rotation in place is picked up. A re-read that fails or finds the file empty (a
+    refresh caught mid-way) logs a warning and returns the last token that was read, rather
+    than sending nothing or dropping a result in hand."""
 
-    def __init__(self, token: str, path: Path | None = None, log: logging.Logger | None = None):
+    def __init__(
+        self, token: str | None, path: Path | None = None, log: logging.Logger | None = None
+    ):
         self._token = token
         self._path = Path(path) if path is not None else None
         self._log = log or logging.getLogger("runwhen_capability.relay")
 
+    @classmethod
+    def from_file(cls, path: Path, log: logging.Logger | None = None) -> TokenSource:
+        """The source for an executor token file, never raising: a file that is missing,
+        unreadable or empty gives a pending source (warned about once). Otherwise the file
+        is read and the unlink tried (see the class docstring), and the resulting mode is
+        logged once."""
+        source = cls(None, path, log)
+        if not source._adopt():
+            source._log.warning("executor token not present yet at %s; waiting for it", path)
+        return source
+
+    @property
+    def pending(self) -> bool:
+        return self._token is None
+
     @property
     def rereads_file(self) -> bool:
-        return self._path is not None
+        return self._path is not None and self._token is not None
+
+    def _adopt(self) -> bool:
+        """Pending only: reads the file and, if it holds a token, takes it and applies the
+        unlink rule. False when there is no token yet."""
+        try:
+            token = self._path.read_text().strip()
+        except OSError:
+            return False
+        if not token:
+            return False
+        self._token = token
+        try:
+            os.unlink(self._path)
+        except OSError:
+            self._log.info("executor token file left in place (read-only mount): %s", self._path)
+            self._log.info(
+                "executor token mode: re-reading %s on every relay call (rotation in place)",
+                self._path,
+            )
+        else:
+            self._log.info("executor token mode: held in memory only; the token file was removed")
+            self._path = None
+        return True
 
     def get(self) -> str:
+        if self._token is None:
+            if not self._adopt():
+                raise TokenNotPresent(f"executor token not present at {self._path}")
+            return self._token
         if self._path is None:
             return self._token
         try:

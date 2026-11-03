@@ -13,9 +13,9 @@ Relay HTTP contract (this is the wire the runner must implement to match):
         body: {"status": "ok"|"failed"|"timeout", "result": {...}, "error": "..."}
            ("result" is a ResultEnvelope, present only on status "ok")
 
-Every relay call carries `Authorization: Bearer <token>`. The token is read at start-up
-from the executor token file -- --token-file, else the RW_EXECUTOR_TOKEN_FILE env var, else
-the legacy EXECUTOR_TOKEN_FILE, else DEFAULT_TOKEN_FILE -- and the file is then unlinked
+Every relay call carries `Authorization: Bearer <token>`. The token comes from the
+executor token file -- --token-file, else the RW_EXECUTOR_TOKEN_FILE env var, else the
+legacy EXECUTOR_TOKEN_FILE, else DEFAULT_TOKEN_FILE -- which is read and then unlinked
 (S1 / SEC-2): task processes run as the same uid in the same pod, so a token that stays on
 disk is a token any task can `cat`. What happens next depends on whether the unlink worked,
 and is logged once:
@@ -28,9 +28,13 @@ and is logged once:
   file empty, the last token read is used, and logged, rather than dropping a result
   already computed (see relay.TokenSource).
 
-A missing, unreadable or empty token file at start-up is an error (the process exits), never
-a poll without a token. Before it reads the token the process also makes itself non-dumpable
-(`_make_non_dumpable`), in both modes, so a task cannot read the in-memory copy out of /proc.
+The file need not be there at start-up (an image smoke test runs `rwtask serve` with no
+token; a pod may start before its mount does). A missing, unreadable or empty file is
+warned about once and serve loads its capability and carries on: each poll tries the file
+again and, while there is no token, is skipped (sleeping RETRY_DELAY) -- never sent
+unauthenticated. The first read that works applies the rule above, once. Before any of that
+the process makes itself non-dumpable (`_make_non_dumpable`), in every mode, so a task cannot
+read the in-memory copy out of /proc.
 
 A request may carry `maxResultBytes`. The result body is serialised (compact
 JSON) before it is posted, and an `ok` result whose body is larger than that
@@ -116,7 +120,7 @@ from .plugin.lease import (
     run_lease,
     wipe_stale_credentials,
 )
-from .relay import RelayClient, TokenSource
+from .relay import RelayClient, TokenNotPresent, TokenSource
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
@@ -174,7 +178,7 @@ def serve(
     filesystem. A V13 lease (plugin code carried inline or by archive) needs the
     same opt-in and is refused the same way, as a failed envelope."""
     log = log or logging.getLogger("runwhen_capability.serve")
-    # First, before the token is in memory: see _make_non_dumpable.
+    # First, before the token can be in memory: see _make_non_dumpable.
     _make_non_dumpable(log)
     tokens = _load_executor_token(_resolve_token_file(token_file), log)
 
@@ -265,28 +269,10 @@ def _resolve_token_file(token_file: Path | None) -> Path:
 
 
 def _load_executor_token(path: Path, log) -> TokenSource:
-    """Reads the executor token (whitespace stripped) and tries to unlink the file; returns
-    the `TokenSource` every relay call uses (see the module docstring for the two modes).
-    A missing, unreadable or empty file ends the process with a clear message
-    (SystemExit): serving without a token would only fail every poll. Unlink worked: a
-    fixed, in-memory token. Unlink refused (a read-only Secret volume, EACCES): logged, and
-    a source that re-reads the file on every call, so a rotation in place is picked up."""
-    try:
-        token = Path(path).read_text().strip()
-    except OSError as exc:
-        log.error("could not read executor token from %s: %s", path, exc)
-        raise SystemExit(f"rwtask serve: could not read executor token from {path}: {exc}") from exc
-    if not token:
-        log.error("executor token file %s is empty", path)
-        raise SystemExit(f"rwtask serve: executor token file {path} is empty")
-    try:
-        os.unlink(path)
-    except OSError:
-        log.info("executor token file left in place (read-only mount): %s", path)
-        log.info("executor token mode: re-reading %s on every relay call (rotation in place)", path)
-        return TokenSource(token, path, log)
-    log.info("executor token mode: held in memory only; the token file was removed")
-    return TokenSource(token, None, log)
+    """The `TokenSource` every relay call uses (see the module docstring and
+    relay.TokenSource): the token file is read and unlinked now if it is there, else the
+    source is pending and the poll loop waits for it. Never exits for a missing token."""
+    return TokenSource.from_file(path, log)
 
 
 def _wipe_stale_bundle_scopes(workdir: Path, log) -> None:
@@ -388,7 +374,8 @@ def _post_result(
     from `tokens.get()` immediately before posting: in the re-reading mode a request can
     run up to the manifest's requestTimeoutSeconds before this runs, long enough for the
     mounted Secret to rotate, and a stale token would lose a result already computed to a
-    401. If that re-read fails, `get()` falls back to the last token read, and says so.
+    401. If that re-read fails, `get()` falls back to the last token read, and says so. (A
+    request was polled, so the source is never pending here.)
 
     The timeout grows by a second per MiB of body: a result near the cap
     takes real time to upload, and the flat RESULT_TIMEOUT is sized for a
@@ -459,7 +446,13 @@ def _poll_once(
     max_stateful_scopes: int,
     allow_bundles: bool = False,
 ) -> None:
-    headers = {"Authorization": f"Bearer {tokens.get()}"}
+    try:
+        token = tokens.get()
+    except TokenNotPresent:
+        # No token yet: skip the poll (never poll unauthenticated) and try again shortly.
+        time.sleep(RETRY_DELAY)
+        return
+    headers = {"Authorization": f"Bearer {token}"}
 
     try:
         resp = session.post(

@@ -171,22 +171,29 @@ def test_serve_sends_bearer_token_from_the_token_file_on_both_relay_calls(tmp_pa
     assert result_call.request.headers["Authorization"] == "Bearer secret-token"
 
 
-def test_serve_missing_token_file_exits_with_a_clear_error_and_makes_no_request(tmp_path, caplog):
-    """The token is read once at startup (see serve.py), so a file that is not
-    there cannot recover later: fail loudly at start, never poll without it."""
-    with responses.RequestsMock() as rsps, pytest.raises(SystemExit) as excinfo:
+def test_serve_starts_without_a_token_file_and_skips_polls_until_it_appears(
+    tmp_path, monkeypatch, caplog
+):
+    """A pod (or an image smoke test) can start with no token: serve loads its capability,
+    warns once, and never polls without a token -- it sleeps and tries the file again."""
+    sleeps = []
+    monkeypatch.setattr("runwhen_capability.serve.time.sleep", sleeps.append)
+
+    with responses.RequestsMock() as rsps, caplog.at_level(logging.INFO):
         serve(
             relay=RELAY,
             pool_id="pool-1",
             workdir=tmp_path / "work",
             capability_dir=FIXTURES / "echo",
             token_file=tmp_path / "does-not-exist" / "token",
-            max_iterations=1,
+            max_iterations=3,
         )
 
-    assert "could not read executor token" in str(excinfo.value)
-    # No relay call is made -- serve() never falls back to an unauthenticated request.
-    assert len(rsps.calls) == 0
+    assert len(rsps.calls) == 0  # never an unauthenticated request
+    assert len(sleeps) == 3
+    assert "serving capability" in caplog.text
+    assert caplog.text.count("executor token not present yet at") == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 # --- execution.mode: stateful ------------------------------------------------
