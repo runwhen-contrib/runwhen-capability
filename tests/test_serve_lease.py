@@ -302,3 +302,131 @@ def test_a_classic_bundle_request_is_unchanged_next_to_leases(poll):
     body = poll(request)  # allow_bundles is off: refused exactly as before
     assert body["status"] == "failed"
     assert "--allow-bundles" in body["error"]
+
+
+# -- materialized credentials (lane C's contract) ----------------------------------------------
+
+SECRET_FILE = "-----BEGIN KEY-----\nsupersecretkeymaterial123\n-----END KEY-----\n"
+SECRET_ENV = "dbuser-secret-value"
+
+
+def creds_lease(names: str, task: str = "py-creds", **kw) -> dict:
+    return make_lease(task, inputs={"names": names}, **kw)
+
+
+def materialized() -> list[dict]:
+    return [
+        {
+            "credentialType": "generic/env",
+            "files": [{"env": "MY_KEY_FILE", "content": SECRET_FILE}],
+            "env": {"PGUSER": SECRET_ENV},
+        },
+        {
+            "credentialType": "aws/credentials",
+            "files": [
+                {
+                    "env": "AWS_SHARED_CREDENTIALS_FILE",
+                    "mode": "0640",
+                    "encoding": "base64",
+                    "content": base64.b64encode(
+                        b"[default]\naws_secret_access_key=abcdef123456\n"
+                    ).decode(),
+                }
+            ],
+        },
+    ]
+
+
+def test_materialized_files_are_private_visible_by_env_scrubbed_and_deleted(poll):
+    names = "MY_KEY_FILE,PGUSER,AWS_SHARED_CREDENTIALS_FILE"
+    body = poll(creds_lease(names), materialized=materialized())
+    envelope = envelope_of(body)
+    assert envelope["status"] == "ok", envelope["errors"]
+    seen = envelope["outputs"]["creds"]
+    assert seen["MY_KEY_FILE"]["len"] == len(SECRET_FILE)  # the task read the real file
+    assert seen["MY_KEY_FILE"]["mode"] == "0o600"  # the default
+    assert seen["MY_KEY_FILE"]["dirMode"] == "0o700"
+    assert seen["AWS_SHARED_CREDENTIALS_FILE"]["mode"] == "0o640"  # the entry's
+    assert seen["PGUSER"] == {"value": "***REDACTED***"}  # an env{} pair is exported, and scrubbed
+    assert seen["MY_KEY_FILE"]["content"] == "***REDACTED***"
+    text = json.dumps(body)
+    for secret in ("supersecretkeymaterial123", SECRET_ENV, "abcdef123456"):
+        assert secret not in text
+    assert list(poll.creds.iterdir()) == []  # deleted with the task
+    assert not (poll.workdir / "scope-1").exists()
+
+
+def test_materialized_files_are_deleted_after_a_failure_and_after_a_timeout(poll):
+    envelope = envelope_of(poll(creds_lease("", "py-crash"), materialized=materialized()))
+    assert envelope["status"] == "failed"
+    assert list(poll.creds.iterdir()) == []
+    envelope = envelope_of(
+        poll(creds_lease("", "py-slow", timeout="1s"), materialized=materialized())
+    )
+    assert [e["code"] for e in envelope["errors"]] == ["timeout"]
+    assert list(poll.creds.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "name", ["RELAY_URL", "POOL_ID", "EXECUTOR_TOKEN_FILE", "RW_SDK", "HOME", "PATH", "BASH_ENV"]
+)
+def test_materialized_cannot_name_a_reserved_or_host_only_variable(poll, name):
+    for entry in (
+        {"credentialType": "generic/env", "env": {name: "planted-secret-value"}},
+        {"credentialType": "generic/env", "files": [{"env": name, "content": "planted-secret"}]},
+    ):
+        envelope = envelope_of(poll(creds_lease(""), materialized=[entry]))
+        assert envelope["status"] == "failed"
+        [error] = envelope["errors"]
+        assert error["code"] == "invalid_input"
+        assert "reserved" in error["message"]
+        assert "planted-secret" not in json.dumps(envelope)
+        assert not poll.creds.exists() or list(poll.creds.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "a string",
+        {"files": []},
+        {"credentialType": "x/y", "surprise": 1},
+        {"credentialType": "x/y", "files": [{"env": "A_B", "content": "x", "mode": "600"}]},
+        {"credentialType": "x/y", "files": [{"env": "A_B", "content": "!!", "encoding": "base64"}]},
+        {"credentialType": "x/y", "files": [{"env": "lower-case", "content": "x"}]},
+        {"credentialType": "x/y", "env": {"A_B": "1"}, "files": [{"env": "A_B", "content": "x"}]},
+    ],
+)
+def test_a_malformed_materialized_entry_fails_the_request_not_the_poll(poll, bad):
+    envelope = envelope_of(poll(creds_lease(""), materialized=[bad]))
+    assert envelope["status"] == "failed"
+    assert [e["code"] for e in envelope["errors"]] == ["invalid_input"]
+    assert envelope["errors"][0]["message"].startswith("materialized[0]")
+
+
+def test_host_only_variables_stay_unset_when_credentials_are_materialized(poll, monkeypatch):
+    monkeypatch.setenv("RELAY_URL", "http://relay.invalid")
+    monkeypatch.setenv("POOL_ID", "pool-9")
+    monkeypatch.setenv("EXECUTOR_TOKEN_FILE", "/var/run/executor/token")
+    envelope = envelope_of(poll(make_lease("sh-env"), materialized=materialized()))
+    seen = envelope["outputs"]["env"]
+    assert (seen["relay"], seen["pool"], seen["token"]) == ("unset", "unset", "unset")
+
+
+def test_startup_removes_credential_directories_a_crashed_run_left(poll):
+    stale = poll.creds / "task-crashed"
+    stale.mkdir(parents=True)
+    (stale / "KEY").write_text("left-behind-secret")
+    other = poll.creds / "not-ours"
+    other.mkdir()
+    envelope_of(poll(make_lease("py-nothing")))
+    assert not stale.exists()
+    assert other.exists()
+
+
+def test_materialized_is_ignored_for_a_classic_request(poll):
+    # materialized[] is for V13 leases; a packaged request ignores it and writes nothing
+    body = poll(
+        {"tasks": []}, materialized=materialized()
+    )  # a packaged request against the echo capability
+    assert body["status"] == "ok"
+    assert not poll.creds.exists()  # nothing was written for it

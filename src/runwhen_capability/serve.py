@@ -49,7 +49,9 @@ plugin/lease.py): it needs no `--allow-bundles`, because what it runs is plugin 
 lease pins by sha256 (inline files are rebuilt into the archive and hashed; an archive must
 be in the cache), not code the request is free to choose. It is validated against the
 `lease` contract and run through the same child runner as a bundle, in its own scope, which
-is always wiped. The result POSTed is `{"status": "ok", "result": <the bare D64 result
+is always wiped. The poll response's `materialized[]` (secret files and variables the
+runner produced) is written under `$RW_CREDENTIALS_DIR`, exported to the task and deleted
+at its end (plugin/lease.py). The result POSTed is `{"status": "ok", "result": <the bare D64 result
 envelope>}` -- not the classic `{version, setup, tasks}` -- including when the envelope's
 own status is `failed`; `status: failed` is only for a request this executor could not
 process at all.
@@ -99,7 +101,7 @@ from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
 from .models import BundleRequestEnvelope, TaskHostRequest, V13LeaseRequest
-from .plugin.lease import run_lease
+from .plugin.lease import run_lease, wipe_stale_credentials
 from .relay import RelayClient
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
@@ -153,6 +155,7 @@ def serve(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     _wipe_stale_bundle_scopes(workdir, log)
+    wipe_stale_credentials()
 
     token_file = (
         Path(token_file)
@@ -470,6 +473,7 @@ def _poll_once(
                 task_request.request.doc,
                 scope_dir=scope_dir,
                 credentials=task_request.credentials,
+                materialized=task_request.materialized,
                 deadline_s=task_request.deadlineMs / 1000,
                 log=log.getChild(task_request.requestId),
             )

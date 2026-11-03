@@ -14,7 +14,17 @@ Every problem with the lease itself is an envelope, never an exception: `failed`
 (the code does not match its hash, cannot be read, or lacks the task's script) or
 `dependency` (an archive that is not in the cache: fetching one waits for DLV-9).
 
-Credentials. Today's `credentials` map of the poll response (`{name: value}`) keeps its
+Credentials, new (lane C's contract): the poll response may also carry `materialized[]`
+(`auth-plan#/$defs/materializedCredential`: the runner's native auth plans, already
+executed). Each file is written under a fresh 0700 per-task directory of
+`$RW_CREDENTIALS_DIR` (default /run/rw/credentials) with the entry's mode (default 0600),
+its `env` variable exported pointing at it, and each `env{}` pair exported; the directory
+is deleted when the task ends, whatever happened. Their names are held to the same
+reserved list as any caller-supplied environment (RW_*, HOME, PATH, BASH*, LD_*, DYLD_*,
+PYTHON*, the host-only variables): a runner cannot use this to reach SEC-2's
+variables. Every value, and every file's content, is redacted from the envelope.
+
+Credentials, old. Today's `credentials` map of the poll response (`{name: value}`) keeps its
 meaning: the value of a Kubernetes kubeconfig entry is written to a private file and
 `KUBECONFIG` points at it (as for a bundle's `k8s.kubeconfig` input). Every value of the
 map, and everything materialized, is redacted from what comes back.
@@ -27,14 +37,16 @@ import binascii
 import copy
 import logging
 import os
+import re
 import shutil
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..contracts import ArchiveError, TreeEntry, archive_sha256, check, validate
+from ..contracts import ArchiveError, TreeEntry, archive_sha256, check, schema, validate
 from ..contracts import archive as archive_mod
 from ..envelope import derive_envelope
 from .run import RunSpec, _duration_seconds, check_extra_env, execute
@@ -196,6 +208,91 @@ def _write_secret_file(path: Path, data: bytes, mode: int = 0o600) -> None:
         raise
 
 
+_MODE_RE = re.compile(r"^0[0-7]{3}$")
+
+
+@dataclass(frozen=True)
+class _Materialized:
+    files: dict[str, tuple[bytes, int]]  # env var -> (content, mode)
+    env: dict[str, str]
+    secrets: list[str]  # every string to scrub from what comes back
+
+
+def _parse_materialized(items: Sequence[Any]) -> _Materialized:
+    """The `materialized[]` of the poll response, checked against materializedCredential.
+    Raises LeaseError(invalid_input) naming the entry and the problem, never a value."""
+    env_pattern = re.compile(schema("common")["$defs"]["envVarName"]["pattern"])
+    files: dict[str, tuple[bytes, int]] = {}
+    env: dict[str, str] = {}
+    secrets: list[str] = []
+
+    def bad(index: int, problem: str) -> LeaseError:
+        return LeaseError("invalid_input", f"materialized[{index}]: {problem}")
+
+    def claim(index: int, name: str) -> None:
+        if not env_pattern.match(name):
+            raise bad(index, f"{name!r} is not a valid environment variable name")
+        try:
+            check_extra_env({name: ""})
+        except ValueError:
+            raise bad(index, f"{name!r} is a reserved environment variable") from None
+        if name in files or name in env:
+            raise bad(index, f"{name!r} is set twice")
+
+    for index, item in enumerate(items):
+        if not isinstance(item, dict) or not isinstance(item.get("credentialType"), str):
+            raise bad(index, "not a materializedCredential (credentialType is required)")
+        if set(item) - {"credentialType", "files", "env"}:
+            raise bad(index, "unknown field")
+        for entry in item.get("files") or []:
+            if not isinstance(entry, dict) or set(entry) - {"env", "mode", "content", "encoding"}:
+                raise bad(index, "a file has an unknown field or is not an object")
+            name, content = entry.get("env"), entry.get("content")
+            if not isinstance(name, str) or not isinstance(content, str):
+                raise bad(index, "a file needs a string env and content")
+            mode = entry.get("mode", "0600")
+            if not isinstance(mode, str) or not _MODE_RE.match(mode):
+                raise bad(index, f"file {name!r}: mode must look like 0600")
+            encoding = entry.get("encoding", "utf-8")
+            if encoding not in ("utf-8", "base64"):
+                raise bad(index, f"file {name!r}: encoding must be utf-8 or base64")
+            claim(index, name)
+            if encoding == "base64":
+                try:
+                    data = base64.b64decode(content, validate=True)
+                except (binascii.Error, ValueError):
+                    raise bad(index, f"file {name!r}: content is not valid base64") from None
+                secrets.append(content)
+            else:
+                data = content.encode("utf-8")
+            try:
+                secrets.append(data.decode("utf-8"))
+            except UnicodeDecodeError:
+                pass
+            files[name] = (data, int(mode, 8))
+        env_pairs = item.get("env") or {}
+        if not isinstance(env_pairs, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env_pairs.items()
+        ):
+            raise bad(index, "env must map names to strings")
+        for name, value in env_pairs.items():
+            claim(index, name)
+            env[name] = value
+            secrets.append(value)
+    return _Materialized(files, env, [x for x in secrets if x])
+
+
+def wipe_stale_credentials(root: Path | None = None) -> None:
+    """Removes per-task directories (`task-*`) a host that died mid-task left in the
+    credentials directory: they hold secret files nothing will ever clean up."""
+    root = Path(root) if root else credentials_dir()
+    if not root.is_dir():
+        return
+    for child in root.iterdir():
+        if child.name.startswith("task-") and child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+
+
 # -- run ---------------------------------------------------------------------------------------
 
 
@@ -204,6 +301,7 @@ def run_lease(
     *,
     scope_dir: Path,
     credentials: Mapping[str, str] | None = None,
+    materialized: Sequence[Any] = (),
     deadline_s: float | None = None,
     archive_cache: Path | None = None,
     secrets_root: Path | None = None,
@@ -211,7 +309,8 @@ def run_lease(
 ) -> dict:
     """Runs one lease and returns its result envelope (it passes `result-envelope`).
     Never raises for a bad lease, bad code or a failing task. `deadline_s` (the
-    request's deadline) caps `limits.timeout`."""
+    request's deadline) caps `limits.timeout`. `materialized` is the poll response's
+    `materialized[]`; `secrets_root` is where its files go (default: credentials_dir())."""
     log = log or _log
     credentials = dict(credentials or {})
     violations = validate("lease", doc)
@@ -233,11 +332,18 @@ def run_lease(
         extra_env: dict[str, str] = {}
         redact = [v for v in credentials.values() if v]
         kubeconfig = _kubeconfig_value(doc, credentials)
-        if kubeconfig:
+        parsed = _parse_materialized(materialized)
+        redact.extend(parsed.secrets)
+        if kubeconfig or parsed.files:
             task_dir = _task_secrets_dir(root)
+        if kubeconfig:
             path = task_dir / "kubeconfig"
             _write_secret_file(path, kubeconfig.encode("utf-8"))
             extra_env["KUBECONFIG"] = str(path)
+        for name, (data, mode) in parsed.files.items():
+            _write_secret_file(task_dir / name, data, mode)
+            extra_env[name] = str(task_dir / name)
+        extra_env.update(parsed.env)
         check_extra_env(extra_env)
         outcome = execute(spec, scope_dir=scope_dir, extra_env=extra_env, redact=redact, log=log)
         envelope = outcome.envelope
@@ -266,4 +372,5 @@ __all__ = [
     "load_code",
     "run_lease",
     "runspec_from_lease",
+    "wipe_stale_credentials",
 ]
