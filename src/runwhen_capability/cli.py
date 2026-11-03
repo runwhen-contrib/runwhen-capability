@@ -11,8 +11,9 @@
     rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
     rwtask validate <dir>
     rwtask compile <plugin-dir> [--out DIR]
+    rwtask upconvert <src-dir> --into <skills-dir> [--name NAME] [--force]
 
-See serve.py, run_local.py, label.py, schemas.py, gitops.py and port/.
+See serve.py, run_local.py, label.py, schemas.py, gitops.py, port/ and upconvert/.
 """
 
 from __future__ import annotations
@@ -288,7 +289,68 @@ def _build_parser() -> argparse.ArgumentParser:
         "--out", default="dist", help="directory to write the archive and compiled.json into"
     )
 
+    upconvert_p = sub.add_parser(
+        "upconvert",
+        help="up-convert a custom-capability/v1 bundle or a capability/v1 directory to a V13 "
+        "skill at <into>/<name>/; prints the up-conversion findings, then validates the result",
+    )
+    upconvert_p.add_argument(
+        "src_dir", help="the classic capability directory (capability.yaml or manifest.yaml)"
+    )
+    upconvert_p.add_argument(
+        "--into", required=True, help="the skills directory; writes <into>/<name>/"
+    )
+    upconvert_p.add_argument("--name", default=None, help="the skill name; default: the source's")
+    upconvert_p.add_argument(
+        "--force", action="store_true", help="replace <into>/<name>/ if it already exists"
+    )
+
     return parser
+
+
+def _upconvert(args: argparse.Namespace) -> int:
+    import shutil
+
+    from .plugin import load_skill_dir, validate_tree
+    from .upconvert import UpconvertError, upconvert_dir, write_result
+
+    try:
+        result = upconvert_dir(Path(args.src_dir), name=args.name)
+    except UpconvertError as exc:
+        print(f"rwtask upconvert: {exc}", file=sys.stderr)
+        return 1
+    if (
+        result.skill_name in ("", ".", "..")
+        or "/" in result.skill_name
+        or "\\" in result.skill_name
+    ):
+        print(
+            f"rwtask upconvert: {result.skill_name!r} is not a usable skill name", file=sys.stderr
+        )
+        return 1
+    target = Path(args.into) / result.skill_name
+    if target.exists() or target.is_symlink():
+        if not args.force:
+            print(
+                f"rwtask upconvert: {target} already exists; use --force to replace it",
+                file=sys.stderr,
+            )
+            return 1
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    write_result(result, target)
+    diagnostics = [*result.diagnostics, *validate_tree(load_skill_dir(target))]
+    for diag in diagnostics:
+        print(_format_plugin_diagnostic(diag))
+    errors = sum(d.severity == "error" for d in diagnostics)
+    warnings = len(diagnostics) - errors
+    print(
+        f"rwtask upconvert: wrote {target}: {errors} error(s), {warnings} warning(s)",
+        file=sys.stderr,
+    )
+    return 1 if errors else 0
 
 
 def _port(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
@@ -648,6 +710,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"FAIL  {label}: {result.detail}")
         print(f"{passed} passed, {failed} failed, {no_test} no test")
         return 1 if failed else 0
+
+    if args.command == "upconvert":
+        return _upconvert(args)
 
     if args.command == "validate":
         from .plugin import load_dir, load_skill_dir, validate_tree
