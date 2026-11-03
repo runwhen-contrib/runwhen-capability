@@ -1,4 +1,4 @@
-# source: synthetic (no wiki example); consistent with 42b-example-papi-skill.md (trimmed to one task)
+# source: synthetic (no wiki example); consistent with 42b-example-papi-skill.md (trimmed to one task); every path is plugin-root-relative
 apiVersion: runwhen.com/compiled-plugin/v1
 compiler: { name: rwtask, version: 0.5.0 }
 plugin:
@@ -21,7 +21,10 @@ skills:
           labels: { app.kubernetes.io/component: papi }
         tags: [runwhen, papi, availability]
     skillMdSha256: "sha256:03534bde68ddd3d53f0472f0a2bdf928243f954d9ed193413a3c8d7281a93b79"
-    files: [SKILL.md, tasks.yaml, scripts/api_probe.sh]
+    files:
+      - skills/papi-health/SKILL.md
+      - skills/papi-health/scripts/api_probe.sh
+      - skills/papi-health/tasks.yaml
     runtime: kubernetes@1
     taskNames: [api-probe]
 tasks:
@@ -30,7 +33,7 @@ tasks:
     name: api-probe
     title: papi API probe
     description: Calls papi /healthz and /livez through the Kubernetes API service proxy and measures latency.
-    script: scripts/api_probe.sh
+    script: skills/papi-health/scripts/api_probe.sh
     runtime: kubernetes@1
     role: health
     appliesTo:

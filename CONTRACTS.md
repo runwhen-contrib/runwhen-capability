@@ -159,6 +159,12 @@ unpacking (D29, D23):
   their JSON Schema inlined, and the task `hash` (VER-6, archive.md);
 - `rules[]` with body and word count; `knowledge[]` with body.
 
+**Every path in the compiled doc is relative to the plugin root**, the same
+paths the lease and the archive use: `skills[].files`, `tasks[].script` and any
+output `schemaRef` read `skills/papi-health/scripts/api_probe.sh`, never a path
+relative to the skill directory (`scripts/api_probe.sh`, which is how
+`tasks.yaml` writes it). `tasks.yaml` itself stays skill-relative.
+
 ## Result envelope (D64)
 
 ```yaml
