@@ -4,11 +4,12 @@ wrote, and derive_envelope: the D64 result envelope."""
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
 from runwhen_capability.contracts import check
-from runwhen_capability.envelope import MAX_ERRORS, errors_from_jsonl
+from runwhen_capability.envelope import MAX_ERRORS, derive_envelope, errors_from_jsonl
 
 
 def _write(tmp_path, *lines: str):
@@ -114,3 +115,153 @@ def test_a_symlinked_errors_file_is_not_followed(tmp_path):
     errors = errors_from_jsonl(link)
     assert all(e["message"] != "leaked" for e in errors)
     _validate_all(errors)
+
+
+# -- derive_envelope ------------------------------------------------------------------
+
+T0 = datetime(2026, 11, 3, 12, 0, 0, tzinfo=UTC)
+T1 = T0 + timedelta(seconds=2, milliseconds=500)
+ERR = {"code": "not_found", "message": "no such pod", "scope": "ns/a"}
+
+
+def _derive(**kwargs):
+    base = {"exit_code": 0, "outputs": {}, "errors": [], "started_at": T0, "finished_at": T1}
+    return derive_envelope(**{**base, **kwargs})
+
+
+# (case id, kwargs, expected status, expected error codes)
+_BRANCHES = [
+    ("ok", {}, "ok", []),
+    ("ok-with-outputs", {"outputs": {"rows": [1, 2], "total": 2}}, "ok", []),
+    ("partial", {"errors": [ERR]}, "partial", ["not_found"]),
+    (
+        "partial-many",
+        {"errors": [ERR, {"code": "timeout", "message": "n2"}]},
+        "partial",
+        ["not_found", "timeout"],
+    ),
+    ("failed-with-errors", {"exit_code": 1, "errors": [ERR]}, "failed", ["not_found"]),
+    (
+        "failed-no-errors-uses-stderr",
+        {"exit_code": 2, "stderr_tail": "Traceback\nRuntimeError: boom\n"},
+        "failed",
+        ["internal"],
+    ),
+    ("failed-no-errors-no-stderr", {"exit_code": 3}, "failed", ["internal"]),
+    ("failed-signal", {"exit_code": -9}, "failed", ["internal"]),
+    ("skipped", {"skipped_reason": "nothing to check"}, "skipped", []),
+    (
+        "skipped-drops-errors",
+        {"skipped_reason": "nothing to check", "errors": [ERR]},
+        "skipped",
+        [],
+    ),
+    ("skipped-empty-reason", {"skipped_reason": ""}, "skipped", []),
+    ("timed-out", {"exit_code": -9, "timed_out": True}, "failed", ["timeout"]),
+    ("timed-out-exit-0", {"exit_code": 0, "timed_out": True}, "failed", ["timeout"]),
+    (
+        "timed-out-keeps-its-timeout-error",
+        {
+            "exit_code": -9,
+            "timed_out": True,
+            "errors": [{"code": "timeout", "message": "killed at the deadline"}],
+        },
+        "failed",
+        ["timeout"],
+    ),
+    (
+        "timed-out-with-other-errors",
+        {"exit_code": -9, "timed_out": True, "errors": [ERR]},
+        "failed",
+        ["not_found", "timeout"],
+    ),
+    (
+        "timed-out-beats-skip",
+        {"timed_out": True, "skipped_reason": "x", "exit_code": -9},
+        "failed",
+        ["timeout"],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "status", "codes"),
+    [pytest.param(k, s, c, id=i) for i, k, s, c in _BRANCHES],
+)
+def test_derive_envelope_follows_the_d64_table_and_validates(kwargs, status, codes):
+    envelope = _derive(**kwargs)
+    check("result-envelope", envelope)
+    assert envelope["status"] == status
+    assert [e["code"] for e in envelope["errors"]] == codes
+
+
+def test_derive_envelope_fills_the_platform_fields_as_rfc_3339_with_z():
+    envelope = _derive()
+    assert envelope["startedAt"] == "2026-11-03T12:00:00.000Z"
+    assert envelope["finishedAt"] == "2026-11-03T12:00:02.500Z"
+    assert set(envelope) == {"status", "startedAt", "finishedAt", "outputs", "errors"}
+
+
+def test_derive_envelope_converts_any_timezone_to_utc_and_reads_naive_as_utc():
+    plus2 = timezone(timedelta(hours=2))
+    envelope = _derive(
+        started_at=datetime(2026, 11, 3, 14, 0, 0, tzinfo=plus2),
+        finished_at=datetime(2026, 11, 3, 12, 0, 1),
+    )
+    assert envelope["startedAt"] == "2026-11-03T12:00:00.000Z"
+    assert envelope["finishedAt"] == "2026-11-03T12:00:01.000Z"
+    check("result-envelope", envelope)
+
+
+def test_derive_envelope_carries_outputs_and_the_skip_reason():
+    envelope = _derive(outputs={"total": 2}, skipped_reason="no pods")
+    assert envelope["reason"] == "no pods"
+    assert envelope["outputs"] == {"total": 2}
+    assert "reason" not in _derive()
+    assert "reason" not in _derive(errors=[ERR])
+
+
+def test_an_empty_skip_reason_still_validates():
+    envelope = _derive(skipped_reason="")
+    assert envelope["status"] == "skipped"
+    assert envelope["reason"]
+    check("result-envelope", envelope)
+
+
+def test_internal_error_message_is_the_last_non_empty_stderr_line():
+    envelope = _derive(exit_code=1, stderr_tail="first\nlast line here  \n\n  \n")
+    assert envelope["errors"] == [{"code": "internal", "message": "last line here"}]
+
+
+def test_internal_error_message_is_capped_at_1000_chars():
+    envelope = _derive(exit_code=1, stderr_tail="x" * 5000)
+    assert len(envelope["errors"][0]["message"]) == 1000
+    check("result-envelope", envelope)
+
+
+@pytest.mark.parametrize("stderr_tail", ["", "\n\n", "   \n  "])
+def test_internal_error_message_without_stderr_names_the_exit_code(stderr_tail):
+    envelope = _derive(exit_code=7, stderr_tail=stderr_tail)
+    assert envelope["errors"] == [{"code": "internal", "message": "process exited 7"}]
+
+
+def test_derive_envelope_does_not_alias_its_inputs():
+    errors = [dict(ERR)]
+    outputs = {"rows": [1]}
+    envelope = _derive(errors=errors, outputs=outputs)
+    errors[0]["message"] = "changed"
+    outputs["rows"].append(2)
+    assert envelope["errors"][0]["message"] == "no such pod"
+    assert envelope["outputs"] == {"rows": [1]}
+
+
+def test_errors_from_jsonl_feeds_derive_envelope(tmp_path):
+    path = _write(
+        tmp_path,
+        json.dumps({"code": "unreachable", "message": "db down"}),
+        "garbage",
+    )
+    envelope = _derive(errors=errors_from_jsonl(path))
+    check("result-envelope", envelope)
+    assert envelope["status"] == "partial"
+    assert [e["code"] for e in envelope["errors"]] == ["unreachable", "internal"]

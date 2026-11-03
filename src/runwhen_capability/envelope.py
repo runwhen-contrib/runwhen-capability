@@ -10,8 +10,10 @@ and those errors into the envelope the contract `result-envelope` describes
 
 from __future__ import annotations
 
+import copy
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -111,3 +113,70 @@ def _parse_line(number: int, raw: bytes) -> dict[str, Any]:
             "the error was dropped"
         )
     return entry
+
+
+_STDERR_MESSAGE_MAX = 1000
+
+
+def _rfc3339(moment: datetime) -> str:
+    """UTC, millisecond precision, `Z`: a naive datetime is taken to be UTC."""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _last_line(text: str) -> str:
+    return next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
+
+
+def derive_envelope(
+    *,
+    exit_code: int,
+    outputs: dict[str, Any],
+    errors: list[dict[str, Any]],
+    started_at: datetime,
+    finished_at: datetime,
+    skipped_reason: str | None = None,
+    timed_out: bool = False,
+    stderr_tail: str = "",
+) -> dict[str, Any]:
+    """The D64 result envelope for one run (CONTRACTS.md "Result envelope"):
+
+    - timed out                 -> `failed`, with a `timeout` error unless `errors`
+                                   already has one (a timeout outranks a skip)
+    - `skipped_reason` given    -> `skipped` with `reason`, and no errors
+    - exit 0, no errors         -> `ok`
+    - exit 0, errors            -> `partial`
+    - non-zero exit             -> `failed`; with no errors, one `internal` error is
+                                   added: the last non-empty line of `stderr_tail`
+                                   (at most 1000 characters), or `process exited N`
+
+    `errors` are `error`-contract dicts (see errors_from_jsonl); the platform-filled
+    fields (`dryRun`, `provenance`, `logTail`, ...) are not set here."""
+    errors = copy.deepcopy(errors)
+    reason: str | None = None
+    if timed_out:
+        if not any(e.get("code") == "timeout" for e in errors):
+            errors.append({"code": "timeout", "message": "the task was killed at its deadline"})
+        status = "failed"
+    elif skipped_reason is not None:
+        status = "skipped"
+        reason = skipped_reason or "skipped"
+        errors = []
+    elif exit_code == 0:
+        status = "partial" if errors else "ok"
+    else:
+        status = "failed"
+        if not errors:
+            message = _last_line(stderr_tail)[:_STDERR_MESSAGE_MAX] or f"process exited {exit_code}"
+            errors.append({"code": "internal", "message": message})
+    envelope: dict[str, Any] = {
+        "status": status,
+        "startedAt": _rfc3339(started_at),
+        "finishedAt": _rfc3339(finished_at),
+        "outputs": copy.deepcopy(outputs),
+        "errors": errors,
+    }
+    if reason is not None:
+        envelope["reason"] = reason
+    return envelope
