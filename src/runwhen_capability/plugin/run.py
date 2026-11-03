@@ -53,7 +53,7 @@ import re
 import shutil
 import tempfile
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -72,6 +72,7 @@ from ..custom.manifest import (
     task_file_language,
 )
 from ..envelope import derive_envelope, errors_from_jsonl
+from .shims import SHIM_ENV_NAMES
 from .tree import PluginTree
 
 _log = logging.getLogger("runwhen_capability.plugin.run")
@@ -268,6 +269,17 @@ def _check_extra_env(extra_env: Mapping[str, str]) -> dict[str, str]:
     return dict(extra_env)
 
 
+def _check_shims(path_prepend: Sequence[str], shim_env: Mapping[str, str]) -> None:
+    """The two narrow channels `rwtask test` uses: absolute directories for the front of
+    PATH (PATH itself stays reserved for extra_env) and the RW_SHIM_* variables."""
+    for directory in path_prepend:
+        if not os.path.isabs(directory) or os.pathsep in directory or "\x00" in directory:
+            raise ValueError(f"path_prepend wants absolute directories, got {directory!r}")
+    for key in shim_env:
+        if key not in SHIM_ENV_NAMES:
+            raise ValueError(f"shim_env may not set {key!r}")
+
+
 def _materialize(files_dir: Path, files: Mapping[str, bytes], executable: frozenset[str]) -> None:
     """The plugin tree under a fresh `files_dir`. Paths are checked again here, the one
     place a bad path would turn into a write outside the scope."""
@@ -393,6 +405,8 @@ def execute(
     extra_env: Mapping[str, str] | None = None,
     inherit_home: bool = False,
     log: logging.Logger | None = None,
+    path_prepend: Sequence[str] = (),
+    shim_env: Mapping[str, str] | None = None,
 ) -> RunOutcome:
     """Runs `spec.task` and returns its envelope. Never raises for a problem with the run
     itself: a bad input, a script that crashes, a timeout and an unreadable output are
@@ -400,8 +414,12 @@ def execute(
     environment (it may not name a reserved or host-only variable: ValueError), and its
     values are redacted from what comes back. `inherit_home` runs the child with the
     caller's own HOME instead of a private one, for `rwtask run` on a developer's
-    machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner."""
+    machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner.
+    `path_prepend` (absolute directories, put first on the child's PATH) and `shim_env`
+    (only the RW_SHIM_* names of shims.SHIM_ENV_NAMES) are how `rwtask test` puts its
+    shims in front of the real tools; ValueError for anything else."""
     log = log or _log
+    _check_shims(path_prepend, shim_env or {})
     scope_dir = Path(scope_dir)
     task = spec.task
     caller_env = _check_extra_env(extra_env or {})
@@ -501,6 +519,8 @@ def execute(
                 extra_env=env,
                 lib_dir=files_dir / "skills" / skill / "lib",
                 home=Path(os.environ["HOME"]) if inherit_home and "HOME" in os.environ else None,
+                path_prepend=path_prepend,
+                shim_env=shim_env,
             )
         except (bundle._LaunchError, OSError) as exc:
             return failed([_error("internal", str(exc))])

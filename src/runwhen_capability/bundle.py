@@ -1255,6 +1255,8 @@ def _execute(
     extra_env: Mapping[str, str] | None = None,
     lib_dir: Path | None = None,
     home: Path | None = None,
+    path_prepend: Sequence[str] = (),
+    shim_env: Mapping[str, str] | None = None,
 ) -> tuple[int, _EventStream, str, bool]:
     """Runs one setup/task file as a child process in its own process group,
     with `deadline_seconds` enforced by SIGKILL-ing the whole group. Returns
@@ -1267,7 +1269,10 @@ def _execute(
     environment after the host's own, so the caller owns what it puts there),
     `lib_dir` (RW_LIB_DIR, where `files_dir/lib` is not the skill's lib/) and
     `home` (a HOME other than the scope's private one: `rwtask run` on a developer's
-    machine, where the caller's own ~/.kube and ~/.aws are the credential)."""
+    machine, where the caller's own ~/.kube and ~/.aws are the credential),
+    `path_prepend` (directories put FIRST on the child's PATH: `rwtask test`'s shims) and
+    `shim_env` (the RW_SHIM_* variables those shims read: RW_* is otherwise never set from
+    outside, so plugin/run.py checks the names before passing them)."""
     base_env = {
         **_inherited_env(),
         **(extra_env or {}),
@@ -1288,6 +1293,9 @@ def _execute(
     }
     if kubeconfig_path:
         base_env["KUBECONFIG"] = kubeconfig_path
+    if path_prepend:
+        base_env["PATH"] = os.pathsep.join([*path_prepend, base_env.get("PATH", os.defpath)])
+    base_env.update(shim_env or {})
 
     if language == "bash":
         argv = ["bash", str(files_dir / file_path)]
