@@ -26,6 +26,8 @@ echo "$*" >> "$FAKE_KUBECTL_LOG"
 case "$*" in
   *"get pods"*) printf '{\\n  "items": [{}, {}, {}]\\n}\\n' ;;
   *"get events"*) echo "Error: events is Forbidden" >&2; exit 1 ;;
+  *"rollout restart"*"--dry-run=server"*) echo "deployment.apps/runwhen-papi restarted (dry run)" ;;
+  *"rollout restart"*) echo "deployment.apps/runwhen-papi restarted" ;;
   *) echo "unexpected: $*" >&2; exit 9 ;;
 esac
 """
@@ -369,3 +371,139 @@ def test_a_classic_dir_with_a_slash_is_not_taken_for_a_skill_task(capsys, tmp_pa
     monkeypatch.chdir(tmp_path)  # no skills/ here
     assert main(["test", str(BUNDLES / "testable"), "--task", "greet-py"]) == 0
     assert "ok" in capsys.readouterr().out
+
+
+# -- artifacts and matchers in a replayed scenario ---------------------------------------------
+
+
+def record_sh_ok(rwtask, plugin):
+    rwtask("probe/sh-ok", "--record", "--resource", DEPLOYMENT, "--scenario", "art", expect=0)
+    return fixture_path(plugin, "sh-ok", "art")
+
+
+def expect_block(path, block):
+    path.write_text(path.read_text() + block)
+
+
+def test_a_list_output_is_matched_with_contains_matchers(rwtask, plugin):
+    path = record_sh_ok(rwtask, plugin)
+    expect_block(
+        path,
+        "  outputs:\n    probe:\n      $contains: [{namespace: runwhen}, {note: hello}]\n",
+    )
+    _, out, _ = rwtask("probe/sh-ok", expect=0)
+    assert "PASS probe/sh-ok/art" in out
+    path.write_text(path.read_text().replace("{note: hello}", "{note: nope}"))
+    code, out, _ = rwtask("probe/sh-ok")
+    assert code == 1
+    assert "outputs.probe: $contains: no element matches {'note': 'nope'}" in out
+
+
+def test_a_bad_matcher_fails_the_scenario_not_the_run(rwtask, plugin):
+    path = record_sh_ok(rwtask, plugin)
+    expect_block(path, "  outputs:\n    probe: {$contian: []}\n")
+    code, out, _ = rwtask("probe/sh-ok")
+    assert code == 1
+    assert "FAIL probe/sh-ok/art" in out and "unknown matcher $contian" in out
+
+
+@pytest.mark.parametrize(
+    ("block", "ok", "needle"),
+    [
+        ("  artifacts:\n    events: {contains: ['kubernetes/deployment']}\n", True, ""),
+        ("  artifacts:\n    events: {contains: ['no-such-text']}\n", False, "missing text"),
+        ("  artifacts:\n    events: {notContains: ['no-such-text']}\n", True, ""),
+        ("  artifacts:\n    events: {notContains: ['runwhen']}\n", False, "forbidden text"),
+        ("  artifacts:\n    events: {lines: {min: 1, max: 1}}\n", True, ""),
+        ("  artifacts:\n    events: {lines: {min: 2}}\n", False, "1 lines, expected at least 2"),
+        ("  artifacts:\n    nope: {}\n", False, "not an artifact output of this task"),
+    ],
+)
+def test_artifact_assertions_pass_and_fail_through_the_cli(rwtask, plugin, block, ok, needle):
+    expect_block(record_sh_ok(rwtask, plugin), block)
+    code, out, _ = rwtask("probe/sh-ok")
+    assert (code == 0) is ok, out
+    assert needle in out
+    assert ("PASS" if ok else "FAIL") in out
+
+
+def test_a_declared_artifact_that_was_not_produced_fails(rwtask, plugin):
+    rwtask("probe/py-artifact", "--record", "--resource", DEPLOYMENT, "--scenario", "a", expect=0)
+    path = fixture_path(plugin, "py-artifact", "a")
+    expect_block(
+        path,
+        "  artifacts:\n    dump: {contains: ['a dump']}\n    declaredButNeverWritten: {}\n",
+    )
+    code, out, _ = rwtask("probe/py-artifact")
+    assert code == 1
+    assert "artifacts.declaredButNeverWritten: the task did not produce this artifact" in out
+    assert "artifacts.dump" not in out  # the one that exists is fine
+
+
+# -- dry-run scenarios -----------------------------------------------------------------------------
+
+
+def test_a_dry_run_is_recorded_and_replayed(rwtask, plugin, kubectl):
+    _, _, err = rwtask(
+        "probe/kube-restart", "--record", "--resource", DEPLOYMENT, "--scenario", "dry",
+        "--dry-run", expect=0,
+    )  # fmt: skip
+    assert kubectl.calls() == [
+        "-n runwhen rollout restart deployment/runwhen-papi --dry-run=server"
+    ]
+    path = fixture_path(plugin, "kube-restart", "dry")
+    doc = load_yaml(path.read_text())
+    assert doc["dryRun"] is True
+    assert doc["calls"][0]["argv"][-1] == "--dry-run=server"
+    assert doc["expect"] == {"status": "ok", "errorCodes": []}
+    add_outputs(path, "  outputs:\n    result: {dry: true}\n")
+    kubectl.remove()
+    _, out, _ = rwtask("probe/kube-restart", expect=0)
+    assert "PASS probe/kube-restart/dry" in out
+
+
+def test_a_real_run_of_a_write_task_is_not_what_a_dry_scenario_replays(rwtask, plugin, kubectl):
+    rwtask(
+        "probe/kube-restart", "--record", "--resource", DEPLOYMENT, "--scenario", "dry",
+        "--dry-run", expect=0,
+    )  # fmt: skip
+    path = fixture_path(plugin, "kube-restart", "dry")
+    path.write_text(path.read_text().replace("dryRun: true\n", ""))
+    kubectl.remove()
+    code, out, _ = rwtask("probe/kube-restart")
+    assert code == 1  # without RW_DRY_RUN the task calls kubectl without --dry-run: a mismatch
+    assert "E_FIXTURE_MISMATCH call 1" in out
+
+
+def test_record_dry_run_needs_no_allow_write_but_a_real_write_still_does(rwtask, plugin, kubectl):
+    code, _, err = rwtask(
+        "probe/kube-restart", "--record", "--resource", DEPLOYMENT, "--scenario", "real"
+    )
+    assert code == 2 and "--allow-write" in err
+    assert not fixture_path(plugin, "kube-restart", "real").exists()
+    assert kubectl.calls() == []
+
+
+def test_record_dry_run_is_refused_for_a_task_without_dry_run(rwtask, plugin):
+    for task in ("sh-write-no-dry", "py-partial"):
+        code, _, err = rwtask(
+            f"probe/{task}", "--record", "--resource", DEPLOYMENT, "--scenario", "d", "--dry-run"
+        )
+        assert code == 2, task
+        assert "does not declare dryRun: true" in err
+        assert not fixture_path(plugin, task, "d").exists()
+
+
+def test_replaying_a_dry_run_scenario_of_a_task_without_dry_run_fails(rwtask, plugin):
+    path = fixture_path(plugin, "sh-write-no-dry", "d")
+    path.parent.mkdir(parents=True)
+    path.write_text("dryRun: true\nexpect: {status: ok}\n")
+    code, out, _ = rwtask("probe/sh-write-no-dry")
+    assert code == 1
+    assert "FAIL probe/sh-write-no-dry/d" in out
+    assert "dryRun: true, but the task does not declare dryRun: true" in out
+
+
+def test_dry_run_only_applies_with_record(rwtask):
+    with pytest.raises(SystemExit):
+        rwtask("probe/kube-restart", "--dry-run")

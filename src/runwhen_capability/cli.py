@@ -13,6 +13,7 @@
     rwtask test <skill>[/<task>] [--plugin-dir DIR] [--shim TOOL]...
     rwtask test <skill>/<task> --record --resource PATH --scenario NAME [--input k=v]...
         [--setting k=v]... [--identity k=v]... [--shim TOOL]... [--force] [--allow-write]
+        [--dry-run]
     rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
     rwtask validate <dir>
     rwtask compile <plugin-dir> [--out DIR]
@@ -374,6 +375,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-write",
         action="store_true",
         help="--record: run a task that is not read-only (it really runs)",
+    )
+    v13_test.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="--record: run with RW_DRY_RUN=1 and write `dryRun: true`; only for a task that "
+        "declares dryRun: true. Needs no --allow-write",
     )
 
     port_p = sub.add_parser(
@@ -753,7 +760,9 @@ _SCENARIO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _RECORD_HEADER = (
     "# Recorded by `rwtask test --record`. Review it before committing: `calls` holds what the\n"
     "# tools printed. `expect.outputs` is left for you to add -- `outputs: {name: value}` is a\n"
-    "# subset match (a dict by key, a list or a scalar whole); `rwtask test` replays this file."
+    "# subset match (a dict by key, a list or a scalar whole; `{$contains: [..]}` and\n"
+    "# `{$containsWhere: {..}}` look inside a list). `expect.artifacts` does the same for\n"
+    "# artifact files. `rwtask test` replays this file."
 )
 
 
@@ -769,6 +778,7 @@ def _v13_test_flags(args: argparse.Namespace) -> bool:
         or args.scenario is not None
         or args.force
         or args.allow_write
+        or args.dry_run
     )
 
 
@@ -799,6 +809,7 @@ def _test_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                 ("--identity", args.v13_identity),
                 ("--force", args.force),
                 ("--allow-write", args.allow_write),
+                ("--dry-run", args.dry_run),
             )
             if value
         ]
@@ -864,11 +875,17 @@ def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[st
     if destination.exists() and not args.force:
         print(f"{who}: {destination} already exists; pass --force to overwrite it", file=sys.stderr)
         return 2
-    if not task["readOnly"] and not args.allow_write:
+    if args.dry_run and not task["dryRun"]:
+        print(
+            f"{who}: {ref} does not declare dryRun: true, so --dry-run is refused", file=sys.stderr
+        )
+        return 2
+    if not task["readOnly"] and not (args.allow_write or (args.dry_run and task["dryRun"])):
         effects = "; ".join(task.get("effects") or ["changes things"])
+        hint = ", or --dry-run to only look" if task["dryRun"] else ""
         print(
             f"{who}: {ref} is not read-only: it {effects}. Recording really runs it; "
-            "pass --allow-write to record it",
+            f"pass --allow-write to record it{hint}",
             file=sys.stderr,
         )
         return 2
@@ -901,6 +918,7 @@ def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[st
                     target=target,
                     inputs=inputs,
                     settings=settings,
+                    dry_run=args.dry_run,
                 ),
                 scope_dir=scope_dir,
                 inherit_home=True,
@@ -924,6 +942,7 @@ def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[st
         calls=calls,
         expect=expect,
         header=_RECORD_HEADER,
+        dry_run=args.dry_run,
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(text, encoding="utf-8")
@@ -979,6 +998,13 @@ def _replay_v13(
                     print(f"  {problem}")
                 continue
             problems: list[str] = []
+            if scenario.dry_run and not task["dryRun"]:
+                failed += 1
+                print(f"FAIL {label}")
+                print(
+                    "  the scenario says dryRun: true, but the task does not declare dryRun: true"
+                )
+                continue
             target, failure = _target_for(
                 who, f"{skill}/{name}", task, tree, scenario.resource, scenario.identity
             )
@@ -998,6 +1024,7 @@ def _replay_v13(
                             target=target,
                             inputs=scenario.inputs,
                             settings=scenario.settings,
+                            dry_run=scenario.dry_run,
                         ),
                         scope_dir=scope_dir,
                         path_prepend=session.path_prepend,
@@ -1005,6 +1032,11 @@ def _replay_v13(
                     )
                     mismatches = session.mismatches()
                     unconsumed = session.unconsumed()
+                # the artifact files go with the scope directory: read them now
+                artifact_texts = {
+                    artifact: file.read_text(encoding="utf-8", errors="replace")
+                    for artifact, file in outcome.artifacts.items()
+                }
             finally:
                 shutil.rmtree(scope_dir, ignore_errors=True)
             if mismatches:
@@ -1012,7 +1044,16 @@ def _replay_v13(
                     f"E_FIXTURE_MISMATCH call {m['index'] + 1}: {m['message']}" for m in mismatches
                 )
             else:
-                problems.extend(match_expect(outcome.envelope, scenario.expect))
+                problems.extend(
+                    match_expect(
+                        outcome.envelope,
+                        scenario.expect,
+                        artifacts=artifact_texts,
+                        artifact_outputs=[
+                            n for n, o in (task.get("outputs") or {}).items() if "artifact" in o
+                        ],
+                    )
+                )
                 if unconsumed:
                     problems.append(f"{unconsumed} recorded calls not made")
             if problems:
