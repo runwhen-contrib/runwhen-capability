@@ -173,6 +173,9 @@ Stdout and stderr are logs and are never parsed for outputs.
 Python script's unit test sees `ctx.resource`, `ctx.settings`, `ctx.run` and
 `ctx.error` with the V13 semantics and no cluster. `rwtask test` replays
 recorded CLI calls through PATH shims, for bash and Python scripts alike.
+A skill's `tests/` (the recorded fixtures) is authoring only: `rwtask compile`, `rwtask pull` and the
+registry never package it (archive.md section 2), so a script must not read it at run time
+(`rwtask validate` warns `W_SCRIPT_READS_TESTS`).
 
 `<NAME>` is the camelCase name in SCREAMING_SNAKE (`latencyThresholdMs` →
 `RW_SETTING_LATENCY_THRESHOLD_MS`). Identity fields are the integration's
@@ -488,3 +491,4 @@ Additive: no field was removed and every document that validated under
 | # | Change | Affects |
 |---|---|---|
 | V2-3 | Canonical root key. `types.yaml`: a root type may declare `canonicalKey: <camelName>` (Kubernetes: `kubeSystemUid`); on a non-root type it is a schema error. `common.schema.json#/$defs/rootIdentity` is `{canonicalKey: {name, value}}`; `rw.discovery.summary.v1` and `rw.access.v1` each gain an optional top-level `root` of that shape. papi re-keys the root to `<name>=<value>`; if another root holds that key, it re-points the reporting connection and marks its own old root `superseded` (no automatic subtree merge). Compile carries `canonicalKey` through in `integration.definition`; no semantic check beyond the schema. Settles F21. | C (papi root dedupe), F (kubernetes discover and check-permissions report it) |
+| V3-1 | A skill's `skills/<skill>/tests/**` is dev-only and never packaged, like the root `tests/`, `runwhen.lock` and `.runwhen/`: `rwtask compile` and `rwtask pull` drop it (silently; not in the archive nor `skills[].files`; it stays an allowed authoring path), `rwtask test` reads fixtures from the plugin directory, and `rwtask validate` warns `W_SCRIPT_READS_TESTS` when a script or `lib/` file mentions a `tests/` path. archive.md section 2 and 3a say so. The registry must apply the same exclusion when it builds or re-normalises an archive, or the sha256 differs between builders. | B (registry ingest, upload re-normalisation), D (runwhen-plugins), F (skill authors) |

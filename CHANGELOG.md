@@ -7,6 +7,16 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- A skill's `skills/<skill>/tests/**` (recorded fixtures) is dev-only and never packaged (lane F),
+  exactly like the root `tests/`, `runwhen.lock` and `.runwhen/`. `load_entries` / `load_dir`
+  (so `rwtask compile` and `rwtask validate`) and `rwtask pull`'s git path drop it silently: not in
+  the archive, `files` or `compiled.skills[].files`, so the archive sha256 stays one identity across
+  builders (the registry must apply the same rule). `skills/<skill>/tests` stays an allowed
+  authoring path, and `rwtask test` still reads fixtures from the plugin directory. This also
+  applies to a workspace skill directory loaded with `load_skill_dir`. New warning
+  `W_SCRIPT_READS_TESTS` when a `.py`/`.sh` file under a skill's `scripts/` or `lib/` mentions a
+  `tests/` path. archive.md sections 2 and 3a, CONTRACTS.md "Plugin format" and the contracts-v3
+  changes (V3-1) say so.
 - The platform-minted `runwhen/sync` credential reaches a task as the JSON file at
   `$RW_SYNC_CREDENTIAL` (lanes B, C): a lease's `materialized[]` entry
   `{credentialType: runwhen/sync, files: [{env: RW_SYNC_CREDENTIAL, ...}]}` is accepted. That one

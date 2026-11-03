@@ -601,3 +601,40 @@ def test_a_remote_ref_in_a_plugin_schema_is_reported():
     assert (d.file, d.path) == (ROLLOUT, "/properties/a/$ref")
     local = '{"$defs": {"a": {"type": "string"}}, "properties": {"a": {"$ref": "#/$defs/a"}}}'
     assert not found(put(kube_entries(), ROLLOUT, local), "E_SCHEMA_REF")
+
+
+# -- W_SCRIPT_READS_TESTS ---------------------------------------------------------------------
+
+
+BASE = "skills/k8s-base/"
+SCRIPT = BASE + "scripts/kubectl.sh"
+
+
+def test_a_script_that_reads_the_skill_tests_gets_a_warning():
+    entries = put(kube_entries(), SCRIPT, "#!/usr/bin/env bash\ncat ./tests/kubectl/basic.yaml\n")
+    hit = only(entries, "W_SCRIPT_READS_TESTS")
+    assert hit.severity == "warning"
+    assert hit.file == SCRIPT
+    assert "not packaged" in hit.message
+    assert errors(entries) == []
+
+
+def test_a_lib_file_that_reads_the_skill_tests_gets_a_warning():
+    entries = put(kube_entries(), BASE + "lib/helpers.py", "FIXTURES = 'tests/kubectl'\n")
+    entries = put(entries, BASE + "lib/helpers.sh", "load() { source ../tests/x.sh; }\n")
+    assert {d.file for d in found(entries, "W_SCRIPT_READS_TESTS")} == {
+        BASE + "lib/helpers.py",
+        BASE + "lib/helpers.sh",
+    }
+
+
+def test_tests_in_a_word_or_in_a_file_that_is_not_code_is_not_flagged():
+    entries = put(kube_entries(), SCRIPT, "#!/usr/bin/env bash\necho latests/ contests/ tests\n")
+    entries = put(entries, BASE + "references/guide.md", "see tests/ for fixtures\n")
+    entries = put(entries, BASE + "lib/data.json", '{"p": "tests/x"}')
+    assert found(entries, "W_SCRIPT_READS_TESTS") == []
+
+
+def test_the_skill_tests_themselves_never_trigger_the_warning():
+    entries = put(kube_entries(), BASE + "tests/kubectl/run.sh", "cat tests/x\n")
+    assert found(entries, "W_SCRIPT_READS_TESTS") == []

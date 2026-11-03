@@ -173,7 +173,6 @@ def test_a_path_outside_the_layout_is_e_path_not_allowed(path):
         "skills/k8s-base/lib/helpers.py",
         "skills/k8s-base/references/guide.md",
         "skills/k8s-base/assets/logo.png",
-        "skills/k8s-base/tests/kubectl/a.yaml",
         "skills/k8s-base/schemas/x.v1.json",
     ],
 )
@@ -188,6 +187,16 @@ def test_every_layout_path_is_allowed(path):
     tree = load_entries(entries)
     assert "E_PATH_NOT_ALLOWED" not in codes(tree)
     assert path in tree.files
+
+
+def test_skill_tests_are_an_allowed_path_but_never_packaged():
+    entries = put(kube_entries(), "skills/k8s-base/tests/kubectl/a.yaml", "a: 1")
+    entries = put(entries, "skills/k8s-base/tests/deep/er/b.yaml", "b: 1")
+    tree = load_entries(entries)
+    assert tree.diagnostics == []  # silently: not E_PATH_NOT_ALLOWED, not any diagnostic
+    assert not [p for p in tree.files if "/tests/" in p]
+    assert not [p for p in tree.skills["k8s-base"].files if p.startswith("tests/")]
+    assert tree.files == load_entries(kube_entries()).files
 
 
 def test_root_tests_directory_is_excluded_like_the_archive_does():
@@ -262,6 +271,19 @@ def test_load_dir_skips_git_root_dotfiles_and_root_tests(tmp_path):
     tree = load_dir(root)
     assert tree.diagnostics == []
     assert not [p for p in tree.files if p.startswith((".", "tests/"))]
+
+
+def test_load_dir_skips_skill_tests_even_a_symlink_in_them(tmp_path):
+    root = tmp_path / "plug"
+    shutil.copytree(KUBE_MINI, root)
+    tests = root / "skills" / "k8s-base" / "tests" / "kubectl"
+    tests.mkdir(parents=True)
+    (tests / "a.yaml").write_text("x: 1")
+    (tests / "link.yaml").symlink_to(tests / "a.yaml")
+    tree = load_dir(root)
+    assert tree.diagnostics == []
+    assert not [p for p in tree.files if "/tests/" in p]
+    assert tree.files == load_dir(KUBE_MINI).files
 
 
 def test_load_dir_flags_a_path_outside_the_layout(tmp_path):

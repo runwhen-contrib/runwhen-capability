@@ -648,6 +648,24 @@ def test_cli_excludes_root_tests_and_dotfiles_from_the_archive(tmp_path, capsys)
     assert not [n for n in names if n.startswith(("tests/", "."))]
 
 
+def test_cli_never_packages_skill_tests(tmp_path, capsys):
+    root = tmp_path / "plug"
+    shutil.copytree(KUBE_MINI, root)
+    fixtures = root / "skills" / "k8s-base" / "tests" / "kubectl"
+    fixtures.mkdir(parents=True)
+    (fixtures / "basic.yaml").write_text("calls: []\n")
+    plain = tmp_path / "plain"
+    shutil.copytree(KUBE_MINI, plain)
+    assert main(["compile", str(root), "--out", str(tmp_path / "o")]) == 0
+    assert main(["compile", str(plain), "--out", str(tmp_path / "p")]) == 0
+    tar = (tmp_path / "o" / "kubernetes-0.1.0.tar").read_bytes()
+    names = [e.path for e in archive.read(tar)]
+    assert not [n for n in names if "/tests/" in n]
+    assert tar == (tmp_path / "p" / "kubernetes-0.1.0.tar").read_bytes()  # one identity
+    compiled = json.loads((tmp_path / "o" / "kubernetes-0.1.0.compiled.json").read_text())
+    assert not [f for s in compiled["skills"] for f in s["files"] if "/tests/" in f]
+
+
 def test_cli_prints_diagnostics_and_writes_nothing_on_errors(tmp_path, capsys):
     root = tmp_path / "plug"
     shutil.copytree(KUBE_MINI, root)

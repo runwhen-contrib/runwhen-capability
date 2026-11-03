@@ -31,10 +31,14 @@ bytes for the same version is rejected with `E_VERSION_CONFLICT`; the first arch
   working copy: untracked and ignored files can never leak in.
 - There is **no wrapper directory**: `plugin.yaml` is at the archive root, next to `integration/`,
   `skills/`, `rules/`, `knowledge/`, `runtimes/`-free (runtimes are images, D34).
-- **Excluded**, all at the archive root only: `tests/` (recorded fixtures are CI evidence and can be
+- **Excluded**: at the archive root, `tests/` (recorded fixtures are CI evidence and can be
   large; no consumer of the archive needs them), `runwhen.lock` and `.runwhen/` (the author's pinned
-  dependencies and editor schemas written by `rwtask pull`, AUT-1; contracts-v3 addendum), and
-  nothing else. `rwtask compile`, `rwtask pull` and the registry apply the same exclusions.
+  dependencies and editor schemas written by `rwtask pull`, AUT-1; contracts-v3 addendum); and in
+  every skill, `skills/<skill>/tests/` (recorded fixtures are dev-only; `rwtask test` reads them from
+  the plugin directory, never from an archive; contracts-v3 addendum); and nothing else.
+  `rwtask compile`, `rwtask pull` and the registry apply the same exclusions, so the archive sha256
+  is one identity. A skill's `tests/` stays an allowed authoring path (no `E_PATH_NOT_ALLOWED` for it
+  on disk); a submitted archive that contains one is re-normalised by dropping it.
 - **Rejected** (`E_INVALID_PLUGIN`, the version is not ingested): symlinks, submodules (gitlinks),
   any path that after normalisation is absolute, contains `..`, `\`, a NUL or a control character,
   is not valid UTF-8 NFC, exceeds 255 bytes, or collides case-insensitively with another path.
@@ -81,7 +85,8 @@ integration/                    at most one integration per plugin (D16)
 skills/<skill>/                 folder name = skill name
   SKILL.md                      required
   tasks.yaml                    only if the skill runs tasks
-  scripts/**  lib/**  schemas/**  references/**  assets/**  tests/**
+  scripts/**  lib/**  schemas/**  references/**  assets/**
+  tests/**                      authoring only, not packaged (section 2)
 rules/<name>.md                 rule-frontmatter.schema.json; file name = name
 knowledge/<name>.md             knowledge-frontmatter.schema.json; file name = name
 ```

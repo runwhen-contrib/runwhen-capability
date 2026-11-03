@@ -18,6 +18,10 @@ Loader diagnostics (all severity "error", `file` is the tree-relative path):
 - E_DUPLICATE_KEY -- a top-level integration key in more than one of
   integration/{integration,types,facets,dependencies}.yaml.
 
+Authoring state is dropped silently and never reaches `files`: the root `tests/`,
+`runwhen.lock` and `.runwhen/`, and each skill's `tests/` (recorded fixtures, dev-only:
+`rwtask test` reads them from the plugin directory; archive.md section 2).
+
 Parsing goes only through `contracts.load_yaml` / `split_frontmatter`, so every
 file is YAML 1.2.
 """
@@ -25,6 +29,7 @@ file is YAML 1.2.
 from __future__ import annotations
 
 import os
+import re
 import stat
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -54,6 +59,7 @@ _ROOT_FILES = frozenset({"plugin.yaml", "README.md", "LICENSE", "CHANGELOG.md", 
 _SKILL_FILES = frozenset({"SKILL.md", "tasks.yaml"})
 _SKILL_DIRS = frozenset({"scripts", "lib", "schemas", "references", "assets", "tests"})
 _INTEGRATION_DIRS = frozenset({"schemas", "auth"})
+_SKILL_DIR_REL = re.compile(r"skills/[^/]+/")
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,15 @@ def _load_markdown(path: str, data: bytes, diags: list[Diagnostic]) -> tuple[dic
         return None
 
 
+def _is_excluded(parts: list[str]) -> bool:
+    """A path that is authoring state, not plugin content (archive.md section 2): anything
+    under the root `tests/` or `.runwhen/`, or under a skill's `tests/` (recorded fixtures,
+    read by `rwtask test` from the plugin directory and never packaged)."""
+    if parts[0] in ("tests", ".runwhen") and len(parts) > 1:
+        return True
+    return len(parts) > 3 and parts[0] == "skills" and parts[2] == "tests"
+
+
 def load_entries(entries: Iterable[TreeEntry]) -> PluginTree:
     """Load a plugin tree from its files. Never raises for a content problem."""
     diags: list[Diagnostic] = []
@@ -174,7 +189,7 @@ def load_entries(entries: Iterable[TreeEntry]) -> PluginTree:
             continue
         folded[key] = path
         parts = path.split("/")
-        if (parts[0] in ("tests", ".runwhen") and len(parts) > 1) or path == LOCK_FILE:
+        if _is_excluded(parts) or path == LOCK_FILE:
             continue  # excluded from the archive (archive.md section 2)
         if not layout_allows(path):
             diags.append(
@@ -270,11 +285,12 @@ def _load_collection(
     return found
 
 
-def _read_dir(root: Path, *, skip_root_tests: bool) -> tuple[list[TreeEntry], list[Diagnostic]]:
+def _read_dir(root: Path) -> tuple[list[TreeEntry], list[Diagnostic]]:
     """Every regular file under `root`, in sorted order. Symlinks and other
     non-regular files are E_PATH_NOT_ALLOWED and never followed. Root-level
-    dotfiles and dot-directories (.git, .github), the root `runwhen.lock` and the
-    root `tests/` directory (when `skip_root_tests`) are skipped."""
+    dotfiles and dot-directories (.git, .github), the root `runwhen.lock`, the
+    root `tests/` directory and each `skills/<skill>/tests/` directory are skipped
+    (`root` may be one skill directory, whose own `tests/` is skipped likewise)."""
     entries: list[TreeEntry] = []
     diags: list[Diagnostic] = []
 
@@ -283,11 +299,9 @@ def _read_dir(root: Path, *, skip_root_tests: bool) -> tuple[list[TreeEntry], li
             children = sorted(scan, key=lambda e: e.name)
         for child in children:
             child_rel = f"{rel}{child.name}"
-            if not rel and (
-                child.name.startswith(".")
-                or child.name == LOCK_FILE
-                or (skip_root_tests and child.name == "tests")
-            ):
+            if not rel and (child.name.startswith(".") or child.name == LOCK_FILE):
+                continue
+            if child.name == "tests" and (not rel or _SKILL_DIR_REL.fullmatch(rel)):
                 continue
             mode = child.stat(follow_symlinks=False).st_mode
             if stat.S_ISLNK(mode):
@@ -315,7 +329,7 @@ def _read_dir(root: Path, *, skip_root_tests: bool) -> tuple[list[TreeEntry], li
 
 def load_dir(root: Path) -> PluginTree:
     """Load the plugin in directory `root`."""
-    entries, diags = _read_dir(Path(root), skip_root_tests=True)
+    entries, diags = _read_dir(Path(root))
     tree = load_entries(entries)
     return _with_leading(tree, diags)
 
@@ -325,7 +339,7 @@ def load_skill_dir(path: Path) -> PluginTree:
     plugin.yaml, so `plugin` is None and the single skill is named after the
     directory."""
     root = Path(path).resolve()
-    entries, diags = _read_dir(root, skip_root_tests=False)
+    entries, diags = _read_dir(root)
     prefixed = [TreeEntry(f"skills/{root.name}/{e.path}", e.data, e.executable) for e in entries]
     for diag in diags:
         diag.file = f"skills/{root.name}/{diag.file}"
