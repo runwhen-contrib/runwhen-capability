@@ -7,7 +7,8 @@ seam, plus an offline validator for them.
         print(v.path, v.message)
 
 The plugin archive (deterministic ustar tar, `contracts.archive.build/read/verify`)
-and the canonical-JSON hashes live alongside.
+and the canonical-JSON hashes live alongside. `load_yaml` / `split_frontmatter` parse
+plugin files as YAML 1.2 (`no` is a string, timestamps stay strings).
 
 The schemas are authored in the repo-level contracts/ directory and mirrored
 into `_data/` by scripts/sync_contracts.py (`make contracts-sync`).
@@ -19,6 +20,7 @@ from typing import Any
 
 from . import _validate
 from ._validate import ContractError, ContractViolation, check, data_dir, schema, validate
+from ._yaml12 import load_yaml, split_frontmatter
 from .archive import ArchiveError, TreeEntry, archive_sha256
 from .hashing import (
     canonical_json,
@@ -37,9 +39,11 @@ __all__ = [
     "canonical_json",
     "check",
     "data_dir",
+    "load_yaml",
     "normalize_permission",
     "permission_hash",
     "schema",
+    "split_frontmatter",
     "task_hash",
     "validate",
 ]
