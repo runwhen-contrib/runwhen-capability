@@ -16,6 +16,11 @@ per-pod bearer token). Two routes, both scoped to one request:
         -> 200 the bytes, with Content-Length and X-RW-Sha256
         -> 404 when `input` is not one of the request's input artifacts
 
+    GET {relay}/v1/tasks/{requestId}/code
+        -> 200 the request's plugin code archive (a tar), with Content-Length and
+           X-RW-Sha256: sha256:<hex>
+        -> 404 when the request's lease carries no `code.archive`
+
 The runner answers a PUT early on purpose: 413 after reading only
 `maxBytes + 1` bytes, 503 before reading any. The client is usually still
 sending when that happens; requests/urllib3 tolerate the broken pipe a close
@@ -310,6 +315,23 @@ class RelayClient:
                 with resp:
                     self._raise_for(resp)
         return InputStream(resp, input)
+
+    def open_code(self) -> InputStream:
+        """Opens the request's plugin code archive (`GET .../code`) for streaming,
+        as an InputStream the caller reads and must close. Failures are as in
+        `open_input`; a 404 (the lease has no `code.archive`) is
+        ArtifactUndeclaredError."""
+        with _transport_errors("downloading the code archive"):
+            resp = self.session.get(
+                self._url("code"),
+                headers=self._auth(),
+                stream=True,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+            )
+            if resp.status_code != 200:
+                with resp:
+                    self._raise_for(resp)
+        return InputStream(resp, "code")
 
     @staticmethod
     def _raise_for(resp: requests.Response, *, upload: bool = False) -> NoReturn:

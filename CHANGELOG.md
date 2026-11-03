@@ -7,6 +7,19 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `rwtask serve` fetches a V13 lease's plugin code archive from the runner relay when it is not in
+  the local cache (DLV-9; it used to fail with a `dependency` error). `RelayClient.open_code()`
+  streams `GET /v1/tasks/{requestId}/code`; the body must be exactly the lease's `code.archive.size`
+  bytes (never more than 64 MiB, enforced while reading), carry a matching `X-RW-Sha256` when sent,
+  and hash to the lease's sha256. Only verified bytes are cached, at `<cache>/<hex>.tar`, written to
+  a unique temporary file and renamed into place, so concurrent fetches of one archive in a pod both
+  succeed. A failed or mismatched fetch is a `dependency` envelope that names the archive (not the
+  relay URL or token); with no relay (`rwtask run`) a missing archive stays a `dependency` error.
+  A cached archive that fails its hash is dropped and fetched once more (with no relay it stays an
+  `internal` error); a lease size over 64 MiB is refused before the relay is asked; a sha256 that is
+  not `sha256:<64 lower-case hex>` is `invalid_input` and never reaches a cache path; `*.tmp` files
+  of dead fetches older than an hour are removed. `.archives`, the cache directory, is refused as a
+  `scopeId`. `load_code` and `runspec_from_lease` take an optional `relay`.
 - A reference time for every V13 task run (lane F): the executor (`plugin/run.py` `execute`, so
   `rwtask run`, `rwtask test` and the lease executor) sets `RW_NOW` (RFC 3339 UTC, milliseconds,
   `Z`) and `RW_NOW_EPOCH` (integer seconds) once at the start of the run, or from the new

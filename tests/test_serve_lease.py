@@ -7,15 +7,22 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
+import requests
 import responses
+from relay_server import Response, refused_url
 
 from runwhen_capability.contracts import TreeEntry, archive, archive_sha256
 from runwhen_capability.contracts import validate as validate_contract
 from runwhen_capability.plugin import compile_tree, load_dir
-from runwhen_capability.serve import serve
+from runwhen_capability.plugin.lease import LeaseError, load_code
+from runwhen_capability.relay import RelayClient
+from runwhen_capability.serve import _is_safe_scope_id, serve
 
 HERE = Path(__file__).resolve().parent
 RUN_MINI = HERE / "plugin" / "fixtures" / "run-mini"
@@ -229,12 +236,15 @@ def test_an_invalid_lease_is_failed_with_invalid_input_naming_the_violation(poll
     assert "limits" in error["message"]
 
 
-def test_an_archive_that_is_not_in_the_cache_is_a_dependency_failure(poll):
-    sha = archive_sha256(archive.build(entries()))
-    lease = make_lease("py-ok", code={"archive": {"sha256": sha, "size": 123}})
-    [error] = envelope_of(poll(lease))["errors"]
+def test_an_archive_the_relay_does_not_have_is_a_dependency_failure(fetch):
+    data = archive.build(entries())
+    sha = archive_sha256(data)
+    lease = make_lease("py-ok", code={"archive": {"sha256": sha, "size": len(data)}})
+    [error] = envelope_of(fetch(lease, Response(404, json={"code": "E_NO_CODE"})))["errors"]
     assert error["code"] == "dependency"
-    assert "DLV-9" in error["message"]
+    assert sha in error["message"]
+    assert "DLV-9" not in error["message"]
+    assert not any(fetch.archives.glob("*"))
 
 
 def test_an_archive_in_the_cache_is_verified_and_run(poll):
@@ -248,14 +258,294 @@ def test_an_archive_in_the_cache_is_verified_and_run(poll):
     assert envelope["outputs"]["summary"]["lib"] == "from-lib"
 
 
-def test_a_corrupt_archive_in_the_cache_is_a_hash_mismatch(poll):
+# -- code archives fetched from the relay (I3) ---------------------------------------------------
+
+
+@pytest.fixture
+def fetch(relay_server, tmp_path, monkeypatch):
+    """Serves one polled lease against the real local relay, which scripts the answers of
+    `GET /v1/tasks/req-1/code`. Returns the POSTed result body; the relay's recorded
+    requests are `relay_server.requests`."""
+    token = tmp_path / "token"
+    monkeypatch.setenv("RW_ARCHIVE_CACHE", str(tmp_path / "archives"))
+    monkeypatch.setenv("RW_CREDENTIALS_DIR", str(tmp_path / "creds"))
+
+    def go(lease, *code: Response):
+        token.write_text("test-token")  # serve reads it once and unlinks it
+        relay_server.script(
+            "POST",
+            "/v1/tasks/next",
+            Response(
+                200,
+                json={
+                    "requestId": "req-1",
+                    "request": lease,
+                    "credentials": {},
+                    "scopeId": "scope-1",
+                    "deadlineMs": 30000,
+                },
+            ),
+        )
+        if code:
+            relay_server.script("GET", "/v1/tasks/req-1/code", *code)
+        relay_server.script("POST", "/v1/tasks/req-1/result", Response(200, json={}))
+        before = len(relay_server.requests)
+        serve(
+            relay=relay_server.url,
+            pool_id="pool-1",
+            workdir=tmp_path / "work",
+            capability_dir=ECHO,
+            token_file=token,
+            max_iterations=1,
+            allow_bundles=True,
+        )
+        [result] = [r for r in relay_server.requests[before:] if r.path.endswith("/result")]
+        return json.loads(result.body)
+
+    go.archives = tmp_path / "archives"
+    go.code_requests = lambda: [r for r in relay_server.requests if r.path.endswith("/code")]
+    return go
+
+
+def code_response(data: bytes, sha: str | None = None, **headers) -> Response:
+    sha = sha or archive_sha256(data)
+    return Response(200, body=data, headers={"X-RW-Sha256": sha, **headers})
+
+
+def archive_lease(data: bytes, size: int | None = None) -> dict:
+    code = {
+        "archive": {"sha256": archive_sha256(data), "size": len(data) if size is None else size}
+    }
+    return make_lease("py-ok", code=code)
+
+
+def test_an_archive_missing_from_the_cache_is_fetched_verified_cached_and_run(fetch):
+    data = archive.build(entries())
+    envelope = envelope_of(fetch(archive_lease(data), code_response(data)))
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert envelope["outputs"]["summary"]["lib"] == "from-lib"
+    [request] = fetch.code_requests()
+    assert request.method == "GET"
+    assert request.header("authorization") == "Bearer test-token"
+    hex_digest = archive_sha256(data).removeprefix("sha256:")
+    assert [p.name for p in fetch.archives.iterdir()] == [f"{hex_digest}.tar"]  # no temp file left
+    assert (fetch.archives / f"{hex_digest}.tar").read_bytes() == data
+
+
+def test_a_cached_archive_is_not_fetched_again(fetch):
+    data = archive.build(entries())
+    lease = archive_lease(data)
+    assert envelope_of(fetch(lease, code_response(data)))["status"] == "ok"
+    assert envelope_of(fetch(lease))["status"] == "ok"  # the relay has no more answers
+    assert len(fetch.code_requests()) == 1
+
+
+def test_fetched_bytes_that_do_not_hash_to_the_lease_are_refused_and_not_cached(fetch):
+    data = archive.build(entries())
+    wrong = bytes([data[0] ^ 1]) + data[1:]  # same length, other bytes
+    lease = archive_lease(data)
+    [error] = envelope_of(fetch(lease, code_response(wrong, sha=archive_sha256(data))))["errors"]
+    assert error["code"] == "dependency"
+    assert archive_sha256(data) in error["message"]
+    assert not any(fetch.archives.glob("*"))
+    # the failure is not remembered: the next request fetches again, and succeeds
+    assert envelope_of(fetch(lease, code_response(data)))["status"] == "ok"
+    assert len(fetch.code_requests()) == 2
+
+
+def test_an_x_rw_sha256_header_that_names_another_archive_is_refused(fetch):
+    data = archive.build(entries())
+    other = "sha256:" + "0" * 64
+    [error] = envelope_of(fetch(archive_lease(data), code_response(data, sha=other)))["errors"]
+    assert error["code"] == "dependency"
+    assert not any(fetch.archives.glob("*"))
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+def test_a_body_whose_length_is_not_the_leases_size_is_refused(fetch, delta):
+    data = archive.build(entries())
+    lease = archive_lease(data, size=len(data) + delta)
+    [error] = envelope_of(fetch(lease, code_response(data)))["errors"]
+    assert error["code"] == "dependency"
+    assert not any(fetch.archives.glob("*"))
+
+
+def test_the_size_cap_is_enforced_while_reading_not_after(fetch):
+    """A relay that keeps sending past the lease's size is cut off, not buffered."""
+    data = archive.build(entries())
+    endless = Response(200, stream=iter([data] + [b"x" * 65536] * 8), content_length=1 << 30)
+    [error] = envelope_of(fetch(archive_lease(data), endless))["errors"]
+    assert error["code"] == "dependency"
+    assert "more than" in error["message"]
+    assert not any(fetch.archives.glob("*"))
+
+
+def test_a_relay_that_cuts_the_download_short_is_a_dependency_failure(fetch):
+    data = archive.build(entries())
+    cut = Response(200, stream=iter([data[:100]]), content_length=len(data))
+    [error] = envelope_of(fetch(archive_lease(data), cut))["errors"]
+    assert error["code"] == "dependency"
+    assert archive_sha256(data) in error["message"]
+    assert not any(fetch.archives.glob("*"))
+
+
+def test_a_relay_error_names_the_archive_but_not_the_relay(fetch, relay_server):
+    data = archive.build(entries())
+    [error] = envelope_of(fetch(archive_lease(data), Response(500, body=b"boom")))["errors"]
+    assert error["code"] == "dependency"
+    assert archive_sha256(data) in error["message"]
+    assert relay_server.url not in error["message"]
+    assert "test-token" not in error["message"]
+
+
+def test_an_unreachable_relay_fails_without_naming_it(tmp_path):
     data = archive.build(entries())
     sha = archive_sha256(data)
-    poll.archives.mkdir()
-    (poll.archives / f"{sha.removeprefix('sha256:')}.tar").write_bytes(data + b"\0" * 512)
-    lease = make_lease("py-ok", code={"archive": {"sha256": sha, "size": len(data)}})
-    [error] = envelope_of(poll(lease))["errors"]
-    assert error["code"] == "internal"
+    client = RelayClient(refused_url(), None, "req-1", requests.Session(), token="s3cret")
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": len(data)}}, tmp_path / "cache", client)
+    assert raised.value.code == "dependency"
+    assert sha in raised.value.message
+    assert "127.0.0.1" not in raised.value.message
+    assert "s3cret" not in raised.value.message
+    assert not (tmp_path / "cache").exists()
+
+
+def test_without_a_relay_a_missing_archive_is_a_clear_dependency_failure(tmp_path):
+    sha = archive_sha256(archive.build(entries()))
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": 1}}, tmp_path / "cache")
+    assert raised.value.code == "dependency"
+    assert sha in raised.value.message
+    assert "relay" in raised.value.message
+
+
+def test_concurrent_requests_for_one_archive_both_succeed_and_leave_one_file(
+    relay_server, tmp_path
+):
+    data = archive.build(entries())
+    sha = archive_sha256(data)
+    code = {"archive": {"sha256": sha, "size": len(data)}}
+    cache = tmp_path / "cache"
+    # each answer is held back, so both fetches are in flight before either finishes
+    relay_server.script(
+        "GET",
+        "/v1/tasks/",
+        *[Response(200, body=data, headers={"X-RW-Sha256": sha}, delay=0.3) for _ in range(2)],
+    )
+    results: list = []
+
+    def run(request_id: str) -> None:
+        client = RelayClient(relay_server.url, None, request_id, requests.Session(), token="t")
+        try:
+            results.append(load_code(code, cache, client))
+        except Exception as exc:  # noqa: BLE001 -- reported by the assertion below
+            results.append(exc)
+
+    threads = [threading.Thread(target=run, args=(f"req-{n}",)) for n in (1, 2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert len(results) == 2
+    assert all(isinstance(r, tuple) for r in results), results
+    assert results[0] == results[1]
+    assert len([r for r in relay_server.requests if r.path.endswith("/code")]) == 2
+    assert [p.name for p in cache.iterdir()] == [f"{sha.removeprefix('sha256:')}.tar"]
+    assert (cache / f"{sha.removeprefix('sha256:')}.tar").read_bytes() == data
+
+
+def test_a_corrupt_archive_in_the_cache_is_dropped_and_fetched_again(fetch):
+    data = archive.build(entries())
+    hex_digest = archive_sha256(data).removeprefix("sha256:")
+    fetch.archives.mkdir()
+    (fetch.archives / f"{hex_digest}.tar").write_bytes(data + b"\0" * 512)
+    envelope = envelope_of(fetch(archive_lease(data), code_response(data)))
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert len(fetch.code_requests()) == 1
+    assert (fetch.archives / f"{hex_digest}.tar").read_bytes() == data
+    assert [p.name for p in fetch.archives.iterdir()] == [f"{hex_digest}.tar"]
+
+
+def test_a_corrupt_cached_archive_is_refetched_only_once(fetch):
+    data = archive.build(entries())
+    hex_digest = archive_sha256(data).removeprefix("sha256:")
+    fetch.archives.mkdir()
+    (fetch.archives / f"{hex_digest}.tar").write_bytes(b"corrupt")
+    wrong = bytes([data[0] ^ 1]) + data[1:]
+    lease = archive_lease(data)
+    [error] = envelope_of(fetch(lease, code_response(wrong, sha=archive_sha256(data))))["errors"]
+    assert error["code"] == "dependency"
+    assert len(fetch.code_requests()) == 1
+    assert not (fetch.archives / f"{hex_digest}.tar").exists()  # the corrupt entry is gone
+
+
+def test_without_a_relay_a_corrupt_cached_archive_stays_an_internal_error(tmp_path):
+    data = archive.build(entries())
+    sha = archive_sha256(data)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    corrupt = cache / f"{sha.removeprefix('sha256:')}.tar"
+    corrupt.write_bytes(data + b"\0" * 512)
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": len(data)}}, cache)
+    assert raised.value.code == "internal"
+    assert corrupt.exists()
+
+
+def test_a_size_over_the_limit_is_refused_before_the_relay_is_asked(relay_server, tmp_path):
+    sha = archive_sha256(archive.build(entries()))
+    size = archive.MAX_ARCHIVE_BYTES + 1
+    client = RelayClient(relay_server.url, None, "req-1", requests.Session(), token="t")
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": size}}, tmp_path / "cache", client)
+    assert raised.value.code == "dependency"
+    assert sha in raised.value.message
+    assert relay_server.started == []
+
+
+@pytest.mark.parametrize(
+    "sha",
+    [
+        "sha256:../../x",
+        "sha256:" + "A" * 64,
+        "sha256:" + "a" * 63,
+        "sha256:" + "a" * 64 + "/..",
+        "x",
+    ],
+)
+def test_a_sha256_that_is_not_64_lower_case_hex_never_reaches_the_cache_path(tmp_path, sha):
+    cache = tmp_path / "cache"
+    with pytest.raises(LeaseError) as raised:
+        load_code({"archive": {"sha256": sha, "size": 1}}, cache)
+    assert raised.value.code == "invalid_input"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_fetch_removes_stale_temp_files_but_not_fresh_ones(fetch):
+    data = archive.build(entries())
+    hex_digest = archive_sha256(data).removeprefix("sha256:")
+    fetch.archives.mkdir()
+    stale = fetch.archives / f"{hex_digest}.tar.dead.tmp"
+    fresh = fetch.archives / f"{hex_digest}.tar.live.tmp"
+    stale.write_bytes(b"partial")
+    fresh.write_bytes(b"partial")
+    old = time.time() - 2 * 3600
+    os.utime(stale, (old, old))
+    assert envelope_of(fetch(archive_lease(data), code_response(data)))["status"] == "ok"
+    assert not stale.exists()
+    assert fresh.exists()
+    assert (fetch.archives / f"{hex_digest}.tar").read_bytes() == data
+
+
+@pytest.mark.parametrize("scope_id", [".archives", ".rw-artifact-cache", "", "..", "a/b"])
+def test_the_archive_cache_directory_is_not_a_scope_id(scope_id):
+    assert not _is_safe_scope_id(scope_id)
+
+
+def test_an_ordinary_scope_id_is_still_safe():
+    assert _is_safe_scope_id("scope-1")
 
 
 def test_a_lease_whose_code_lacks_its_script_fails(poll):
@@ -679,17 +969,19 @@ def test_a_refusal_after_the_lease_validated_carries_provenance(poll):
     # the lease's own claim, even though it is the one that was wrong
     assert envelope["provenance"] == expected_provenance(mismatch)
 
-    sha = archive_sha256(archive.build(entries()))
-    missing = make_lease("py-ok", code={"archive": {"sha256": sha, "size": 123}})
-    envelope = envelope_of(poll(missing))
-    assert envelope["errors"][0]["code"] == "dependency"
-    assert envelope["provenance"] == expected_provenance(missing)
-    assert envelope["provenance"]["archiveSha256"] == sha
-
     dry = dry_run_lease("sh-write-no-dry")
     envelope = envelope_of(poll(dry))
     assert envelope["errors"][0]["message"] == "task does not support dry run"
     assert envelope["provenance"] == expected_provenance(dry)
+
+
+def test_an_archive_that_could_not_be_fetched_carries_provenance(fetch):
+    sha = archive_sha256(archive.build(entries()))
+    missing = make_lease("py-ok", code={"archive": {"sha256": sha, "size": 123}})
+    envelope = envelope_of(fetch(missing, Response(404, json={"code": "E_NO_CODE"})))
+    assert envelope["errors"][0]["code"] == "dependency"
+    assert envelope["provenance"] == expected_provenance(missing)
+    assert envelope["provenance"]["archiveSha256"] == sha
 
 
 def test_a_lease_refused_for_the_opt_in_carries_provenance_when_it_validates(poll):

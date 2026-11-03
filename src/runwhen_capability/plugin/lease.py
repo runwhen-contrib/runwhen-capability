@@ -5,14 +5,14 @@ V13 task) and return its result envelope.
 
 The lease (CONTRACTS.md "Lease") is validated against the `lease` contract; its code is
 checked against the sha256 it names and read from memory (`code.inline`) or from the
-archive cache (`code.archive`); and `runspec_from_lease` turns it into the `RunSpec`
-that `plugin.run.execute` runs. Nothing here starts a process but `execute`, which is
-bundle.py's hardened child runner.
+archive cache (`code.archive`; on a miss it is fetched from the runner relay and cached); and
+`runspec_from_lease` turns it into the `RunSpec` that `plugin.run.execute` runs. Nothing here
+starts a process but `execute`, which is bundle.py's hardened child runner.
 
 Every problem with the lease itself is an envelope, never an exception: `failed` with
 `invalid_input` (the lease or a credential entry breaks its contract) or `internal`
 (the code does not match its hash, cannot be read, or lacks the task's script) or
-`dependency` (an archive that is not in the cache: fetching one waits for DLV-9).
+`dependency` (an archive that is not in the cache and could not be fetched from the relay).
 
 Provenance (VER-6). Every envelope a lease produces carries `provenance` (the lease's task
 ref, plugin, version, task hash, the code's archive sha256, the runtime image and digest,
@@ -75,7 +75,9 @@ from .run import (
 _log = logging.getLogger("runwhen_capability.plugin.lease")
 
 ARCHIVE_CACHE_ENV = "RW_ARCHIVE_CACHE"
-DEFAULT_ARCHIVE_CACHE = "/work/.archives"
+#: The archive cache's directory name in the executor's workdir, which is not a scope.
+ARCHIVE_CACHE_DIR = ".archives"
+DEFAULT_ARCHIVE_CACHE = f"/work/{ARCHIVE_CACHE_DIR}"
 CREDENTIALS_DIR_ENV = "RW_CREDENTIALS_DIR"
 DEFAULT_CREDENTIALS_DIR = "/run/rw/credentials"
 
@@ -154,9 +156,117 @@ def _decode_inline(item: dict) -> bytes:
     return content.encode("utf-8")
 
 
-def load_code(code: dict, cache_dir: Path | None = None) -> tuple[dict[str, bytes], frozenset[str]]:
+_FETCH_CHUNK = 64 * 1024
+_STALE_TMP_SECONDS = 3600
+_HEX_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
+def _remove_stale_temp_files(cache: Path) -> None:
+    """Best effort: deletes the `.tmp` files of fetches that died mid-write (a killed
+    pod) and are older than an hour; a fetch in flight is never that old."""
+    cutoff = time.time() - _STALE_TMP_SECONDS
+    try:
+        for tmp in cache.glob("*.tar.*.tmp"):
+            try:
+                if tmp.stat().st_mtime < cutoff:
+                    tmp.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _fetch_archive(relay: RelayClient, code_archive: dict, path: Path) -> bytes:
+    """The archive `code_archive` (`{sha256, size}`) names, fetched from the runner relay
+    (`GET /v1/tasks/{requestId}/code`), checked and stored at `path` (the cache's
+    `<hex>.tar`). The body is read at most `size` (and MAX_ARCHIVE_BYTES) bytes plus one,
+    so an oversized or endless body is refused without being held; its length must be
+    `size`, its `X-RW-Sha256` header (when sent) and its bytes must hash to the lease's
+    sha256. Only bytes that pass are stored, written to a unique temporary file and renamed
+    into place, so a concurrent fetch of the same archive in this pod, or a crash, never
+    leaves a partial file under the final name. A failure is a `dependency` LeaseError
+    that names the archive and the relay's code, never the URL or the token."""
+    sha = code_archive["sha256"]
+    size = code_archive["size"]
+    if size > archive_mod.MAX_ARCHIVE_BYTES:
+        raise LeaseError(
+            "dependency",
+            f"archive {sha} could not be fetched: its size, {size} bytes, is over the "
+            f"{archive_mod.MAX_ARCHIVE_BYTES} allowed",
+        )
+    _remove_stale_temp_files(path.parent)
+    cap = size
+    try:
+        with relay.open_code() as stream:
+            header = stream.headers.get("X-RW-Sha256")
+            if header is not None and header.removeprefix("sha256:").lower() != (
+                sha.removeprefix("sha256:").lower()
+            ):
+                raise LeaseError(
+                    "dependency", f"archive {sha} could not be fetched: the relay sent another one"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = stream.read(min(_FETCH_CHUNK, cap + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > cap:
+                    raise LeaseError(
+                        "dependency",
+                        f"archive {sha} could not be fetched: the relay sent more than the "
+                        f"{cap} bytes allowed",
+                    )
+    except ArtifactError as exc:
+        what = (
+            "the relay has no code archive for this request"
+            if exc.code == "E_ARTIFACT_UNDECLARED"
+            else f"relay error {exc.code}"
+        )
+        raise LeaseError("dependency", f"archive {sha} could not be fetched: {what}") from None
+    data = b"".join(chunks)
+    if len(data) != size:
+        raise LeaseError(
+            "dependency",
+            f"archive {sha} could not be fetched: the relay sent {len(data)} bytes, "
+            f"the lease says {size}",
+        )
+    try:
+        archive_mod.verify(data, sha)
+    except ArchiveError:
+        raise LeaseError(
+            "dependency", f"archive {sha} could not be fetched: the bytes do not match its hash"
+        ) from None
+    tmp: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+        os.replace(tmp, path)
+        tmp = None
+    except OSError as exc:
+        # The archive is verified and in memory: run it, and fetch again next time.
+        _log.warning("archive %s could not be cached at %s: %s", sha, path, exc)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return data
+
+
+def load_code(
+    code: dict, cache_dir: Path | None = None, relay: RelayClient | None = None
+) -> tuple[dict[str, bytes], frozenset[str]]:
     """(files by plugin-root path, executable paths) of a lease's `code`, after checking
-    them against the sha256 the lease names. Raises LeaseError."""
+    them against the sha256 the lease names. An archive that is not in the cache is
+    fetched through `relay` and cached (`_fetch_archive`); with no relay it is a
+    `dependency` error. A cached archive that fails its hash is fetched again once when
+    there is a relay (`internal` error when there is none). Raises LeaseError."""
     if "inline" in code:
         inline = code["inline"]
         entries = []
@@ -177,18 +287,35 @@ def load_code(code: dict, cache_dir: Path | None = None) -> tuple[dict[str, byte
     else:
         sha = code["archive"]["sha256"]
         hex_digest = sha.removeprefix("sha256:")
+        if not _HEX_DIGEST.fullmatch(hex_digest):
+            # the hex becomes a file name: nothing but a sha256 may reach the path
+            raise LeaseError("invalid_input", f"archive sha256 {sha!r} is not sha256:<64 hex>")
         path = (cache_dir or archive_cache_dir()) / f"{hex_digest}.tar"
         try:
             data = path.read_bytes()
+            try:
+                archive_mod.verify(data, sha)
+            except ArchiveError as exc:
+                if relay is None:
+                    raise LeaseError("internal", f"archive {sha} rejected: {exc}") from None
+                # a corrupt cache entry heals itself: drop it and fetch it once more
+                _log.warning("cached archive %s is corrupt (%s); fetching it again", sha, exc)
+                try:
+                    path.unlink()
+                except OSError:
+                    pass  # the fetch replaces it anyway
+                data = _fetch_archive(relay, code["archive"], path)
         except FileNotFoundError:
-            raise LeaseError(
-                "dependency",
-                f"archive {sha} is not in the cache: archive fetch not available until DLV-9",
-            ) from None
+            if relay is None:
+                raise LeaseError(
+                    "dependency",
+                    f"archive {sha} is not in the cache and there is no runner relay to fetch "
+                    "it from",
+                ) from None
+            data = _fetch_archive(relay, code["archive"], path)
         except OSError as exc:
             raise LeaseError("internal", f"archive {sha} could not be read: {exc}") from None
         try:
-            archive_mod.verify(data, sha)
             entries = archive_mod.read(data)
         except ArchiveError as exc:
             raise LeaseError("internal", f"archive {sha} rejected: {exc}") from None
@@ -201,7 +328,9 @@ def load_code(code: dict, cache_dir: Path | None = None) -> tuple[dict[str, byte
 # -- the lease as a RunSpec ----------------------------------------------------------------
 
 
-def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> RunSpec:
+def runspec_from_lease(
+    lease: dict, *, archive_cache: Path | None = None, relay: RelayClient | None = None
+) -> RunSpec:
     """The one place a lease becomes a RunSpec. `lease` must already satisfy the `lease`
     contract. The compiled-task-shaped `task` carries what `execute` reads (ref, skill,
     name, script, readOnly, dryRun, outputs) and no `inputs`/`inputSchema`/`settings`:
@@ -210,11 +339,12 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
     `limits.resources.memory` (`cpu` is advisory and not read). The run is a dry run
     (`RW_DRY_RUN=1`, `dryRun: true` on the envelope) when the lease says `dryRun: true`; a
     task that does not declare `dryRun` refuses it (LeaseError invalid_input) before any
-    code is read. Raises LeaseError."""
+    code is read. An archive missing from `archive_cache` is fetched through `relay`.
+    Raises LeaseError."""
     dry_run = bool(lease.get("dryRun"))
     if dry_run and not lease["task"].get("dryRun"):
         raise LeaseError("invalid_input", "task does not support dry run")
-    files, executable = load_code(lease["code"], archive_cache)
+    files, executable = load_code(lease["code"], archive_cache, relay)
     leased = lease["task"]
     if leased["script"] not in files:
         raise LeaseError("internal", f"the code has no script {leased['script']!r}")
@@ -481,7 +611,7 @@ def _run_valid_lease(
 ) -> dict:
     """The envelope of a lease that satisfies the `lease` contract, without provenance."""
     try:
-        spec = runspec_from_lease(doc, archive_cache=archive_cache)
+        spec = runspec_from_lease(doc, archive_cache=archive_cache, relay=relay)
     except LeaseError as exc:
         return failed_envelope(exc.code, exc.message, exc.scope)
     if deadline_s is not None:
@@ -541,6 +671,7 @@ def _task_secrets_dir(root: Path) -> Path:
 
 
 __all__ = [
+    "ARCHIVE_CACHE_DIR",
     "LeaseError",
     "archive_cache_dir",
     "attach_provenance",

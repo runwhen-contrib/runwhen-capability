@@ -499,6 +499,39 @@ def test_open_input_404_is_undeclared(relay_server, tmp_path):
         _client(relay_server, tmp_path).open_input("nope")
 
 
+def test_open_code_streams_the_archive_from_the_code_route(relay_server, tmp_path):
+    payload = b"tar-bytes" * 1000
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    relay_server.script("GET", "/", Response(200, body=payload, headers={"X-RW-Sha256": digest}))
+
+    with _client(relay_server, tmp_path).open_code() as stream:
+        assert stream.headers["X-RW-Sha256"] == digest
+        assert stream.read(10) == payload[:10]
+        assert stream.read() == payload[10:]
+    (seen,) = relay_server.requests
+    assert seen.method == "GET"
+    assert seen.path == "/v1/tasks/req-1/code"
+    assert seen.header("Authorization") == "Bearer tok-1"
+
+
+def test_open_code_404_is_undeclared(relay_server, tmp_path):
+    relay_server.script("GET", "/", Response(404, body=b"no archive"))
+
+    with pytest.raises(ArtifactUndeclaredError):
+        _client(relay_server, tmp_path).open_code()
+
+
+def test_open_code_from_a_relay_that_refuses_the_connection_is_a_transport_error(tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("tok-1")
+    client = RelayClient(refused_url(), token_file, "req-1", requests.Session())
+
+    with pytest.raises(ArtifactError) as excinfo:
+        client.open_code()
+
+    _transport_error(excinfo, requests.ConnectionError)
+
+
 def _response(status: int, text: str) -> requests.Response:
     resp = requests.Response()
     resp.status_code = status
