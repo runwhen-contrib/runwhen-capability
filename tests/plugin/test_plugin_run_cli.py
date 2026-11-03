@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -248,3 +249,71 @@ def test_v13_flags_refuse_the_classic_ones(rwtask):
     with pytest.raises(SystemExit) as exc:
         rwtask("probe/py-ok", "--request", "r.json")
     assert exc.value.code == 2
+
+
+# -- relative credential paths (lane F): the child runs in its scope, not the caller's cwd ------
+
+
+@pytest.fixture
+def cred_env(monkeypatch, tmp_path):
+    cwd = tmp_path / "caller"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    for name in ("KUBECONFIG", "PGPASSFILE", "SSL_CERT_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return cwd
+
+
+def paths_of(rwtask):
+    _, envelope, _ = rwtask("probe/sh-paths", expect=0)
+    assert envelope["status"] == "ok", envelope
+    return envelope["outputs"]["paths"]
+
+
+def test_a_relative_kubeconfig_reaches_the_task_absolute(rwtask, cred_env, monkeypatch):
+    monkeypatch.setenv("KUBECONFIG", "../x.kubeconfig")
+    monkeypatch.setenv("PGPASSFILE", ".pgpass")
+    paths = paths_of(rwtask)
+    assert paths["kubeconfig"] == str(cred_env / ".." / "x.kubeconfig")
+    assert paths["pgpassfile"] == str(cred_env / ".pgpass")
+    assert paths["sslCertFile"] == "unset"  # not set: not invented
+
+
+def test_absolute_and_home_relative_values_are_left_as_they_are_or_expanded(
+    rwtask, cred_env, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("KUBECONFIG", "/etc/kube/config")
+    monkeypatch.setenv("PGPASSFILE", "~/.pgpass")
+    monkeypatch.setenv("SSL_CERT_FILE", "")
+    paths = paths_of(rwtask)
+    assert paths["kubeconfig"] == "/etc/kube/config"
+    assert paths["pgpassfile"] == str(tmp_path / "home" / ".pgpass")  # the REAL home
+    assert paths["sslCertFile"] == ""
+
+
+def test_every_entry_of_a_kubeconfig_list_is_resolved(rwtask, cred_env, monkeypatch):
+    monkeypatch.setenv("KUBECONFIG", f"a.yaml:/abs/b.yaml::~/c.yaml:{cred_env}/d.yaml")
+    home = os.environ["HOME"]
+    assert paths_of(rwtask)["kubeconfig"] == os.pathsep.join(
+        [str(cred_env / "a.yaml"), "/abs/b.yaml", "", f"{home}/c.yaml", f"{cred_env}/d.yaml"]
+    )
+
+
+def test_the_credential_path_variables_are_one_documented_constant():
+    from runwhen_capability.plugin.run import CREDENTIAL_PATH_VARS
+
+    assert CREDENTIAL_PATH_VARS == (
+        "KUBECONFIG",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "CLOUDSDK_CONFIG",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "AZURE_CONFIG_DIR",
+        "PGPASSFILE",
+        "PGSSLROOTCERT",
+        "PGSSLCERT",
+        "PGSSLKEY",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+    )

@@ -53,7 +53,7 @@ import re
 import shutil
 import tempfile
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -72,6 +72,7 @@ from ..custom.manifest import (
     task_file_language,
 )
 from ..envelope import derive_envelope, errors_from_jsonl
+from .shims import SHIM_ENV_NAMES
 from .tree import PluginTree
 
 _log = logging.getLogger("runwhen_capability.plugin.run")
@@ -228,6 +229,59 @@ def coerce_value(type_name: str | None, raw: str) -> Any:
     return raw
 
 
+# -- the caller's credential paths -------------------------------------------------------
+
+#: Variables whose value is a path to a credential or its trust material. The task runs
+#: with its scope directory as the working directory, so a relative one the caller set
+#: (`KUBECONFIG=../x.kubeconfig`) means something else there: `execute` with
+#: `inherit_home` resolves each against the caller's own directory first.
+CREDENTIAL_PATH_VARS: tuple[str, ...] = (
+    "KUBECONFIG",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CONFIG",
+    "AWS_SHARED_CREDENTIALS_FILE",
+    "AWS_CONFIG_FILE",
+    "AZURE_CONFIG_DIR",
+    "PGPASSFILE",
+    "PGSSLROOTCERT",
+    "PGSSLCERT",
+    "PGSSLKEY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+)
+_PATH_LIST_VARS = frozenset({"KUBECONFIG"})  # os.pathsep-separated, each entry a path
+
+
+def _absolute_path(value: str, cwd: str, home: str | None) -> str:
+    if not value:
+        return value
+    if value == "~" or value.startswith("~/"):
+        return home + value[1:] if home else value
+    return value if os.path.isabs(value) else os.path.join(cwd, value)
+
+
+def resolve_credential_paths(
+    environ: Mapping[str, str], *, cwd: str | None = None, home: str | None = None
+) -> dict[str, str]:
+    """The CREDENTIAL_PATH_VARS of `environ` whose value changes when made absolute
+    against `cwd` (default: the current directory): a relative value, or a leading `~`
+    (expanded against `home`, default `environ`'s HOME, because the child may be given a
+    private one). Empty values and absolute paths are left alone; KUBECONFIG is resolved
+    entry by entry."""
+    cwd = cwd or os.getcwd()
+    home = home if home is not None else environ.get("HOME")
+    changed: dict[str, str] = {}
+    for name in CREDENTIAL_PATH_VARS:
+        value = environ.get(name)
+        if not value:
+            continue
+        parts = value.split(os.pathsep) if name in _PATH_LIST_VARS else [value]
+        resolved = os.pathsep.join(_absolute_path(p, cwd, home) for p in parts)
+        if resolved != value:
+            changed[name] = resolved
+    return changed
+
+
 # -- execute ----------------------------------------------------------------------------
 
 
@@ -266,6 +320,17 @@ def _check_extra_env(extra_env: Mapping[str, str]) -> dict[str, str]:
         if is_reserved_env_name(key) or key in bundle._HOST_ONLY_ENV or "=" in key or not key:
             raise ValueError(f"extra_env may not set {key!r}")
     return dict(extra_env)
+
+
+def _check_shims(path_prepend: Sequence[str], shim_env: Mapping[str, str]) -> None:
+    """The two narrow channels `rwtask test` uses: absolute directories for the front of
+    PATH (PATH itself stays reserved for extra_env) and the RW_SHIM_* variables."""
+    for directory in path_prepend:
+        if not os.path.isabs(directory) or os.pathsep in directory or "\x00" in directory:
+            raise ValueError(f"path_prepend wants absolute directories, got {directory!r}")
+    for key in shim_env:
+        if key not in SHIM_ENV_NAMES:
+            raise ValueError(f"shim_env may not set {key!r}")
 
 
 def _materialize(files_dir: Path, files: Mapping[str, bytes], executable: frozenset[str]) -> None:
@@ -393,6 +458,8 @@ def execute(
     extra_env: Mapping[str, str] | None = None,
     inherit_home: bool = False,
     log: logging.Logger | None = None,
+    path_prepend: Sequence[str] = (),
+    shim_env: Mapping[str, str] | None = None,
 ) -> RunOutcome:
     """Runs `spec.task` and returns its envelope. Never raises for a problem with the run
     itself: a bad input, a script that crashes, a timeout and an unreadable output are
@@ -400,8 +467,14 @@ def execute(
     environment (it may not name a reserved or host-only variable: ValueError), and its
     values are redacted from what comes back. `inherit_home` runs the child with the
     caller's own HOME instead of a private one, for `rwtask run` on a developer's
-    machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner."""
+    machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner. It
+    also makes relative credential paths in the caller's environment (KUBECONFIG, ...:
+    `CREDENTIAL_PATH_VARS`) absolute against the caller's working directory.
+    `path_prepend` (absolute directories, put first on the child's PATH) and `shim_env`
+    (only the RW_SHIM_* names of shims.SHIM_ENV_NAMES) are how `rwtask test` puts its
+    shims in front of the real tools; ValueError for anything else."""
     log = log or _log
+    _check_shims(path_prepend, shim_env or {})
     scope_dir = Path(scope_dir)
     task = spec.task
     caller_env = _check_extra_env(extra_env or {})
@@ -473,7 +546,11 @@ def execute(
     except (OSError, ValueError) as exc:
         return failed([_error("internal", f"could not prepare the task's scope: {exc}")])
 
-    env = {**caller_env, **_v13_env(spec, inputs, settings, language)}
+    # `rwtask run` / `rwtask test --record`: the caller's own environment is the credential,
+    # and its relative paths were written for the caller's directory, not the scope's.
+    # Not part of caller_env: those values are redacted from the result, a path is not secret.
+    caller_paths = resolve_credential_paths(os.environ) if inherit_home else {}
+    env = {**caller_paths, **caller_env, **_v13_env(spec, inputs, settings, language)}
     skill = task["skill"]
     plugin_name = task["ref"].split(":", 1)[0]
     started_at = datetime.now(UTC)
@@ -501,6 +578,8 @@ def execute(
                 extra_env=env,
                 lib_dir=files_dir / "skills" / skill / "lib",
                 home=Path(os.environ["HOME"]) if inherit_home and "HOME" in os.environ else None,
+                path_prepend=path_prepend,
+                shim_env=shim_env,
             )
         except (bundle._LaunchError, OSError) as exc:
             return failed([_error("internal", str(exc))])
@@ -686,4 +765,12 @@ def _collect_artifacts(
     return artifacts, errors
 
 
-__all__ = ["RunOutcome", "RunSpec", "coerce_value", "execute", "resolve_target"]
+__all__ = [
+    "CREDENTIAL_PATH_VARS",
+    "RunOutcome",
+    "RunSpec",
+    "coerce_value",
+    "execute",
+    "resolve_credential_paths",
+    "resolve_target",
+]
