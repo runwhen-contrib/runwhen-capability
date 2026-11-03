@@ -17,6 +17,10 @@ dependencies = [
     # An early 413/503 relay response is only readable mid-upload on urllib3 2.x.
     "urllib3>=2",
     "jsonschema[format-nongpl]>=4.23,<5",
+    # Plugin-authored JSON Schema `pattern`s run on RE2, never on backtracking `re` (S13).
+    # Newer releases ship cp312/cp313/cp314 wheels for macOS 13+ and manylinux_2_28; 1.1 covers
+    # older macOS and manylinux2014.
+    "google-re2>=1.1,<2",
 ]
 
 [project.urls]
