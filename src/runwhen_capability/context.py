@@ -524,18 +524,32 @@ class Context:
         if stderr_state.get("over"):
             stderr += f"\n... stderr truncated at {_STDERR_BYTE_BUDGET} bytes"
 
+        return self._finish_run(argv, proc.returncode, stdout, stderr, check)
+
+    def _finish_run(
+        self,
+        argv: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        check: bool | None,
+    ) -> subprocess.CompletedProcess:
+        """What `run()` does with a finished command: forward its stderr to
+        ctx.log, raise RwCommandError on a failure when `check` (or, if None, the
+        task contract) says to, else return the CompletedProcess. Its own method so
+        `runwhen_capability.testing`'s command stubs behave exactly as a real run."""
         prog = argv[0] if argv else "?"
         if stderr:
             for line in stderr.splitlines():
                 self.log.info("%s: %s", prog, line)
-        if (self._v13_contract if check is None else check) and proc.returncode != 0:
+        if (self._v13_contract if check is None else check) and returncode != 0:
             last = next((ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), "")
-            message = f"{prog} exited {proc.returncode}" + (f": {last[:500]}" if last else "")
+            message = f"{prog} exited {returncode}" + (f": {last[:500]}" if last else "")
             raise RwCommandError(
-                classify_command_error(argv, proc.returncode, stderr),
+                classify_command_error(argv, returncode, stderr),
                 message,
                 argv=argv,
-                returncode=proc.returncode,
+                returncode=returncode,
                 stderr=stderr,
             )
-        return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout, stderr=stderr)
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)

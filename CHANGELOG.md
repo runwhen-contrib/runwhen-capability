@@ -7,6 +7,12 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `runwhen_capability.testing`, for unit-testing a skill's scripts without a runner: `make_context(...)`
+  builds a real `Context` as the V13 executor does (and restores `os.environ` afterwards), with
+  `.errors`, `.artifact(name)` and `.envelope(outputs)` (checked against `result-envelope`);
+  `run_main(main, tc, **inputs)` calls a script's `main` as the entry point does and returns the
+  envelope; `stub_commands(tc, {argv: (rc, stdout, stderr)})` answers `ctx.run` without spawning.
+  Not exported from the package root.
 - `rwtask port <bundle-dir> --plugin <name> --into <skills-dir>` drafts a V13 `SKILL.md` and
   `tasks.yaml`, plus a porting brief, from a classic rw-cli Robot bundle. It never copies classic
   script bodies. Needs the new `port` extra (`robotframework>=7`).

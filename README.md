@@ -58,6 +58,40 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
   `SkipTask(reason)`; `reason` says why). Either way the rest of the request still runs. Only
   tasks can skip: a setup that raises `SkipTask` has failed.
 
+### Testing a skill
+
+`runwhen_capability.testing` runs a skill script's `main(ctx, **inputs)` against the real V13
+semantics (the environment the executor sets, `ctx.run` raising `RwCommandError`, the error side
+channel, the result envelope) with no runner and no cluster. Commands are stubbed by exact argv.
+
+```python
+from runwhen_capability.testing import make_context, run_main, stub_commands
+
+
+def test_pods():
+    resource = {
+        "path": "kubernetes/clusters/kind/namespaces/web",
+        "cluster": "kind",
+        "type": "kubernetes/namespace",
+        "name": "web",
+    }
+    with make_context(resource=resource, settings={"maxPods": 1}) as tc:
+        stub_commands(
+            tc,
+            {
+                ("kubectl", "get", "pods", "-n", "web", "-o", "json"): (0, '{"items": []}', ""),
+            },
+        )
+        env = run_main(main, tc, limit=5)  # main(ctx, limit=5), from scripts/pods.py
+        assert tc.errors == []  # ctx.error / RwError, as the executor reads them
+        assert tc.artifact("report") is None  # a file the script wrote under $RW_OUT
+    assert env["status"] == "ok"  # checked against `result-envelope`
+    assert env["outputs"] == {"pods": []}
+```
+
+An unstubbed command is an `AssertionError`. `ctx.skip(...)` gives a `skipped` envelope; any
+exception other than `RwError` propagates. See the module docstring for the details.
+
 ### Artifacts
 
 A result travels inline and has a size cap. Large or binary output goes out as an **artifact**
