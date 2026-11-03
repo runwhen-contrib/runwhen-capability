@@ -36,8 +36,10 @@ Output handling. A data output is checked against its compiled JSON Schema (draf
 are dropped and an `internal` error names them. An artifact output is the file the task
 wrote at `$RW_OUT/<name>` (or `<name>.<ext>`), registered with `rw_artifact`, or written
 to `$RW_ARTIFACTS_DIR/<name>`; the envelope carries `{"artifact": "art_local_<name>"}` and
-the file is returned in `RunOutcome.artifacts`. Artifacts are collected only from a task
-that exited 0. Outputs are optional: a task that writes none is `ok` with `outputs: {}`.
+the file is returned in `RunOutcome.artifacts` (`rwtask serve` passes an
+`artifact_uploader` instead, so the relay stores it: see plugin/lease.py). Artifacts are
+collected only from a task that exited 0. Outputs are optional: a task that writes none is
+`ok` with `outputs: {}`.
 
 `resolve_target` turns a resource path into the lease's `target` (path, qualified type,
 identity), from the plugin's own integration types where the platform is its own.
@@ -53,11 +55,11 @@ import re
 import shutil
 import tempfile
 import urllib.parse
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 import jsonschema
 import referencing
@@ -94,6 +96,19 @@ set -euo pipefail
 unset BASH_ENV
 """
 )
+
+
+class ArtifactUploadError(Exception):
+    """An artifact output that could not be stored; `code` is the envelope error code."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+#: `(output name, open file, declared contentType) -> the output's envelope value`.
+ArtifactUploader = Callable[[str, BinaryIO, str], dict]
 
 
 @dataclass
@@ -315,7 +330,7 @@ def _env_field(name: str) -> str:
     return input_env_name(re.sub(r"[^A-Za-z0-9_]", "_", name))
 
 
-def _check_extra_env(extra_env: Mapping[str, str]) -> dict[str, str]:
+def check_extra_env(extra_env: Mapping[str, str]) -> dict[str, str]:
     for key in extra_env:
         if is_reserved_env_name(key) or key in bundle._HOST_ONLY_ENV or "=" in key or not key:
             raise ValueError(f"extra_env may not set {key!r}")
@@ -361,6 +376,13 @@ def _validator(schema: dict) -> jsonschema.Validator:
     return cls(schema, registry=referencing.Registry(), format_checker=cls.FORMAT_CHECKER)
 
 
+def _validate_output(schema: dict, value: Any) -> list[str]:
+    """The problems `value` has against an output's JSON Schema, [] if none. The one
+    place output schemas are evaluated, so the engine can be swapped (S13: a
+    plugin-authored `pattern` is a regex the host runs)."""
+    return _problems(_validator(schema), value)
+
+
 def _json_path(parts) -> str:
     return "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in parts)
 
@@ -381,6 +403,8 @@ def _problems(validator: jsonschema.Validator, value: Any, limit: int = 5) -> li
 def _resolve_inputs(task: dict, provided: Mapping[str, Any]) -> tuple[dict, list[dict]]:
     """(inputs, invalid_input errors): defaults overlaid by `provided`, checked against
     the task's compiled `inputSchema`."""
+    if "inputSchema" not in task:  # a lease: its inputs are already resolved
+        return dict(provided), []
     inputs = {
         name: copy.deepcopy(spec["default"])
         for name, spec in (task.get("inputs") or {}).items()
@@ -405,6 +429,8 @@ def _resolve_inputs(task: dict, provided: Mapping[str, Any]) -> tuple[dict, list
 
 
 def _resolve_settings(task: dict, provided: Mapping[str, Any]) -> tuple[dict, list[dict]]:
+    if "settings" not in task:  # a lease: its settings are already resolved
+        return dict(provided), []
     declared: dict[str, dict] = task.get("settings") or {}
     settings = {name: copy.deepcopy(spec.get("default")) for name, spec in declared.items()}
     errors = []
@@ -457,6 +483,8 @@ def execute(
     scope_dir: Path,
     extra_env: Mapping[str, str] | None = None,
     inherit_home: bool = False,
+    redact: Sequence[str] = (),
+    artifact_uploader: ArtifactUploader | None = None,
     log: logging.Logger | None = None,
     path_prepend: Sequence[str] = (),
     shim_env: Mapping[str, str] | None = None,
@@ -472,12 +500,17 @@ def execute(
     `CREDENTIAL_PATH_VARS`) absolute against the caller's working directory.
     `path_prepend` (absolute directories, put first on the child's PATH) and `shim_env`
     (only the RW_SHIM_* names of shims.SHIM_ENV_NAMES) are how `rwtask test` puts its
-    shims in front of the real tools; ValueError for anything else."""
+    shims in front of the real tools; ValueError for anything else.
+    `redact` is further secret values (file contents the caller materialized) to scrub.
+    `artifact_uploader` stores an artifact output somewhere else than the scope (the relay,
+    under `rwtask serve`): it is called as `(name, open file, contentType)` for each artifact
+    the task wrote and returns the envelope value, or raises ArtifactUploadError. Without
+    one, artifacts are kept in the scope and the value is `art_local_<name>`."""
     log = log or _log
     _check_shims(path_prepend, shim_env or {})
     scope_dir = Path(scope_dir)
     task = spec.task
-    caller_env = _check_extra_env(extra_env or {})
+    caller_env = check_extra_env(extra_env or {})
     started_at = datetime.now(UTC)
 
     def finish(
@@ -531,7 +564,7 @@ def execute(
     if timeout_s is None:
         timeout_s = float(bundle.DEFAULT_REQUEST_DEADLINE)
 
-    redactor = Redactor([v for v in caller_env.values() if v])
+    redactor = Redactor([v for v in (*caller_env.values(), *redact) if v])
     files_dir = scope_dir / _PLUGIN_DIR
     rw_sdk_dir = scope_dir / ".rw-sdk"
     try:
@@ -622,12 +655,11 @@ def execute(
 
         artifacts: dict[str, Path] = {}
         if exit_code == 0 and not timed_out and skip is None:
-            artifacts, artifact_errors = _collect_artifacts(
-                task, scope_dir, secrets_dir, scope_id, events
+            artifacts, artifact_values, artifact_errors = _collect_artifacts(
+                task, scope_dir, secrets_dir, scope_id, events, artifact_uploader
             )
             errors.extend(artifact_errors)
-            for name in artifacts:
-                outputs[name] = {"artifact": f"art_local_{name}"}
+            outputs.update(artifact_values)
 
     if redactor:
         outputs = redactor.value(outputs)
@@ -672,7 +704,7 @@ def _check_outputs(task: dict, raw: dict[str, Any]) -> tuple[dict[str, Any], lis
                 )
             )
         elif "jsonSchema" in spec:
-            problems = _problems(_validator(spec["jsonSchema"]), value)
+            problems = _validate_output(spec["jsonSchema"], value)
             if problems:
                 errors.append(
                     _error(
@@ -729,14 +761,16 @@ def _collect_artifacts(
     secrets_dir: Path,
     scope_id: tuple[int, int],
     events: list[dict],
-) -> tuple[dict[str, Path], list[dict]]:
+    uploader: ArtifactUploader | None = None,
+) -> tuple[dict[str, Path], dict[str, dict], list[dict]]:
+    """(local files, envelope values, errors) for the task's artifact outputs."""
     specs = {
         name: spec["artifact"]
         for name, spec in (task.get("outputs") or {}).items()
         if "artifact" in spec
     }
     if not specs:
-        return {}, []
+        return {}, {}, []
     registered = {e["name"]: e["path"] for e in events if e["op"] == "artifact"}
     for name in specs:
         if name not in registered and (found := _out_dir_candidate(scope_dir, name)):
@@ -746,7 +780,15 @@ def _collect_artifacts(
     )
     errors = [_error("storage", message.split(": ", 1)[-1]) for message in problems]
     artifacts: dict[str, Path] = {}
+    values: dict[str, dict] = {}
     try:
+        if uploader is not None:
+            for name, handle in handles.items():
+                try:
+                    values[name] = uploader(name, handle, specs[name]["contentType"])
+                except ArtifactUploadError as exc:
+                    errors.append(_error(exc.code, exc.message, name))
+            return {}, values, errors
         if handles:
             out_dir = scope_dir / _ARTIFACT_OUT_DIR
             shutil.rmtree(out_dir, ignore_errors=True)
@@ -756,17 +798,19 @@ def _collect_artifacts(
             with open(destination, "wb") as sink:
                 shutil.copyfileobj(handle, sink)
             artifacts[name] = destination
+            values[name] = {"artifact": f"art_local_{name}"}
     except OSError as exc:
         errors.append(_error("storage", f"could not keep an artifact: {exc}"))
-        artifacts = {}
+        artifacts, values = {}, {}
     finally:
         for handle in handles.values():
             handle.close()
-    return artifacts, errors
+    return artifacts, values, errors
 
 
 __all__ = [
     "CREDENTIAL_PATH_VARS",
+    "ArtifactUploadError",
     "RunOutcome",
     "RunSpec",
     "coerce_value",

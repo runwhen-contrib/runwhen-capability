@@ -195,3 +195,10 @@ tasks:
     readOnly: true
     outputs:
       paths: { schema: "{ kubeconfig: string, pgpassfile: string, sslCertFile: string }" }
+  - name: py-creds
+    title: Python, credentials
+    description: Reports what it can see of the credential files and variables named by `names`.
+    script: scripts/py_creds.py
+    readOnly: true
+    outputs:
+      creds: { schema: ./schemas/object.v1.json }

@@ -96,8 +96,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=None,
         help="also run bundle requests -- a custom capability's code carried inside the "
-        "request -- instead of refusing them; default: off, unless RW_ALLOW_BUNDLES=1. "
-        "Only an image built to run custom capabilities should enable this.",
+        "request -- and V13 leases (plugin code) instead of refusing them; default: off, "
+        "unless RW_ALLOW_BUNDLES=1. Only an image built to run custom capabilities "
+        "should enable this.",
     )
 
     run_p = sub.add_parser(
