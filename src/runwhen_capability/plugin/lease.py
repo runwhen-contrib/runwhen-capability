@@ -31,7 +31,11 @@ its `env` variable exported pointing at it, and each `env{}` pair exported; the 
 is deleted when the task ends, whatever happened. Their names are held to the same
 reserved list as any caller-supplied environment (RW_*, HOME, PATH, BASH*, LD_*, DYLD_*,
 PYTHON*, the host-only variables): a runner cannot use this to reach SEC-2's
-variables. Every value, and every file's content, is redacted from the envelope.
+variables. The one exception is the platform-minted credential: a `files[].env` of
+`RW_SYNC_CREDENTIAL` in an entry whose credentialType is `runwhen/sync` (run.py
+PLATFORM_MINTED_FILE_ENV); the same name anywhere else, and every other RW_* name, is still
+refused. Every value, and every file's content (a minted credential's token too), is
+redacted from the envelope.
 
 Credentials, old. Today's `credentials` map of the poll response (`{name: value}`) keeps its
 meaning: the value of a Kubernetes kubeconfig entry is written to a private file and
@@ -64,12 +68,14 @@ from ..errors import ArtifactError
 from ..models import OutputDecl
 from ..relay import TRANSPORT_ERROR, RelayClient
 from .run import (
+    PLATFORM_MINTED_FILE_ENV,
     ArtifactUploader,
     ArtifactUploadError,
     RunSpec,
     _duration_seconds,
     check_extra_env,
     execute,
+    minted_file_secrets,
 )
 
 _log = logging.getLogger("runwhen_capability.plugin.lease")
@@ -472,6 +478,8 @@ class _Materialized:
     files: dict[str, tuple[bytes, int]]  # env var -> (content, mode)
     env: dict[str, str]
     secrets: list[str]  # every string to scrub from what comes back
+    # PLATFORM_MINTED_FILE_ENV names set as a file of their own credential type's entry
+    allowed_env: frozenset[str] = frozenset()
 
 
 def _parse_materialized(items: Sequence[Any]) -> _Materialized:
@@ -481,15 +489,17 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
     files: dict[str, tuple[bytes, int]] = {}
     env: dict[str, str] = {}
     secrets: list[str] = []
+    allowed: set[str] = set()
 
     def bad(index: int, problem: str) -> LeaseError:
         return LeaseError("invalid_input", f"materialized[{index}]: {problem}")
 
-    def claim(index: int, name: str) -> None:
+    def claim(index: int, name: str, minted_name: str | None = None) -> None:
+        """`minted_name`: the one RW_* name this entry's credential type may set as a file."""
         if not env_pattern.match(name):
             raise bad(index, f"{name!r} is not a valid environment variable name")
         try:
-            check_extra_env({name: ""})
+            check_extra_env({name: ""}, allow=(minted_name,) if name == minted_name else ())
         except ValueError:
             raise bad(index, f"{name!r} is a reserved environment variable") from None
         if name in files or name in env:
@@ -512,7 +522,10 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
             encoding = entry.get("encoding", "utf-8")
             if encoding not in ("utf-8", "base64"):
                 raise bad(index, f"file {name!r}: encoding must be utf-8 or base64")
-            claim(index, name)
+            minted_name = PLATFORM_MINTED_FILE_ENV.get(item["credentialType"])
+            claim(index, name, minted_name)
+            if name == minted_name:
+                allowed.add(name)
             if encoding == "base64":
                 try:
                     data = base64.b64decode(content, validate=True)
@@ -525,6 +538,8 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
                 secrets.append(data.decode("utf-8"))
             except UnicodeDecodeError:
                 pass
+            if name == minted_name:
+                secrets.extend(minted_file_secrets(data))  # the token alone, too
             files[name] = (data, int(mode, 8))
         env_pairs = item.get("env") or {}
         if not isinstance(env_pairs, dict) or not all(
@@ -535,7 +550,7 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
             claim(index, name)
             env[name] = value
             secrets.append(value)
-    return _Materialized(files, env, [x for x in secrets if x])
+    return _Materialized(files, env, [x for x in secrets if x], frozenset(allowed))
 
 
 def wipe_stale_credentials(root: Path | None = None) -> None:
@@ -635,7 +650,7 @@ def _run_valid_lease(
             _write_secret_file(task_dir / name, data, mode)
             extra_env[name] = str(task_dir / name)
         extra_env.update(parsed.env)
-        check_extra_env(extra_env)
+        check_extra_env(extra_env, allow=parsed.allowed_env)
         uploader = None
         if relay is not None:
             uploader = relay_uploader(
@@ -650,6 +665,7 @@ def _run_valid_lease(
             spec,
             scope_dir=scope_dir,
             extra_env=extra_env,
+            allow_env=parsed.allowed_env,
             redact=redact,
             artifact_uploader=uploader,
             log=log,
