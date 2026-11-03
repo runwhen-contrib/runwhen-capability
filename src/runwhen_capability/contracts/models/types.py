@@ -32,6 +32,10 @@ class TypeDef1(BaseModel):
     )
     root: Literal[True]
     rootKey: RootKey | RootKey1
+    canonicalKey: common.CamelName | None = Field(
+        None,
+        description="Root types only: the name of an identity-bearing value that the integration's discovery or permissionCheck task reports for the root (`root.canonicalKey` of rw.discovery.summary.v1 / rw.access.v1). Once reported, it supersedes `rootKey` for dedupe (kubernetes: `kubeSystemUid`).",
+    )
     parent: common.TypeRef | None = None
     plural: common.Slug
     native: dict[str, Any] | None = None
@@ -58,6 +62,10 @@ class TypeDef2(BaseModel):
     )
     root: Literal[True] | None = None
     rootKey: RootKey2 | RootKey3 | None = None
+    canonicalKey: common.CamelName | None = Field(
+        None,
+        description="Root types only: the name of an identity-bearing value that the integration's discovery or permissionCheck task reports for the root (`root.canonicalKey` of rw.discovery.summary.v1 / rw.access.v1). Once reported, it supersedes `rootKey` for dedupe (kubernetes: `kubeSystemUid`).",
+    )
     parent: common.TypeRef
     plural: common.Slug
     native: dict[str, Any] | None = None

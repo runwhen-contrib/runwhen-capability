@@ -90,7 +90,7 @@ type (`kubernetes/namespace`).
 
 | Block | Rules the schema does not carry |
 |---|---|
-| `types` | Exactly one type is `root` (with `rootKey`); every other type has a `parent` whose chain ends at a root. Path = `platform/<plural>/<name>/…` down the chain. Names and parents never change (D21). |
+| `types` | Exactly one type is `root` (with `rootKey`); every other type has a `parent` whose chain ends at a root. Path = `platform/<plural>/<name>/…` down the chain. Names and parents never change (D21). The root may also name a `canonicalKey` (camelCase, e.g. Kubernetes `kubeSystemUid`), the identity-bearing value the integration's discovery or permissionCheck task reports for the root; see "Canonical root key" under Discovery sync. A `canonicalKey` on a non-root type is a schema error. |
 | `credentialTypes` | Name prefix is the platform (`kubernetes/kubeconfig`), except `generic/*` and the platform-minted `runwhen/sync`. `materialize.env: {fromTaskVars: true}` means the task names the variables (`generic/env`). |
 | `credentialTypes` `content` | Optional token naming what the type's material is (`kubeconfig` for `kubernetes/kubeconfig`); used to match references (call F1). |
 | `authMethods` | Exactly one of `native` (`passthrough`, `in-cluster-token`) or `script`. `accepts` lists reference kinds and/or content tokens (call F1). `in-cluster-token` only produces a file-materialized type. |
@@ -363,6 +363,26 @@ entry-point tasks (agreed with lanes C and F, 2026-11-04):
 | `discovery` | `{}`: discovery is driven by settings and the connection's root | settings only (e.g. Kubernetes `namespaces`) | `summary` of `kind: rw.discovery.summary.v1`; resources go through the sync API |
 | `cli` | `{"command": "<arguments>"}` | a required input `command` (`type: string`); allowlists live in settings | the integration's own output (text or artifact) |
 
+**Canonical root key** (contracts-v3, call F21). `rootKey` is the provisional
+key papi dedupes a root on when a connection is confirmed, before the
+integration has run anything. In-cluster and private values collide across
+clusters (in-cluster `apiServer` is the service-range IP: 10.96.0.1 on
+kind/kubeadm, 10.0.0.1 on AKS), so until a canonical key is reported papi scopes
+in-cluster and private keys by runner (`runner:<uuid>|<server>`). When the root
+type declares `canonicalKey: <name>`, the integration's first discovery run (the
+summary) or permission check (the access report) may report
+`root: {canonicalKey: {name, value}}`, with `name` equal to the declared name
+(`kubeSystemUid`: the `kube-system` namespace UID, which is the same whichever
+path reaches the cluster). papi then:
+
+1. re-keys the connection's provisional root to `<name>=<value>`;
+2. if another root already holds that key, re-points the reporting connection to
+   it and marks its own old root `superseded`, for an admin to retire. There is
+   no automatic subtree merge: both roots may carry children, issues and
+   memories.
+
+`rootKey` stays the key until one is reported.
+
 ## Hashing
 
 All in `runwhen_capability.contracts.hashing`, with vectors in `contracts/vectors/`:
@@ -417,7 +437,7 @@ every wiki example valid.
 | F18 | Claude Code's extra frontmatter keys (`argument-hint`, `model`, `user-invocable`) are rejected. | SK7 strict; add them in v2 if a skill needs one. |
 | F19 | Plugin files are YAML 1.2; `load_yaml` is the reference loader for Python. | YAML 1.1 turns the kubernetes alias `no` into `false`; every lane must parse the same way. |
 | F20 | `rw.discovery.v1` keeps today's open/items/commit API: no edges payload (rule-derived), discovered types move from the pack `PUT` to `open`, `summary` on commit replaces `stats`, `taskRun` replaces `capabilityRunUuid`. | Smallest change to working code; static types now register at install. |
-| F21 | Kubernetes `rootKey: server` is provisional: an in-cluster and a GKE connection to one cluster report different servers, so connection confirm takes `attachToRoot` (lane C). A canonical key (the `kube-system` namespace UID from the first permission check) is a `contracts-v2` candidate. | e2e #3 needs two connections on one root. |
+| F21 | Kubernetes `rootKey: server` is provisional: an in-cluster and a GKE connection to one cluster report different servers, so connection confirm takes `attachToRoot` (lane C). Resolved by `contracts-v3`: the root type may declare `canonicalKey` (Kubernetes: `kubeSystemUid`, the `kube-system` namespace UID) and discovery or the permission check reports it (see "Canonical root key"). | e2e #3 needs two connections on one root. |
 
 ## Not in v1
 

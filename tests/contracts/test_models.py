@@ -60,6 +60,9 @@ MODEL_LOOSER_THAN_SCHEMA: dict[str, str] = {
     "tasks/invalid/write-without-effects.yaml": (
         "`if readOnly == false then required: [effects, destructive]`"
     ),
+    "types/invalid/canonical-key-on-non-root.yaml": (
+        "typeDef oneOf of `required` + `not: {required}` (canonicalKey only with root)"
+    ),
     "types/invalid/root-and-parent.yaml": (
         "typeDef oneOf of `required` + `not: {required}` (root+rootKey xor parent)"
     ),

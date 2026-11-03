@@ -29,3 +29,4 @@ class AccessReport(BaseModel):
     )
     checkedAt: AwareDatetime | None = None
     rules: list[Rule]
+    root: common.RootIdentity | None = None
