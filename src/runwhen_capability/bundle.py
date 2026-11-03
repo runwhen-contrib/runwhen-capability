@@ -78,7 +78,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1252,15 +1252,26 @@ def _execute(
     kubeconfig_path: str | None,
     tail_guard: int,
     log: logging.Logger,
+    extra_env: Mapping[str, str] | None = None,
+    lib_dir: Path | None = None,
+    home: Path | None = None,
 ) -> tuple[int, _EventStream, str, bool]:
     """Runs one setup/task file as a child process in its own process group,
     with `deadline_seconds` enforced by SIGKILL-ing the whole group. Returns
     (exit code, what was read off the output fd, combined stdout+stderr
     tail -- up to 2 * LOG_TAIL_BYTES, unredacted -- whether the deadline was
-    hit). Raises _LaunchError if the child could not be started at all."""
+    hit). Raises _LaunchError if the child could not be started at all.
+
+    The classic bundle path passes none of the keyword-only extras. The V13 path
+    (plugin/run.py) passes `extra_env` (variables added to the child's
+    environment after the host's own, so the caller owns what it puts there),
+    `lib_dir` (RW_LIB_DIR, where `files_dir/lib` is not the skill's lib/) and
+    `home` (a HOME other than the scope's private one: `rwtask run` on a developer's
+    machine, where the caller's own ~/.kube and ~/.aws are the credential)."""
     base_env = {
         **_inherited_env(),
-        "HOME": str(scope_dir / _HOME_DIR),
+        **(extra_env or {}),
+        "HOME": str(home if home is not None else scope_dir / _HOME_DIR),
         "TMPDIR": str(scope_dir / _TMP_DIR),
         "RW_WORKDIR": str(scope_dir),
         # Not inherited (every RW_* is stripped): set here, for bash and Python alike.
@@ -1273,7 +1284,7 @@ def _execute(
         "RW_OPERATION": operation,
         # The bundle's lib/ (it may not exist): importable from Python tasks,
         # sourceable from bash ones. RW_* is reserved, so no input can set it.
-        "RW_LIB_DIR": str(files_dir / "lib"),
+        "RW_LIB_DIR": str(lib_dir if lib_dir is not None else files_dir / "lib"),
     }
     if kubeconfig_path:
         base_env["KUBECONFIG"] = kubeconfig_path
