@@ -663,3 +663,72 @@ def test_cli_reports_a_missing_bundle_and_missing_robot(tmp_path, capsys, monkey
     monkeypatch.setattr("runwhen_capability.port.robot_model.read_bundle", boom)
     assert run_port(tmp_path) == 1
     assert "runwhen-capability[port]" in capsys.readouterr().err
+
+
+def test_cli_reports_a_malformed_inventory(tmp_path, capsys):
+    for text in ("tasks: [", "42\n"):
+        bad = tmp_path / "bad.yaml"
+        bad.write_text(text)
+        assert run_port(tmp_path, "--inventory", str(bad)) == 1
+        err = capsys.readouterr().err
+        assert err.startswith("rwtask port:") and "Traceback" not in err
+    assert not (tmp_path / "skills").exists()
+
+
+def test_inventory_top_level_must_be_a_list_or_mapping(tmp_path):
+    bad = tmp_path / "scalar.yaml"
+    bad.write_text("42\n")
+    with pytest.raises(ValueError, match="list of bundle entries"):
+        load_inventory_entry(bad, "demo-bundle")
+
+
+def test_brief_and_warnings_say_the_inventory_has_no_entry(tmp_path):
+    path = write_bundle(tmp_path, runbook=RUNBOOK)
+    draft = draft_skill(read_bundle(path), "kubernetes", inventory_missing=True)
+    assert "- Inventory: given, but no entry for demo-bundle" in draft.brief
+    warning = "inventory has no entry for bundle demo-bundle"
+    assert warning in draft.warnings
+    warnings_section = draft.brief.split("## Warnings")[1].split("## Porting checklist")[0]
+    assert warning in warnings_section
+    # not given at all stays "none"
+    plain = draft_skill(read_bundle(path), "kubernetes")
+    assert "- Inventory: none" in plain.brief
+    assert not any("inventory" in w for w in plain.warnings)
+
+
+def test_task_variables_are_collected_from_task_bodies(tmp_path):
+    runbook = """\
+*** Tasks ***
+Check Things
+    [Tags]    access:read-only
+    ${LOOKBACK}=    RW.Core.Import User Variable    LOOKBACK
+    ...    description=Window.
+    ...    default=1h
+    ${NAMESPACE}=    RW.Core.Import User Variable    NAMESPACE
+    ${tok}=    RW.Core.Import Secret    task_secret
+    ${kc}=    RW.Core.Import Secret    kubeconfig
+"""
+    path = write_bundle(tmp_path, runbook=runbook)
+    bundle = read_bundle(path)
+    by_name = {v.name: v for v in bundle.user_vars}
+    assert by_name["LOOKBACK"].default == "1h"
+    assert [v.name for v in bundle.user_vars].count("NAMESPACE") == 1
+    assert bundle.secrets.count("kubeconfig") == 1 and "task_secret" in bundle.secrets
+
+
+def test_readonly_missing_from_an_existing_entry_is_named_in_the_warning(tmp_path):
+    path = write_bundle(tmp_path, runbook=RUNBOOK)
+    entry = {
+        "bundle": "demo-bundle",
+        "tasks": [{"title": "Check Things for Restarts", "asserts": "x"}, {"title": "Wipe Things"}],
+    }
+    draft = draft_skill(read_bundle(path), "kubernetes", inventory=entry)
+    assert any(
+        "inventory entry for 'Check Things for `${NAMESPACE}` Restarts' has no readOnly; "
+        "using tags" in w
+        for w in draft.warnings
+    )
+    # and a task with no entry at all keeps the old wording
+    entry["tasks"] = [{"title": "Wipe Things", "readOnly": False}]
+    draft = draft_skill(read_bundle(path), "kubernetes", inventory=entry)
+    assert any("no inventory entry for" in w for w in draft.warnings)

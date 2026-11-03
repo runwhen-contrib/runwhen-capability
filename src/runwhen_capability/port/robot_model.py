@@ -131,6 +131,7 @@ def _parse_robot(path: Path) -> _Parsed:
                     parsed.display_name = (item.value or "").strip()
 
         def visit_TestCase(self, node: Any) -> None:
+            self.generic_visit(node)  # variables and secrets imported inside the task body
             doc, tags = "", []
             for item in node.body:
                 kind = type(item).__name__

@@ -273,6 +273,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _port(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    import yaml
+
     from .port.draft import draft_skill, load_inventory_entry
     from .port.robot_model import PortDependencyError, read_bundle
 
@@ -285,15 +287,19 @@ def _port(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         inventory = None
         if args.inventory:
             inventory = load_inventory_entry(Path(args.inventory), bundle.name)
-        draft = draft_skill(bundle, args.plugin, inventory=inventory, skill_name=args.skill)
+        draft = draft_skill(
+            bundle,
+            args.plugin,
+            inventory=inventory,
+            skill_name=args.skill,
+            inventory_missing=bool(args.inventory) and inventory is None,
+        )
     except PortDependencyError as exc:
         print(f"rwtask port: {exc}", file=sys.stderr)
         return 1
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, yaml.YAMLError) as exc:
         print(f"rwtask port: {exc}", file=sys.stderr)
         return 1
-    if args.inventory and inventory is None:
-        draft.warnings.append(f"inventory {args.inventory} has no entry for bundle {bundle.name}")
 
     into = Path(args.into).resolve()
     skill_dir = into / draft.skill_name

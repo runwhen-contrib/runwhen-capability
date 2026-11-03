@@ -350,17 +350,24 @@ def _brief(
     plugin: str,
     skill: str,
     inventory: dict | None,
+    inventory_missing: bool,
     task_list: list[tuple[ClassicTask, str]],
     dispositions: list[tuple[UserVar, str]],
     warnings: list[str],
 ) -> str:
+    if inventory:
+        inventory_state = "found an entry for this bundle"
+    elif inventory_missing:
+        inventory_state = f"given, but no entry for {bundle.name}"
+    else:
+        inventory_state = "none"
     out: list[str] = [f"# Porting brief: {bundle.name}", ""]
     out += [
         f"- Classic bundle: `{bundle.name}`"
         + (f" ({bundle.display_name})" if bundle.display_name else ""),
         f"- Target: plugin `{plugin}`, skill `{skill}`",
         f"- Classic resource types: {', '.join(f'`{t}`' for t in bundle.resource_types) or 'none'}",
-        f"- Inventory: {'found an entry for this bundle' if inventory else 'none'}",
+        f"- Inventory: {inventory_state}",
         "",
         "The draft skill is a skeleton. Re-derive each script from the source system; the "
         "classic scripts below are reading material only and are never copied.",
@@ -448,11 +455,13 @@ def draft_skill(
     plugin: str,
     inventory: dict | None = None,
     skill_name: str | None = None,
+    inventory_missing: bool = False,
 ) -> Draft:
     """Draft SKILL.md and tasks.yaml (relative to the skill dir) plus the brief.
 
     `inventory` is the CNT-1 inventory entry for this bundle (a mapping with
-    `tasks[]`), if there is one.
+    `tasks[]`), if there is one. `inventory_missing` says an inventory file was
+    given but had no entry for this bundle; the brief and warnings record it.
     """
     if not bundle.tasks:
         raise ValueError(
@@ -460,6 +469,8 @@ def draft_skill(
             "(an SLI-only bundle: port its SLI tasks by hand from the brief)"
         )
     warnings: list[str] = []
+    if inventory_missing and not inventory:
+        warnings.append(f"inventory has no entry for bundle {bundle.name}")
     kubernetes = plugin == KUBERNETES
     skill = _skill_slug(skill_name or bundle.name)
 
@@ -485,7 +496,11 @@ def draft_skill(
         entry = _inventory_task(inventory, task)
         read_only: bool | None = entry.get("readOnly") if entry else None
         if not isinstance(read_only, bool):
-            if inventory:
+            if entry:
+                warnings.append(
+                    f"task {name}: inventory entry for {task.title!r} has no readOnly; using tags"
+                )
+            elif inventory:
                 warnings.append(
                     f"task {name}: no inventory entry for {task.title!r}; "
                     "readOnly comes from the classic tags"
@@ -528,7 +543,9 @@ def draft_skill(
 
     types = _applies_to(bundle, plugin, warnings)
     skill_md = _skill_md(bundle, skill, types, task_list)
-    brief = _brief(bundle, plugin, skill, inventory, task_list, dispositions, warnings)
+    brief = _brief(
+        bundle, plugin, skill, inventory, inventory_missing, task_list, dispositions, warnings
+    )
     return Draft(
         files={"SKILL.md": skill_md, "tasks.yaml": _dump(tasks_file)},
         brief=brief,
@@ -542,6 +559,11 @@ def load_inventory_entry(path: Path, bundle_name: str) -> dict | None:
     entries, or a mapping with a `bundles` list); None when absent."""
     doc = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     entries = doc.get("bundles") if isinstance(doc, dict) else doc
+    if entries is not None and not isinstance(entries, list):
+        raise ValueError(
+            f"inventory {path}: expected a list of bundle entries, "
+            f"or a mapping with a `bundles` list; got {type(entries).__name__}"
+        )
     for entry in entries or []:
         if isinstance(entry, dict) and entry.get("bundle") == bundle_name:
             return entry
