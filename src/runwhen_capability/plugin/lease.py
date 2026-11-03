@@ -206,7 +206,8 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
     contract. The compiled-task-shaped `task` carries what `execute` reads (ref, skill,
     name, script, readOnly, dryRun, outputs) and no `inputs`/`inputSchema`/`settings`:
     a lease's inputs and settings are resolved by papi and used as given. The target and
-    its identity are the lease's own. `timeout_s` is `limits.timeout`. The run is a dry run
+    its identity are the lease's own. `timeout_s` is `limits.timeout` and `memory` is
+    `limits.resources.memory` (`cpu` is advisory and not read). The run is a dry run
     (`RW_DRY_RUN=1`, `dryRun: true` on the envelope) when the lease says `dryRun: true`; a
     task that does not declare `dryRun` refuses it (LeaseError invalid_input) before any
     code is read. Raises LeaseError."""
@@ -233,6 +234,7 @@ def runspec_from_lease(lease: dict, *, archive_cache: Path | None = None) -> Run
         settings=dict(lease["settings"]),
         dry_run=dry_run,
         timeout_s=_duration_seconds(lease["limits"]["timeout"]),
+        memory=lease["limits"].get("resources", {}).get("memory"),
     )
 
 

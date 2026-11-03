@@ -708,3 +708,23 @@ def test_provenance_names_the_first_connection_of_the_credentials(poll):
     envelope = envelope_of(poll(lease))
     assert envelope["provenance"] == expected_provenance(lease, connection="prod-kube")
     assert "connection" not in envelope_of(poll(make_lease("py-ok")))["provenance"]
+
+
+# -- CAP-7: limits.resources.memory ---------------------------------------------------------------
+
+
+def test_a_leases_memory_limit_becomes_the_runspecs_and_cpu_is_not_read():
+    from runwhen_capability.plugin.lease import runspec_from_lease
+
+    lease = make_lease("py-ok")
+    assert runspec_from_lease(lease).memory is None
+    lease["limits"]["resources"] = {"cpu": "500m", "memory": "256Mi"}
+    assert runspec_from_lease(lease).memory == "256Mi"
+
+
+def test_a_lease_with_room_in_its_memory_limit_runs_normally(poll):
+    lease = make_lease("py-ok")
+    lease["limits"]["resources"] = {"cpu": "1", "memory": "2Gi"}
+    envelope = envelope_of(poll(lease))
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert "provenance" in envelope

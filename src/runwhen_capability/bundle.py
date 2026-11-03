@@ -1235,6 +1235,32 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
+#: Sets RLIMIT_AS, then becomes the real command. Run as `python -I -S -c <this> <bytes>
+#: <argv...>` so the limit is in force from the first instruction of the task's interpreter
+#: (or bash), and is inherited by whatever the task starts. -I -S: nothing in the scope or
+#: the site directories can shadow the three stdlib imports.
+_RLIMIT_AS_LAUNCHER = (
+    "import os, resource, sys\n"
+    "limit = int(sys.argv[1])\n"
+    "resource.setrlimit(resource.RLIMIT_AS, (limit, limit))\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
+
+_memory_limit_noted = False
+
+
+def _with_memory_limit(argv: list[str], limit_bytes: int) -> list[str]:
+    return [sys.executable, "-I", "-S", "-c", _RLIMIT_AS_LAUNCHER, str(limit_bytes), *argv]
+
+
+def _note_memory_limit_unsupported(log: logging.Logger) -> None:
+    """Once per process: the memory limit is not applied on this platform."""
+    global _memory_limit_noted  # noqa: PLW0603 -- a once-flag, not state anything reads
+    if not _memory_limit_noted:
+        _memory_limit_noted = True
+        log.debug("a task memory limit is only enforced on Linux; not applied on %s", sys.platform)
+
+
 def _execute(
     *,
     files_dir: Path,
@@ -1257,6 +1283,7 @@ def _execute(
     home: Path | None = None,
     path_prepend: Sequence[str] = (),
     shim_env: Mapping[str, str] | None = None,
+    memory_limit_bytes: int | None = None,
 ) -> tuple[int, _EventStream, str, bool]:
     """Runs one setup/task file as a child process in its own process group,
     with `deadline_seconds` enforced by SIGKILL-ing the whole group. Returns
@@ -1272,7 +1299,10 @@ def _execute(
     machine, where the caller's own ~/.kube and ~/.aws are the credential),
     `path_prepend` (directories put FIRST on the child's PATH: `rwtask test`'s shims) and
     `shim_env` (the RW_SHIM_* variables those shims read: RW_* is otherwise never set from
-    outside, so plugin/run.py checks the names before passing them)."""
+    outside, so plugin/run.py checks the names before passing them) and
+    `memory_limit_bytes` (CAP-7: the child's RLIMIT_AS on Linux, applied by a small stdlib
+    launcher that execs the real argv, so nothing runs in a forked child of this threaded
+    process; skipped, with one debug line, where `resource.RLIMIT_AS` is not enforced)."""
     base_env = {
         **_inherited_env(),
         **(extra_env or {}),
@@ -1333,6 +1363,12 @@ def _execute(
             "RW_CREDENTIALS_FILE": str(credentials_file),
             "RW_ALLOW_ANONYMOUS": "1" if allow_anonymous else "0",
         }
+
+    if memory_limit_bytes is not None:
+        if sys.platform.startswith("linux"):
+            argv = _with_memory_limit(argv, memory_limit_bytes)
+        else:
+            _note_memory_limit_unsupported(log)
 
     read_fd, write_fd = os.pipe()
     env["RW_OUTPUT_FD"] = str(write_fd)

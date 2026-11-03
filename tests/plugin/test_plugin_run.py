@@ -6,6 +6,7 @@ from __future__ import annotations
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -13,7 +14,13 @@ import pytest
 
 from runwhen_capability.contracts import validate as validate_contract
 from runwhen_capability.plugin import compile_tree, load_dir
-from runwhen_capability.plugin.run import RunSpec, coerce_value, execute, resolve_target
+from runwhen_capability.plugin.run import (
+    RunSpec,
+    coerce_value,
+    execute,
+    parse_quantity_bytes,
+    resolve_target,
+)
 
 HERE = Path(__file__).resolve().parent
 RUN_MINI = HERE / "fixtures" / "run-mini"
@@ -650,3 +657,112 @@ def test_a_remote_ref_in_an_input_schema_is_invalid_input_not_a_crash(tmp_path):
     assert env["status"] == "failed"
     assert env["errors"][0]["code"] == "invalid_input"
     assert "could not be evaluated" in env["errors"][0]["message"]
+
+
+# -- CAP-7: the memory limit ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("quantity", "expected"),
+    [
+        ("1000000", 1_000_000),
+        ("0", 0),
+        ("512M", 512_000_000),
+        ("1G", 1_000_000_000),
+        ("2T", 2 * 10**12),
+        ("3k", 3000),
+        ("256Mi", 256 * 2**20),
+        ("1Gi", 2**30),
+        ("64Ki", 64 * 2**10),
+        ("1Ti", 2**40),
+        ("1.5Gi", 3 * 2**29),
+        ("0.5Mi", 2**19),
+        ("1500m", 2),  # milli-bytes round up
+        ("1m", 1),
+    ],
+)
+def test_parse_quantity_bytes_follows_the_kubernetes_suffixes(quantity, expected):
+    assert parse_quantity_bytes(quantity) == expected
+
+
+@pytest.mark.parametrize(
+    "quantity", ["", "Mi", "-1", "1e3", "1.Gi", "1 Gi", "256mi", "1KiB", "1GB"]
+)
+def test_parse_quantity_bytes_refuses_what_the_contract_refuses(quantity):
+    with pytest.raises(ValueError, match="not a quantity"):
+        parse_quantity_bytes(quantity)
+
+
+_ALLOCATE = b"""
+def main(ctx, **inputs):
+    block = bytearray(512 * 1024 * 1024)
+    block[-1] = 1
+    return {"out": {"size": len(block)}}
+"""
+
+
+def _memory_task(memory=None):
+    task = {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": "scripts/t.py",
+        "inputs": {},
+        "inputSchema": {"type": "object"},
+        "settings": {},
+        "outputs": {"out": {"jsonSchema": {"type": "object"}}},
+    }
+    if memory is not None:
+        task["resources"] = {"memory": memory}
+    return task
+
+
+def _run_allocating(tmp_path, *, spec_memory=None, task_memory=None):
+    outcome = execute(
+        RunSpec(
+            task=_memory_task(task_memory),
+            files={"scripts/t.py": _ALLOCATE},
+            memory=spec_memory,
+        ),
+        scope_dir=tmp_path / "scope",
+    )
+    assert validate_contract("result-envelope", outcome.envelope) == []
+    return outcome.envelope
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux only")
+@pytest.mark.parametrize("where", ["spec", "task"])
+def test_a_task_that_allocates_past_its_memory_limit_fails_with_the_hint(tmp_path, where):
+    kw = {"spec_memory": "64Mi"} if where == "spec" else {"task_memory": "64Mi"}
+    envelope = _run_allocating(tmp_path, **kw)
+    assert envelope["status"] == "failed"
+    [error] = envelope["errors"]
+    assert error["code"] == "internal"
+    assert error["hint"] == "the task exceeded its memory limit (64Mi)"
+    assert envelope["outputs"] == {}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is enforced on Linux only")
+def test_a_task_within_its_memory_limit_runs_normally(tmp_path):
+    envelope = _run_allocating(tmp_path, spec_memory="2Gi")
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert envelope["outputs"]["out"] == {"size": 512 * 1024 * 1024}
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="the limit is applied on Linux")
+def test_where_the_limit_cannot_be_applied_the_task_just_runs(tmp_path):
+    envelope = _run_allocating(tmp_path, spec_memory="64Mi")
+    assert envelope["status"] == "ok", envelope["errors"]
+
+
+def test_a_memory_limit_that_is_not_a_quantity_is_invalid_input(tmp_path):
+    envelope = _run_allocating(tmp_path, spec_memory="lots")
+    assert codes(envelope) == ["invalid_input"]
+    assert "not a quantity" in envelope["errors"][0]["message"]
+
+
+def test_a_failure_with_no_memory_limit_is_never_blamed_on_memory(run):
+    # py-raise fails on its own account; a limit that was not hit must not rewrite it
+    envelope = run("py-raise").envelope
+    assert envelope["status"] == "failed"
+    assert all("hint" not in e or "memory" not in e["hint"] for e in envelope["errors"])

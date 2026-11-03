@@ -29,6 +29,12 @@ with the wheel and sdist attached to the GitHub Release.
   `tasks.yaml`, plus a porting brief, from a classic rw-cli Robot bundle. It never copies classic
   script bodies. Needs the new `port` extra (`robotframework>=7`).
 
+- A task's memory limit (CAP-7). A lease's `limits.resources.memory` (and a compiled task's
+  `resources.memory`, for `rwtask run`) is a Kubernetes quantity applied to the task's child as
+  `RLIMIT_AS` on Linux; elsewhere it is not applied. A task that dies of it and reported no error of
+  its own fails `internal` with the hint "the task exceeded its memory limit (<quantity>)". `cpu` stays
+  advisory. `plugin.run.parse_quantity_bytes` reads the quantity.
+
 ### Fixed
 
 - `ctx.settings` snake_cases only the top-level setting names. It used to rewrite keys at every depth,
