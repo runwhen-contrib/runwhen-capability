@@ -10,6 +10,9 @@
     rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]
     rwtask export <dir> [--name NAME ...] [--force]
     rwtask test <dir> [--task NAME]
+    rwtask test <skill>[/<task>] [--plugin-dir DIR] [--shim TOOL]...
+    rwtask test <skill>/<task> --record --resource PATH --scenario NAME [--input k=v]...
+        [--setting k=v]... [--identity k=v]... [--shim TOOL]... [--force] [--allow-write]
     rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE]
     rwtask validate <dir>
     rwtask compile <plugin-dir> [--out DIR]
@@ -24,6 +27,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -296,14 +300,79 @@ def _build_parser() -> argparse.ArgumentParser:
 
     test_p = sub.add_parser(
         "test",
-        help="run each capability's tests/<task>.json locally, the same way run --local does",
+        help="run each capability's tests/<task>.json locally, the same way run --local does; "
+        "or replay (--record: record) a V13 skill's CLI-call fixtures (<skill>[/<task>])",
     )
-    test_p.add_argument("dir", help="root directory to search for capability.yaml bundles")
+    test_p.add_argument(
+        "dir",
+        help="root directory to search for capability.yaml bundles -- or <skill>[/<task>] of "
+        "a V13 plugin (see --plugin-dir), whose fixtures are skills/<skill>/tests/<task>/*.yaml",
+    )
     test_p.add_argument(
         "--task",
         default=None,
         metavar="NAME",
         help="run only the test for this task name, across every capability that has one",
+    )
+    v13_test = test_p.add_argument_group(
+        "V13 skill fixtures",
+        "Without --record every scenario is replayed: kubectl, helm, flux, argocd, git, psql, "
+        "redis-cli, curl, az, gcloud and aws (and any --shim TOOL) answer from the recorded "
+        "calls, in order, and the envelope is checked against `expect`. --record runs the task "
+        "once for real, with your own environment as the credential (D43), and writes the "
+        "scenario. Review a recorded file before committing it: it holds what the tools printed.",
+    )
+    v13_test.add_argument(
+        "--plugin-dir", default=None, metavar="DIR", help="the plugin directory; default: ."
+    )
+    v13_test.add_argument(
+        "--shim",
+        dest="shims",
+        action="append",
+        default=None,
+        metavar="TOOL",
+        help="also shim this tool (repeatable); give it to replay as it was given to --record",
+    )
+    v13_test.add_argument(
+        "--record", action="store_true", help="run the task for real and write its scenario"
+    )
+    v13_test.add_argument(
+        "--scenario", default=None, metavar="NAME", help="--record: the scenario's file name"
+    )
+    v13_test.add_argument(
+        "--resource", default=None, metavar="PATH", help="--record: the target's resource path"
+    )
+    v13_test.add_argument(
+        "--input",
+        dest="v13_inputs",
+        action="append",
+        default=None,
+        metavar="K=V",
+        help="--record: a task input (repeatable); typed like `rwtask run --input`",
+    )
+    v13_test.add_argument(
+        "--setting",
+        dest="v13_settings",
+        action="append",
+        default=None,
+        metavar="K=V",
+        help="--record: a task setting (repeatable)",
+    )
+    v13_test.add_argument(
+        "--identity",
+        dest="v13_identity",
+        action="append",
+        default=None,
+        metavar="K=V",
+        help="--record: set or override an identity field of the target (repeatable)",
+    )
+    v13_test.add_argument(
+        "--force", action="store_true", help="--record: overwrite an existing scenario file"
+    )
+    v13_test.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="--record: run a task that is not read-only (it really runs)",
     )
 
     port_p = sub.add_parser(
@@ -503,23 +572,14 @@ def _key_values(parser: argparse.ArgumentParser, flag: str, items: list[str] | N
     return pairs
 
 
-def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
-    import shutil
-    import tempfile
-
-    import yaml
-
+def _load_compiled_plugin(who: str, directory: Path):
+    """(tree, compiled plugin) for the plugin in `directory`, or the exit code (1) after
+    printing why: no plugin.yaml, a validation error, or a plugin that does not compile.
+    Warnings are printed and do not stop anything."""
     from .plugin import PluginInvalid, compile_tree, load_dir, validate_tree
-    from .plugin.run import RunSpec, coerce_value, execute, resolve_target
 
-    ref = args.capability_dir
-    if args.request or args.tasks or args.inputs or args.target or args.credentials:
-        parser.error(
-            "run <skill>/<task> takes none of --request/--task/--inputs/--target/--credentials"
-        )
-    directory = Path(args.plugin_dir)
     if not (directory / "plugin.yaml").is_file():
-        print(f"rwtask run: {directory} has no plugin.yaml (see --plugin-dir)", file=sys.stderr)
+        print(f"{who}: {directory} has no plugin.yaml (see --plugin-dir)", file=sys.stderr)
         return 1
     tree = load_dir(directory)
     diagnostics = validate_tree(tree)
@@ -528,19 +588,90 @@ def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if any(d.severity == "error" for d in diagnostics):
         return 1
     try:
-        compiled = compile_tree(tree)
+        return tree, compile_tree(tree)
     except PluginInvalid as exc:
-        print(f"rwtask run: {exc}", file=sys.stderr)
+        print(f"{who}: {exc}", file=sys.stderr)
         return 1
 
+
+def _find_task(who: str, compiled: dict, ref: str) -> dict | None:
+    """The compiled task `[<plugin>:]<skill>/<task>`, or None after printing the tasks there are."""
     wanted = ref.split(":", 1)[1] if ":" in ref else ref
     tasks = {f"{t['skill']}/{t['name']}": t for t in compiled["tasks"]}
     task = tasks.get(wanted)
     if task is None:
         available = ", ".join(sorted(tasks)) or "none"
+        print(f"{who}: no task {wanted!r} in this plugin (tasks: {available})", file=sys.stderr)
+    return task
+
+
+def _typed_values(
+    parser: argparse.ArgumentParser,
+    flag: str,
+    items: list[str] | None,
+    specs: dict | None,
+    bad_values: list[str],
+) -> dict:
+    """`--input`/`--setting` K=V items typed by the task's declared types; a value that is
+    not JSON for its type is added to `bad_values` instead."""
+    from .plugin.run import coerce_value
+
+    values = {}
+    for key, raw in _key_values(parser, flag, items):
+        try:
+            values[key] = coerce_value(((specs or {}).get(key) or {}).get("type"), raw)
+        except ValueError as exc:
+            bad_values.append(f"{flag} {key}: {exc}")
+    return values
+
+
+def _target_for(
+    who: str, ref: str, task: dict, tree, resource: str | None, identity: dict
+) -> tuple[dict | None, int | None]:
+    """(the run's target, None), or (None, the exit code) after printing why not. Warns,
+    without stopping, when the task applies to other types than the resource's."""
+    from .plugin.run import resolve_target
+
+    if resource is None:
+        if task.get("appliesTo"):
+            print(f"{who}: {ref} needs a target: pass --resource PATH", file=sys.stderr)
+            return None, 2
+        return None, None
+    try:
+        target = resolve_target(resource, tree, identity_overrides=identity)
+    except ValueError as exc:
+        print(f"{who}: {exc}", file=sys.stderr)
+        return None, 2
+    for warning in target.pop("warnings", []):
+        print(f"warning: {warning}", file=sys.stderr)
+    applies = (task.get("appliesTo") or {}).get("types")
+    if applies and target["type"] not in applies:
         print(
-            f"rwtask run: no task {wanted!r} in this plugin (tasks: {available})", file=sys.stderr
+            f"warning: {ref} applies to {', '.join(applies)}, not {target['type']}",
+            file=sys.stderr,
         )
+    return target, None
+
+
+def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    import shutil
+    import tempfile
+
+    import yaml
+
+    from .plugin.run import RunSpec, execute
+
+    ref = args.capability_dir
+    if args.request or args.tasks or args.inputs or args.target or args.credentials:
+        parser.error(
+            "run <skill>/<task> takes none of --request/--task/--inputs/--target/--credentials"
+        )
+    loaded = _load_compiled_plugin("rwtask run", Path(args.plugin_dir))
+    if isinstance(loaded, int):
+        return loaded
+    tree, compiled = loaded
+    task = _find_task("rwtask run", compiled, ref)
+    if task is None:
         return 2
     if not task["readOnly"] and not (args.allow_write or (args.dry_run and task["dryRun"])):
         effects = "; ".join(task.get("effects") or ["changes things"])
@@ -558,42 +689,19 @@ def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return 2
 
     bad_values: list[str] = []
-
-    def typed(flag: str, items, specs: dict) -> dict:
-        values = {}
-        for key, raw in _key_values(parser, flag, items):
-            try:
-                values[key] = coerce_value((specs.get(key) or {}).get("type"), raw)
-            except ValueError as exc:
-                bad_values.append(f"{flag} {key}: {exc}")
-        return values
-
-    inputs = typed("--input", args.v13_inputs, task.get("inputs") or {})
-    settings = typed("--setting", args.v13_settings, task.get("settings") or {})
+    inputs = _typed_values(parser, "--input", args.v13_inputs, task.get("inputs"), bad_values)
+    settings = _typed_values(
+        parser, "--setting", args.v13_settings, task.get("settings"), bad_values
+    )
     if bad_values:
         for message in bad_values:
             print(f"rwtask run: {message}", file=sys.stderr)
         return 2
     identity = dict(_key_values(parser, "--identity", args.v13_identity))
 
-    target = None
-    if args.resource is not None:
-        try:
-            target = resolve_target(args.resource, tree, identity_overrides=identity)
-        except ValueError as exc:
-            print(f"rwtask run: {exc}", file=sys.stderr)
-            return 2
-        for warning in target.pop("warnings", []):
-            print(f"warning: {warning}", file=sys.stderr)
-        applies = (task.get("appliesTo") or {}).get("types")
-        if applies and target["type"] not in applies:
-            print(
-                f"warning: {ref} applies to {', '.join(applies)}, not {target['type']}",
-                file=sys.stderr,
-            )
-    elif task.get("appliesTo"):
-        print(f"rwtask run: {ref} needs a target: pass --resource PATH", file=sys.stderr)
-        return 2
+    target, failure = _target_for("rwtask run", ref, task, tree, args.resource, identity)
+    if failure is not None:
+        return failure
 
     spec = RunSpec(
         task=task,
@@ -638,6 +746,292 @@ def _run_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         print("--- output of the script ---", file=sys.stderr)
         print(outcome.log_tail.rstrip(), file=sys.stderr)
     return 1 if envelope["status"] == "failed" else 0
+
+
+_SCENARIO_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_RECORD_HEADER = (
+    "# Recorded by `rwtask test --record`. Review it before committing: `calls` holds what the\n"
+    "# tools printed. `expect.outputs` is left for you to add -- `outputs: {name: value}` is a\n"
+    "# subset match (a dict by key, a list or a scalar whole); `rwtask test` replays this file."
+)
+
+
+def _v13_test_flags(args: argparse.Namespace) -> bool:
+    return bool(
+        args.record
+        or args.plugin_dir is not None
+        or args.resource is not None
+        or args.v13_inputs
+        or args.v13_settings
+        or args.v13_identity
+        or args.shims
+        or args.scenario is not None
+        or args.force
+        or args.allow_write
+    )
+
+
+def _is_v13_test(args: argparse.Namespace) -> bool:
+    """`rwtask test <skill>[/<task>]`: any V13 flag, or the first path segment names a
+    skill under `<plugin-dir>/skills/`, or the positional has a `/` and is not an existing
+    directory (a classic `rwtask test path/to/capabilities` keeps working)."""
+    if _v13_test_flags(args):
+        return True
+    target = args.dir.split(":", 1)[-1]
+    if (Path(args.plugin_dir or ".") / "skills" / target.split("/", 1)[0]).is_dir():
+        return True
+    return "/" in args.dir and not Path(args.dir).is_dir()
+
+
+def _test_v13(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    who = "rwtask test --record" if args.record else "rwtask test"
+    if args.task:
+        parser.error("test <skill>[/<task>] has no --task: name the task as <skill>/<task>")
+    if not args.record:
+        used = [
+            flag
+            for flag, value in (
+                ("--scenario", args.scenario),
+                ("--resource", args.resource),
+                ("--input", args.v13_inputs),
+                ("--setting", args.v13_settings),
+                ("--identity", args.v13_identity),
+                ("--force", args.force),
+                ("--allow-write", args.allow_write),
+            )
+            if value
+        ]
+        if used:
+            parser.error(f"{', '.join(used)} only apply with --record")
+    from .plugin.shims import DEFAULT_SHIMS, check_tool_name
+
+    try:
+        for tool in args.shims or []:
+            check_tool_name(tool)
+    except ValueError as exc:
+        parser.error(str(exc))
+    shims = list(dict.fromkeys([*DEFAULT_SHIMS, *(args.shims or [])]))
+
+    skill, _, task_name = args.dir.split(":", 1)[-1].partition("/")
+    directory = Path(args.plugin_dir or ".")
+    if args.record and not task_name:
+        print(f"{who}: --record needs <skill>/<task>, got {args.dir!r}", file=sys.stderr)
+        return 2
+    loaded = _load_compiled_plugin(who, directory)
+    if isinstance(loaded, int):
+        return loaded
+    tree, compiled = loaded
+    skill_tasks = {t["name"]: t for t in compiled["tasks"] if t["skill"] == skill}
+    if not skill_tasks:
+        skills = ", ".join(sorted({t["skill"] for t in compiled["tasks"]})) or "none"
+        print(
+            f"{who}: no skill {skill!r} with tasks in this plugin (skills: {skills})",
+            file=sys.stderr,
+        )
+        return 2
+    tests_root = directory / "skills" / skill / "tests"
+    if args.record:
+        task = skill_tasks.get(task_name)
+        if task is None:
+            _find_task(who, compiled, f"{skill}/{task_name}")
+            return 2
+        return _record_v13(parser, args, tree, task, tests_root, shims)
+    if task_name and task_name not in skill_tasks:
+        _find_task(who, compiled, f"{skill}/{task_name}")
+        return 2
+    return _replay_v13(args, tree, skill, skill_tasks, task_name, tests_root, shims)
+
+
+def _record_v13(parser, args, tree, task: dict, tests_root: Path, shims: list[str]) -> int:
+    import shutil
+    import tempfile
+
+    from .plugin.fixtures import dump_scenario
+    from .plugin.run import RunSpec, execute
+    from .plugin.shims import ShimSession
+
+    who = "rwtask test --record"
+    ref = f"{task['skill']}/{task['name']}"
+    if not args.scenario or not _SCENARIO_NAME.match(args.scenario):
+        print(
+            f"{who}: --scenario NAME is required (letters, digits, '.', '_', '-'; "
+            f"got {args.scenario!r})",
+            file=sys.stderr,
+        )
+        return 2
+    destination = tests_root / task["name"] / f"{args.scenario}.yaml"
+    if destination.exists() and not args.force:
+        print(f"{who}: {destination} already exists; pass --force to overwrite it", file=sys.stderr)
+        return 2
+    if not task["readOnly"] and not args.allow_write:
+        effects = "; ".join(task.get("effects") or ["changes things"])
+        print(
+            f"{who}: {ref} is not read-only: it {effects}. Recording really runs it; "
+            "pass --allow-write to record it",
+            file=sys.stderr,
+        )
+        return 2
+
+    bad_values: list[str] = []
+    inputs = _typed_values(parser, "--input", args.v13_inputs, task.get("inputs"), bad_values)
+    settings = _typed_values(
+        parser, "--setting", args.v13_settings, task.get("settings"), bad_values
+    )
+    if bad_values:
+        for message in bad_values:
+            print(f"{who}: {message}", file=sys.stderr)
+        return 2
+    identity = dict(_key_values(parser, "--identity", args.v13_identity))
+    target, failure = _target_for(who, ref, task, tree, args.resource, identity)
+    if failure is not None:
+        return failure
+
+    scope_dir = Path(tempfile.mkdtemp(prefix="rwtask-test-"))
+    try:
+        with ShimSession.record(shims) as session:
+            for tool in session.missing:
+                if tool in (args.shims or []):
+                    print(f"warning: --shim {tool}: not installed, so not shimmed", file=sys.stderr)
+            outcome = execute(
+                RunSpec(
+                    task=task,
+                    files=tree.files,
+                    executable=tree.executable,
+                    target=target,
+                    inputs=inputs,
+                    settings=settings,
+                ),
+                scope_dir=scope_dir,
+                inherit_home=True,
+                path_prepend=session.path_prepend,
+                shim_env=session.env,
+            )
+            calls = session.recorded()
+    finally:
+        shutil.rmtree(scope_dir, ignore_errors=True)
+
+    envelope = outcome.envelope
+    expect = {
+        "status": envelope["status"],
+        "errorCodes": sorted({e["code"] for e in envelope["errors"]}),
+    }
+    text = dump_scenario(
+        resource=args.resource,
+        inputs=inputs,
+        settings=settings,
+        identity=identity,
+        calls=calls,
+        expect=expect,
+        header=_RECORD_HEADER,
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text, encoding="utf-8")
+    print(
+        f"{who}: recorded {len(calls)} calls, status {envelope['status']}"
+        + (f" [{', '.join(expect['errorCodes'])}]" if expect["errorCodes"] else "")
+        + f" -> {destination}",
+        file=sys.stderr,
+    )
+    for error in envelope["errors"]:
+        print(f"  {error['code']}: {error['message']}", file=sys.stderr)
+    return 0
+
+
+def _replay_v13(
+    args, tree, skill: str, skill_tasks: dict, task_name: str, tests_root: Path, shims: list[str]
+) -> int:
+    import shutil
+    import tempfile
+
+    from .plugin.fixtures import FixtureError, load_scenario, match_expect, scenario_files
+    from .plugin.run import RunSpec, execute
+    from .plugin.shims import ShimSession
+
+    who = "rwtask test"
+    passed = failed = 0
+    if task_name:
+        names = [task_name]
+    else:
+        # every task with fixtures, plus any fixture directory no task answers to
+        on_disk = (
+            sorted(p.name for p in tests_root.iterdir() if p.is_dir())
+            if tests_root.is_dir()
+            else []
+        )
+        names = sorted({*(n for n in skill_tasks if n in on_disk), *on_disk})
+    for name in names:
+        task = skill_tasks.get(name)
+        files = scenario_files(tests_root / name)
+        if task is None:
+            if files:
+                failed += 1
+                print(f"FAIL {skill}/{name}: no such task (fixtures in {tests_root / name})")
+            continue
+        for path in files:
+            label = f"{skill}/{name}/{path.stem}"
+            try:
+                scenario = load_scenario(path)
+            except FixtureError as exc:
+                failed += 1
+                print(f"FAIL {label}")
+                for problem in exc.errors:
+                    print(f"  {problem}")
+                continue
+            problems: list[str] = []
+            target, failure = _target_for(
+                who, f"{skill}/{name}", task, tree, scenario.resource, scenario.identity
+            )
+            if failure is not None:
+                failed += 1
+                print(f"FAIL {label}")
+                print("  the scenario's resource/identity cannot be used (see the message above)")
+                continue
+            scope_dir = Path(tempfile.mkdtemp(prefix="rwtask-test-"))
+            try:
+                with ShimSession.replay(scenario.calls, shims) as session:
+                    outcome = execute(
+                        RunSpec(
+                            task=task,
+                            files=tree.files,
+                            executable=tree.executable,
+                            target=target,
+                            inputs=scenario.inputs,
+                            settings=scenario.settings,
+                        ),
+                        scope_dir=scope_dir,
+                        path_prepend=session.path_prepend,
+                        shim_env=session.env,
+                    )
+                    mismatches = session.mismatches()
+                    unconsumed = session.unconsumed()
+            finally:
+                shutil.rmtree(scope_dir, ignore_errors=True)
+            if mismatches:
+                problems.extend(
+                    f"E_FIXTURE_MISMATCH call {m['index'] + 1}: {m['message']}" for m in mismatches
+                )
+            else:
+                problems.extend(match_expect(outcome.envelope, scenario.expect))
+                if unconsumed:
+                    problems.append(f"{unconsumed} recorded calls not made")
+            if problems:
+                failed += 1
+                print(f"FAIL {label}")
+                for problem in problems:
+                    print(f"  {problem}")
+                if outcome.envelope["status"] in ("failed", "partial") and outcome.log_tail.strip():
+                    print("  --- output of the script ---")
+                    for line in outcome.log_tail.rstrip().splitlines():
+                        print(f"  {line}")
+            else:
+                passed += 1
+                print(f"PASS {label}")
+    if not passed and not failed:
+        scope = f"{skill}/{task_name}" if task_name else skill
+        print(f"{who}: no fixtures for {scope} (looked in {tests_root}/<task>/*.yaml)")
+        return 1
+    print(f"{passed} passed, {failed} failed")
+    return 1 if failed else 0
 
 
 def _gitops_config(parser: argparse.ArgumentParser, args: argparse.Namespace, command: str):
@@ -913,6 +1307,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "test":
+        if _is_v13_test(args):
+            return _test_v13(parser, args)
         from . import gitops
 
         results = gitops.run_tests(Path(args.dir), task=args.task)

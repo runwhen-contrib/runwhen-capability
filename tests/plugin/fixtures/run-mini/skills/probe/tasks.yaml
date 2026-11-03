@@ -174,3 +174,17 @@ tasks:
     readOnly: true
     outputs:
       pools: { schema: "{ cl_waiting: integer, sv_idle: integer, saturated: boolean }[]" }
+  - name: kube-count
+    title: Count pods (bash, kubectl)
+    description: Calls kubectl twice and counts with jq; the fixtures for `rwtask test` are recorded from it.
+    script: scripts/kube_count.sh
+    readOnly: true
+    outputs:
+      pods: { schema: "{ namespace: string, count: integer }" }
+  - name: kube-count-py
+    title: Count pods (Python, kubectl)
+    description: The same through ctx.run.
+    script: scripts/kube_count_py.py
+    readOnly: true
+    outputs:
+      pods: { schema: "{ namespace: string, count: integer }" }
