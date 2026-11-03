@@ -6,6 +6,7 @@ A scenario is one YAML file, `skills/<skill>/tests/<task>/<scenario>.yaml`:
     inputs: {limit: 3}                    # optional, typed values
     settings: {label: x}                  # optional
     identity: {cluster: kind}             # optional, overrides the path-derived identity
+    dryRun: true                          # optional: RW_DRY_RUN=1; the task must declare dryRun
     calls:                                # the CLI calls the task makes, in order
       - argv: [kubectl, get, pods]        # argv[0] is the tool's basename
         stdin: "..."                      # optional; asserted only when present
@@ -16,6 +17,8 @@ A scenario is one YAML file, `skills/<skill>/tests/<task>/<scenario>.yaml`:
       status: ok | partial | failed | skipped
       errorCodes: [permission_denied]     # optional; the envelope's codes as a set
       outputs: {name: value}              # optional; subset match, see `match_expect`
+      artifacts:                          # optional; per artifact output of the task
+        <name>: {contains: [str], notContains: [str], lines: {min: 1, max: 9}}
 
 The format is the SDK's own (not a contract); lane F's generators write it. Loading is
 strict: an unknown key, a wrong type or a missing `expect` is an error naming the file and
@@ -24,6 +27,7 @@ the path, never a silently ignored typo.
 
 from __future__ import annotations
 
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,6 +53,7 @@ SCENARIO_SCHEMA: dict[str, Any] = {
         "inputs": {"type": "object"},
         "settings": {"type": "object"},
         "identity": _STRING_MAP,
+        "dryRun": {"type": "boolean"},
         "calls": {
             "type": "array",
             "items": {
@@ -72,6 +77,25 @@ SCENARIO_SCHEMA: dict[str, Any] = {
                 "status": {"enum": list(STATUSES)},
                 "errorCodes": {"type": "array", "items": {"enum": list(ERROR_CODES)}},
                 "outputs": {"type": "object"},
+                "artifacts": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "contains": {"type": "array", "items": {"type": "string"}},
+                            "notContains": {"type": "array", "items": {"type": "string"}},
+                            "lines": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "min": {"type": "integer", "minimum": 0},
+                                    "max": {"type": "integer", "minimum": 0},
+                                },
+                            },
+                        },
+                    },
+                },
             },
         },
     },
@@ -99,6 +123,7 @@ class Scenario:
     settings: dict = field(default_factory=dict)
     identity: dict = field(default_factory=dict)
     calls: list[dict] = field(default_factory=list)
+    dry_run: bool = False
 
 
 def _path(parts) -> str:
@@ -131,6 +156,8 @@ def load_scenario(path: Path) -> Scenario:
             problems.append(f"{where + ': ' if where else ''}unknown key(s) {', '.join(extra)}")
         else:
             problems.append(f"{where or '(scenario)'}: {error.message}"[:300])
+    if not problems:
+        problems = _expectation_problems(doc["expect"])
     if problems:
         raise FixtureError(path, problems)
     calls = [
@@ -146,7 +173,75 @@ def load_scenario(path: Path) -> Scenario:
         settings=doc.get("settings") or {},
         identity=doc.get("identity") or {},
         calls=calls,
+        dry_run=bool(doc.get("dryRun", False)),
     )
+
+
+MATCHERS = ("$contains", "$containsWhere")
+
+
+def _is_matcher(value: Any) -> bool:
+    """A non-empty dict whose keys are all `$`-prefixed."""
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(isinstance(k, str) and k.startswith("$") for k in value)
+    )
+
+
+def _has_dollar_key(value: dict) -> bool:
+    return any(isinstance(k, str) and k.startswith("$") for k in value)
+
+
+def _expectation_problems(expect: dict) -> list[str]:
+    """Matcher mistakes in `expect.outputs` (the schema cannot say these), with paths."""
+    problems: list[str] = []
+
+    def walk(value: Any, where: str) -> None:
+        if isinstance(value, dict):
+            if _is_matcher(value):
+                for name, argument in value.items():
+                    if name not in MATCHERS:
+                        problems.append(f"{where}: unknown matcher {name}")
+                    elif name == "$contains":
+                        if not isinstance(argument, list):
+                            problems.append(f"{where}: $contains wants a list of items")
+                        else:
+                            for i, item in enumerate(argument):
+                                walk(item, f"{where}[{i}]")
+                    elif not isinstance(argument, dict) or not argument:
+                        problems.append(f"{where}: $containsWhere wants an object")
+                    else:
+                        walk(argument, where)
+            elif _has_dollar_key(value):
+                problems.append(f"{where}: mixes $-matchers with plain keys")
+            else:
+                for key, sub in value.items():
+                    walk(sub, f"{where}.{key}")
+        elif isinstance(value, list):
+            whole(value, where)
+
+    def whole(value: Any, where: str) -> None:
+        # a list is compared whole: a matcher in it would be taken for literal data
+        if isinstance(value, dict):
+            if _has_dollar_key(value):
+                problems.append(f"{where}: a matcher inside a list is not evaluated; use $contains")
+            else:
+                for key, sub in value.items():
+                    whole(sub, f"{where}.{key}")
+        elif isinstance(value, list):
+            for i, sub in enumerate(value):
+                whole(sub, f"{where}[{i}]")
+
+    if "outputs" in expect:
+        walk(expect["outputs"], "expect.outputs")
+    for name, spec in (expect.get("artifacts") or {}).items():
+        lines = spec.get("lines") or {}
+        if "min" in lines and "max" in lines and lines["min"] > lines["max"]:
+            problems.append(
+                f"expect.artifacts.{name}.lines: min {lines['min']} is above max {lines['max']}"
+            )
+    return problems
 
 
 def _without_argv(call: dict) -> dict:
@@ -187,6 +282,7 @@ def dump_scenario(
     calls: list[dict],
     expect: dict,
     header: str = "",
+    dry_run: bool = False,
 ) -> str:
     """The YAML text of a scenario (the `--record` output)."""
     doc: dict[str, Any] = {}
@@ -195,6 +291,8 @@ def dump_scenario(
     for key, value in (("inputs", inputs), ("settings", settings), ("identity", identity)):
         if value:
             doc[key] = value
+    if dry_run:
+        doc["dryRun"] = True
     doc["calls"] = calls
     doc["expect"] = expect
     body = yaml.dump(doc, Dumper=_Dumper, sort_keys=False, allow_unicode=True, width=100)
@@ -220,6 +318,10 @@ def _same(a: Any, b: Any) -> bool:
 
 
 def _subset(expected: Any, got: Any, where: str, problems: list[str]) -> None:
+    if _is_matcher(expected):
+        for name, argument in expected.items():
+            _matcher(name, argument, got, where, problems)
+        return
     if isinstance(expected, dict) and isinstance(got, dict):
         for key, value in expected.items():
             sub = f"{where}.{key}"
@@ -232,13 +334,77 @@ def _subset(expected: Any, got: Any, where: str, problems: list[str]) -> None:
         problems.append(f"{where}: expected {expected!r}, got {got!r}")
 
 
-def match_expect(envelope: dict, expect: dict) -> list[str]:
+def _matches(expected: Any, got: Any) -> bool:
+    problems: list[str] = []
+    _subset(expected, got, "", problems)
+    return not problems
+
+
+def _matcher(name: str, argument: Any, got: Any, where: str, problems: list[str]) -> None:
+    if not isinstance(got, list):
+        problems.append(f"{where}: {name}: expected a list, got {got!r}")
+    elif name == "$contains":
+        for item in argument:
+            if not any(_matches(item, element) for element in got):
+                problems.append(f"{where}: $contains: no element matches {item!r}")
+                return  # the first missing item is enough
+    elif not any(isinstance(e, dict) and _matches(argument, e) for e in got):
+        problems.append(f"{where}: $containsWhere: no element matches {argument!r}")
+
+
+def _artifact_problems(
+    expected: dict, texts: Mapping[str, str], declared: Collection[str]
+) -> list[str]:
+    problems: list[str] = []
+    for name, spec in expected.items():
+        where = f"artifacts.{name}"
+        if name not in declared:
+            known = ", ".join(sorted(declared)) or "none"
+            problems.append(
+                f"{where}: not an artifact output of this task (artifact outputs: {known})"
+            )
+            continue
+        if name not in texts:
+            problems.append(f"{where}: the task did not produce this artifact")
+            continue
+        text = texts[name]
+        problems.extend(
+            f"{where}: missing text {s!r}" for s in spec.get("contains", []) if s not in text
+        )
+        problems.extend(
+            f"{where}: contains forbidden text {s!r}"
+            for s in spec.get("notContains", [])
+            if s in text
+        )
+        count = len(text.splitlines())
+        lines = spec.get("lines") or {}
+        if "min" in lines and count < lines["min"]:
+            problems.append(f"{where}: {count} lines, expected at least {lines['min']}")
+        if "max" in lines and count > lines["max"]:
+            problems.append(f"{where}: {count} lines, expected at most {lines['max']}")
+    return problems
+
+
+def match_expect(
+    envelope: dict,
+    expect: dict,
+    *,
+    artifacts: Mapping[str, str] | None = None,
+    artifact_outputs: Collection[str] | None = None,
+) -> list[str]:
     """Why `envelope` does not meet `expect`: one message per mismatch, [] for a pass.
 
     `status` must be equal. `errorCodes`, when given, is compared with the envelope's
     codes as a sorted set. `outputs` is a subset match: every expected key of a dict must
     be present with an equal value, recursively through dicts; a list or a scalar must be
-    equal as a whole (a bool is not a number)."""
+    equal as a whole (a bool is not a number). A dict whose keys are all `$`-prefixed is a
+    matcher on a list instead: `{"$contains": [items]}` (each item subset-matches some
+    element, any order, one element may serve two items) and `{"$containsWhere": {k: v}}`
+    (some element subset-matches); several on one dict must all hold. Matchers work at any
+    depth, including inside `$contains` items. The first missing item is the one named.
+
+    `artifacts` (what the run produced: name -> text) and `artifact_outputs` (the task's
+    artifact output names; default: those produced) are for `expect.artifacts`."""
     problems: list[str] = []
     if envelope.get("status") != expect.get("status"):
         problems.append(f"status: expected {expect.get('status')}, got {envelope.get('status')}")
@@ -249,4 +415,8 @@ def match_expect(envelope: dict, expect: dict) -> list[str]:
             problems.append(f"errorCodes: expected {want}, got {got}")
     if "outputs" in expect:
         _subset(expect["outputs"], envelope.get("outputs") or {}, "outputs", problems)
+    if expect.get("artifacts"):
+        texts = artifacts or {}
+        declared = artifact_outputs if artifact_outputs is not None else list(texts)
+        problems.extend(_artifact_problems(expect["artifacts"], texts, declared))
     return problems

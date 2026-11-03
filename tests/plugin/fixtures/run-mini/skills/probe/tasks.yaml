@@ -202,3 +202,14 @@ tasks:
     readOnly: true
     outputs:
       creds: { schema: ./schemas/object.v1.json }
+  - name: kube-restart
+    title: Restart a deployment (bash, kubectl)
+    description: Rolls the deployment; under dry run only asks the server what it would do.
+    script: scripts/kube_restart.sh
+    readOnly: false
+    effects: ["Restarts the deployment's pods"]
+    destructive: false
+    idempotent: true
+    dryRun: true
+    outputs:
+      result: { schema: "{ dry: boolean }" }
