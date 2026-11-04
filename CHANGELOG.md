@@ -233,6 +233,12 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Fixed
 
+- `k8s_proxy_get` / `k8s_proxy_request` (and the bash helpers) drop the per-request API-server
+  response headers `audit-id`, `date` and `x-kubernetes-pf-*` (flow-control UIDs) from `headers`:
+  they identify the cluster's audit trail and differ on every call, so `rwtask test --record` stored
+  them in `k8s-proxy-get` / `k8s-proxy-request` fixtures. They are dropped from the answer itself,
+  so a live run, a recording and a replay show a task the same headers; an older scenario that
+  still holds them replays without them, and so does a `stub_commands(k8s_proxy=...)` response.
 - `ctx.settings` snake_cases only the top-level setting names. It used to rewrite keys at every depth,
   so an object-typed setting whose keys are user data (`patterns: {connRefused: ...}`) arrived with
   its keys changed. Nested values now keep their keys verbatim (still readable as attributes where

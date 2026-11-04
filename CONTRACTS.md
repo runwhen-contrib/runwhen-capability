@@ -148,6 +148,9 @@ re-issued as a GET, and `delete` a 307 too), so a write to a pod or service goes
 TCP port is opened) and reads through it with a client that sends no credential and never
 follows a redirect. The answer is the backend's own `status`, lowercased `headers` and `body`
 (text; 4 MiB at most, `truncated` says it was cut), also for a 404 or 503, which are data.
+The per-request API-server headers `audit-id`, `date` and `x-kubernetes-pf-*` are dropped from
+`headers` (they identify the cluster's audit trail and differ on every call), in a live run, a
+recording and a replay alike.
 `location` is the redirect target only when it stays on the same pod/service/port, and then it
 is the **backend-relative path plus query** (`/somewhere/else?x=1`: the API server rewrites a
 backend's Location into `/api/v1/namespaces/<ns>/<kind>/<[https:]name:port>/proxy/...`, and the
