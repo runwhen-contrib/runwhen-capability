@@ -7,6 +7,11 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- **contracts-v6: registry API addendum (lane D, M4)** (`contracts/registry-api.openapi.yaml`): `POST
+  /v1/sources/{id}:publish` and `:draft`, problem codes `E_BUSY`, `E_INVALID_SNAPSHOT`,
+  `E_BRANCH_MOVED`, `E_WRITE_DISABLED`, `Source.kind: snapshot`, and the snapshot/import semantics,
+  copied from plugin-registry#6 @482f0d6. Additive; no JSON Schema changed. See CONTRACTS.md
+  "Changes in contracts-v6".
 - **`ctx.k8s_proxy_request` / `rw_k8s_proxy_request`, request headers and longer port names (S17,
   lane F's last three extensions)** (`runwhen_capability/k8s_proxy.py`):
   - `proxy_request(method, namespace, kind, name, port, path, *, body=None, headers=None,
