@@ -7,6 +7,9 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- **contracts-v7** (CONTRACTS.md "Changes in contracts-v7"): V7-1 registry problem code
+  `E_BAD_REQUEST` (`contracts/registry-api.openapi.yaml` copied from plugin-registry#13 @7211d78);
+  V7-2 documents the runner's `dispatch` attempt token and the `X-RW-Dispatch` echo (S20).
 - **The runner's attempt token (`X-RW-Dispatch`) is echoed on result, artifact and code requests
   (lane C, runner#112)** (`runwhen_capability/relay.py`, `serve.py`, `models.py`): the `POST
   /v1/tasks/next` answer may carry `dispatch`, a decimal uint64 string naming this attempt

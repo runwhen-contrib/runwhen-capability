@@ -1,9 +1,9 @@
-# V13 plugins contracts (contracts-v6)
+# V13 plugins contracts (contracts-v7)
 
 Every seam between the lanes of the V13 plugins program, frozen at M0 (`contracts-v1`)
-and extended additively in `contracts-v2`, `contracts-v3`, `contracts-v4`, `contracts-v5` and `contracts-v6` (see [Changes in contracts-v2](#changes-in-contracts-v2),
+and extended additively in `contracts-v2`, `contracts-v3`, `contracts-v4`, `contracts-v5`, `contracts-v6` and `contracts-v7` (see [Changes in contracts-v2](#changes-in-contracts-v2),
 [Changes in contracts-v3](#changes-in-contracts-v3), [Changes in contracts-v4](#changes-in-contracts-v4),
-[Changes in contracts-v5](#changes-in-contracts-v5), [Changes in contracts-v6](#changes-in-contracts-v6)). The
+[Changes in contracts-v5](#changes-in-contracts-v5), [Changes in contracts-v6](#changes-in-contracts-v6), [Changes in contracts-v7](#changes-in-contracts-v7)). The
 schemas in [`contracts/`](contracts/) are normative; this page says what they
 cannot: who produces and consumes each document, the rules that are not
 expressible in JSON Schema, and the calls made at freeze.
@@ -18,11 +18,12 @@ Design source: the V13 wiki ([skill spec](https://wiki.sdlc.shared.runwhen.com/#
 ## Using the contracts
 
 ```bash
-pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v6"
+pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v7"
 ```
 
-The `contracts-v6` tag is pending: until it exists, pin the commit
-(`@<sha>`, the `v13/plugins-m2` merge commit that introduced contracts-v6) in place of `@contracts-v6`.
+The `contracts-v7` tag is pending: until it exists, pin the commit
+(`@<sha>`, the milestone-branch merge commit that introduced contracts-v7; v5 landed on
+`v13/plugins-m2`, v6 and v7 on `v13/plugins-m3`) in place of `@contracts-v7`.
 
 ```python
 from runwhen_capability.contracts import archive, check, load_yaml, validate
@@ -614,4 +615,14 @@ changed; the JSON Schemas did not.
 | # | Change | Affects |
 |---|---|---|
 | V6-1 | Registry API addendum (lane D, M4; plugin-registry#6 @482f0d6). New routes: `POST /v1/sources/{id}:publish?message=` (tar or gzip plugin tree; 201 `IndexEntry` for a new version, 200 for an idempotent retry of the same content) and `POST /v1/sources/{id}:draft?branch=&message=` (201 `DraftResult {source, branch, commit, path, changed}`; a missing branch is created at the base tip even when nothing changed). Both accept only a source with a `write:` config. A tree that carries none of what the archive leaves out (root `tests/`, `runwhen.lock`, `.runwhen/`, `skills/*/tests/`) keeps those from the branch; one that carries any of it is authoritative for the whole directory. New problem codes: `E_BUSY` (409: another export, import or source write is running, or too many uploads), `E_INVALID_SNAPSHOT` (422: malformed snapshot layout or manifest), `E_BRANCH_MOVED` (409: the branch moved twice during a publish), `E_WRITE_DISABLED` (403: no `write:` config). `Source.kind` gains `snapshot` (`SourceRef.kind` had it). `/v1/snapshot` documents 404 (unknown `plugin=`) and 409 `E_BUSY`; `/v1/import` documents 413. `latestOnly` follows the index's `latest` rule (newest release, else newest prerelease). A snapshot's `runtimes.json` holds git-published runtimes only, in the `/v1/runtimes` item shape with upstream refs (`mirrored: false`). Imported versions carry `source.kind = snapshot`, `id = snapshot`, and keep the exporter's repo, tag and commit as sanitised provenance; `snapshot.json` `source` is informational. | B (papi registry client: new codes, `snapshot` kind), D (server, already shipped), E/G (publish and draft from the builder and UI, if used) |
+
+## Changes in contracts-v7
+
+Additive: no route, field or schema was removed, and every document that validated under
+`contracts-v6` still does. No JSON Schema changed.
+
+| # | Change | Affects |
+|---|---|---|
+| V7-1 | Registry problem code `E_BAD_REQUEST` (lane D, plugin-registry#13 @7211d78; `registry-api.openapi.yaml` copied verbatim): a request parameter or body that is malformed, not a plugin or snapshot problem. It is 422 for request validation and route-level parameter checks (the `:draft` `branch` and `message`, a malformed `expectedSha256`), and 400 or 416 for a malformed or unsatisfiable `Range` on blob and archive GETs. Before v7 these carried `E_UNAVAILABLE`, and a bad `:draft` branch carried `E_INVALID_PLUGIN`. Path-parameter errors stay 404 `E_NOT_FOUND`; `E_INVALID_PLUGIN`, `E_INVALID_SNAPSHOT` and `E_UNAVAILABLE` keep their meanings. | B (papi's registry client passes 4xx codes through; nothing keys on `E_UNAVAILABLE`, checked by lane D), D (server, shipped) |
+| V7-2 | Runner attempt token, S20 (runner ↔ executor wire; behaviour, not a schema). The `POST /v1/tasks/next` 200 body may carry `dispatch`, a decimal uint64 string naming this hand-out of the request. The executor (`rwtask serve`) echoes it as `X-RW-Dispatch: <dispatch>` on `POST /v1/tasks/{requestId}/result`, `PUT .../artifacts/{name}`, `GET .../artifacts/in/{input}` and `GET .../code` (plain and `?sha256=`), so a result or artifact from a superseded attempt is refused (the runner answers 404) instead of being taken as the current one. An older runner sends no `dispatch` and gets no header; an invalid value (not a decimal uint64) is ignored, never a task failure. | C (runner sends `dispatch` and checks the header; runwhen-runner#112) |
 
