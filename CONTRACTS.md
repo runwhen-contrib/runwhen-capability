@@ -21,7 +21,7 @@ pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen
 ```
 
 The `contracts-v4` tag is pending: until it exists, pin the commit
-(`@<sha>`, the head of the `lane-a/auth-script` branch) in place of `@contracts-v4`.
+(`@<sha>`, the `v13/plugins` merge commit that introduced contracts-v4) in place of `@contracts-v4`.
 
 ```python
 from runwhen_capability.contracts import archive, check, load_yaml, validate
