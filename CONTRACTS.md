@@ -333,11 +333,17 @@ The script contract:
 | | |
 |---|---|
 | Runs in | the executor, in the task's runtime image (which ships `gke-gcloud-auth-plugin`, `aws`, `kubelogin`), before the task script; working dir = the integration's plugin root |
+| Script | `method.script.path` is relative to the integration's `integration/` directory, exactly as the definition writes it: `auth/gke.py` runs `<archive root>/integration/auth/gke.py`. papi and the runner pass it verbatim; an absolute path, `..` or an empty segment fails the task `invalid_input`. The working dir (above) is the archive root, one level up |
 | Interpreter | by extension: `.py` → `python3`, `.sh` → `bash` with `set -euo pipefail` |
 | Reference | `RW_AUTH_REF_DIR/<key>` per key of a secret/vault/file reference (`value` when it has one unnamed value), written from `materialized[].reference` and kept until the task ends; nothing for `in-cluster-sa` (standard SA mount) or `cloud-identity` (ambient). A k8s-secret, vault or file reference without `materialized[].reference` fails the task `invalid_input` |
 | Inputs | `RW_AUTH_INPUT_<NAME>` |
 | Output | file types: write `RW_AUTH_OUT_FILE`; env types: `NAME=value` lines to `RW_AUTH_OUT_ENV` |
 | Failure | non-zero exit fails the task run before its script starts (`status: failed`); the auth script may write one `{code, message}` JSON line to `RW_AUTH_OUT_ERROR` (default `internal`, scope `auth`) |
+
+The runtime image has no `gcloud`. A kubeconfig an auth script writes for GKE must call
+`gke-gcloud-auth-plugin` with `--use_application_default_credentials` in its `exec.args`
+(credentials from `GOOGLE_APPLICATION_CREDENTIALS`); without it the plugin shells out to
+`gcloud` and every kubectl call fails.
 
 `passthrough` writes the single reference value to the file target, or maps keys
 to variables for env targets. `in-cluster-token` writes a kubeconfig built from
