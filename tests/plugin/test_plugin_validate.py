@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 
+import pytest
 from _plugin_fixtures import (
     KUBE_MINI,
     drop,
@@ -416,6 +417,42 @@ def test_auth_script_must_exist_under_integration():
     d = only(entries, "E_AUTH_SCRIPT_MISSING")
     assert (d.file, d.path) == (INTEGRATION, "/authMethods/gke/script")
     assert validate_entries(put(entries, "integration/auth/gke.py", "x")) == []
+
+
+def with_materialize(materialize: str):
+    return edit(
+        kube_entries(),
+        INTEGRATION,
+        'materialize: { file: { env: KUBECONFIG, mode: "0600" } }',
+        f"materialize: {materialize}",
+    )
+
+
+def test_non_secret_names_must_be_in_the_materialize_env_list():
+    ok = with_materialize("{ env: [PGHOST, PGPASSWORD], nonSecret: [PGHOST] }")
+    assert validate_entries(ok) == []
+    entries = with_materialize("{ env: [PGHOST, PGPASSWORD], nonSecret: [PGHOST, PGPORT] }")
+    d = only(entries, "E_NON_SECRET_UNKNOWN")
+    assert (d.file, d.path) == (
+        INTEGRATION,
+        "/credentialTypes/kubernetes~1kubeconfig/materialize/nonSecret/1",
+    )
+    assert "PGPORT" in d.message
+    assert [x.code for x in validate_entries(entries)] == ["E_NON_SECRET_UNKNOWN"]
+
+
+@pytest.mark.parametrize(
+    "materialize",
+    [
+        "{ file: { env: KUBECONFIG }, nonSecret: [KUBECONFIG] }",
+        "{ env: { fromTaskVars: true }, nonSecret: [REGION] }",
+        "{ file: { env: KUBECONFIG }, env: [REGION], nonSecret: [REGION] }",
+    ],
+)
+def test_non_secret_needs_an_env_list_and_no_file(materialize):
+    # the schema rejects it, so the semantic check has nothing to add
+    codes = [d.code for d in validate_entries(with_materialize(materialize))]
+    assert "E_SCHEMA" in codes and "E_NON_SECRET_UNKNOWN" not in codes
 
 
 def rule(name: str, words: int) -> str:

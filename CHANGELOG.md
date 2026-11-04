@@ -7,6 +7,24 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- **contracts-v5 (tag pending), `materialize.nonSecret`** (lane F's postgres/aws/azure on a real runner):
+  the executor redacted every materialized env value, substring-matching any value of 8 or more
+  characters, so `PGDATABASE=postgres` turned every "postgres" in task output into `***REDACTED***`
+  and `AWS_REGION` / `AZURE_SUBSCRIPTION_ID` were mangled out of ARNs and canonical keys.
+  `integration.schema.json` `credentialTypes.*.materialize` gains an optional `nonSecret` (an array of
+  env names, `minItems` 1, `uniqueItems`), allowed only with `env` as a list (not `fromTaskVars`, not
+  `file`) and naming only names in that list: `rwtask validate` reports one that is not as
+  `E_NON_SECRET_UNKNOWN`. `auth-plan.schema.json` `materialize` allows `env` with `nonSecret`
+  (never `file` with it). `rwtask serve` leaves the listed names out of its redaction, for a native
+  plan (`materialized[].env`, with the names read from the lease's `credentials[].authPlan`) and a
+  script plan (`auth_script.run_script_plan` returns only the other values in `AuthResult.secrets`;
+  `plugin.run.execute` takes `non_secret_env`). A `file` is always secret, and a non-secret value that
+  is also a secret elsewhere in the lease stays redacted. Without the field nothing changes.
+  CONTRACTS.md "Changes in contracts-v5" (V5-1), the credential type and Auth plan prose, the
+  install line, examples (`integration/synthetic-postgres-non-secret.yaml`,
+  `auth-plan/synthetic-postgres-non-secret.yaml` and invalid cases), generated models and the
+  packaged copy follow. Affects B/C (papi copies `materialize` into plans, the runner passes the plan
+  through) and F (postgres, aws and azure mark their non-secret names).
 - `ctx.k8s_proxy_get` / `rw_k8s_proxy_get` (S17), refined:
   - It now runs `kubectl proxy --unix-socket=<0700 temp dir>/p.sock` (readiness: the "Starting to
     serve on <socket>" line kubectl 1.3x prints, else the socket file after 0.5 s; the directory is

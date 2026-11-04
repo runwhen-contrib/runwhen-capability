@@ -1,8 +1,9 @@
-# V13 plugins contracts (contracts-v4)
+# V13 plugins contracts (contracts-v5)
 
 Every seam between the lanes of the V13 plugins program, frozen at M0 (`contracts-v1`)
-and extended additively in `contracts-v2`, `contracts-v3` and `contracts-v4` (see [Changes in contracts-v2](#changes-in-contracts-v2),
-[Changes in contracts-v3](#changes-in-contracts-v3), [Changes in contracts-v4](#changes-in-contracts-v4)). The
+and extended additively in `contracts-v2`, `contracts-v3`, `contracts-v4` and `contracts-v5` (see [Changes in contracts-v2](#changes-in-contracts-v2),
+[Changes in contracts-v3](#changes-in-contracts-v3), [Changes in contracts-v4](#changes-in-contracts-v4),
+[Changes in contracts-v5](#changes-in-contracts-v5)). The
 schemas in [`contracts/`](contracts/) are normative; this page says what they
 cannot: who produces and consumes each document, the rules that are not
 expressible in JSON Schema, and the calls made at freeze.
@@ -17,11 +18,11 @@ Design source: the V13 wiki ([skill spec](https://wiki.sdlc.shared.runwhen.com/#
 ## Using the contracts
 
 ```bash
-pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v4"
+pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v5"
 ```
 
-The `contracts-v4` tag is pending: until it exists, pin the commit
-(`@<sha>`, the `v13/plugins` merge commit that introduced contracts-v4) in place of `@contracts-v4`.
+The `contracts-v5` tag is pending: until it exists, pin the commit
+(`@<sha>`, the `v13/plugins` merge commit that introduced contracts-v5) in place of `@contracts-v5`.
 
 ```python
 from runwhen_capability.contracts import archive, check, load_yaml, validate
@@ -92,7 +93,7 @@ type (`kubernetes/namespace`).
 | Block | Rules the schema does not carry |
 |---|---|
 | `types` | Exactly one type is `root` (with `rootKey`); every other type has a `parent` whose chain ends at a root. Path = `platform/<plural>/<name>/…` down the chain. Names and parents never change (D21). The root may also name a `canonicalKey` (camelCase, e.g. Kubernetes `kubeSystemUid`), the identity-bearing value the integration's discovery or permissionCheck task reports for the root; see "Canonical root key" under Discovery sync. A `canonicalKey` on a non-root type is a schema error. |
-| `credentialTypes` | Name prefix is the platform (`kubernetes/kubeconfig`), except `generic/*` and the platform-minted `runwhen/sync`. `materialize.env: {fromTaskVars: true}` means the task names the variables (`generic/env`). |
+| `credentialTypes` | Name prefix is the platform (`kubernetes/kubeconfig`), except `generic/*` and the platform-minted `runwhen/sync`. `materialize.env: {fromTaskVars: true}` means the task names the variables (`generic/env`). `materialize.nonSecret` (contracts-v5) lists the `env` names whose values are not secret: a non-empty, unique subset of the `env` list, so only with `env` as a list of names (not with `fromTaskVars`, not with `file`); validation reports a name that `env` does not list as `E_NON_SECRET_UNKNOWN`. Every other materialized value is secret and a `file` always is (see "Auth plan"). |
 | `credentialTypes` `content` | Optional token naming what the type's material is (`kubeconfig` for `kubernetes/kubeconfig`); used to match references (call F1). |
 | `authMethods` | Exactly one of `native` (`passthrough`, `in-cluster-token`) or `script`. `accepts` lists reference kinds and/or content tokens (call F1). `in-cluster-token` only produces a file-materialized type. |
 | `permissions` | `schema` is a JSON Schema for one permission in the source system's terms. Every task permission validates against it (INT-2). |
@@ -276,7 +277,9 @@ Retryability belongs to the code, never the instance. Platform-filled, never
 authored: `startedAt`, `finishedAt`, `truncated`, `dryRun`, `provenance` (plugin,
 version, task hash, archive, runtime digest, connection, runner; VER-6) and
 `logTail` (call F6). The runner scrubs every materialized credential value from
-outputs, errors, `logTail` and artifacts before they leave the pod.
+outputs, errors, `logTail` and artifacts before they leave the pod, except the
+`env` values whose name the credential type lists in `materialize.nonSecret`
+(contracts-v5; see "Auth plan").
 
 ## Lease
 
@@ -348,7 +351,8 @@ pinned when papi reconciles).
 method: `credentialType`, `reference`, the `method` (`native`, or `script {path,
 archive}` from the integration's plugin archive, which may differ from the
 task's plugin), resolved `inputs` (derived ones included) and the credential
-type's `materialize` target (for `generic/env`, the task's variables). Executors
+type's `materialize` target (for `generic/env`, the task's variables), `nonSecret` included
+when the type declares it (contracts-v5). Executors
 are warm pool pods with no per-task init container, so the plan runs before the
 task script where credentials already resolve (call F7): a **native** method in
 the runner (`Dispatcher.NextTask`), which hands the executor the result as
@@ -375,6 +379,17 @@ The script contract:
 | Inputs | `RW_AUTH_INPUT_<NAME>` |
 | Output | file types: write `RW_AUTH_OUT_FILE`; env types: `NAME=value` lines to `RW_AUTH_OUT_ENV` |
 | Failure | non-zero exit fails the task run before its script starts (`status: failed`); the auth script may write one `{code, message}` JSON line to `RW_AUTH_OUT_ERROR` (default `internal`, scope `auth`) |
+
+**Redaction** (contracts-v5). Every materialized value is secret unless its name is in
+the plan's `materialize.nonSecret`: the executor redacts each `materialized[].env` value
+and each file's content (and a script plan's produced file or `NAME=value` pairs) from
+the task's output, errors, `logTail` and artifacts, substring-matching any value of 8
+or more characters, except the `env` values of the names listed in `nonSecret` (`PGHOST`,
+`PGDATABASE=postgres`, `AWS_REGION`, `AZURE_SUBSCRIPTION_ID`, ... which would otherwise
+be mangled wherever they appear in output). Files are always secret, `nonSecret` only
+ever removes names, and it is by name: a string that is also a secret value anywhere in
+the same lease (another name, a file, a reference) stays redacted. A plan's `materialize`
+is `file`, `env`, or `env` with `nonSecret`; a plan with `file` and `nonSecret` is invalid.
 
 The runtime image has no `gcloud`. A kubeconfig an auth script writes for GKE must call
 `gke-gcloud-auth-plugin` with `--use_application_default_credentials` in its `exec.args`
@@ -551,3 +566,12 @@ Additive: no field was removed and every document that validated under
 | # | Change | Affects |
 |---|---|---|
 | V4-1 | Script auth plans get their reference material. `auth-plan.schema.json#/$defs/materializedCredential` gains an optional `reference: {files: [{key, content, encoding?}]}` (`key` = a secret's key, or `value`; `minItems` 1; strict), which excludes `files` and `env` in the same entry. The runner sends it on `/v1/tasks/next` for a plan whose method is a `script` and whose reference is a `k8s-secret`, `vault` or `file`; the SDK writes it to `$RW_AUTH_REF_DIR/<key>` for the auth script and keeps it until the task ends (see "Auth plan"). `rwtask serve` now runs script auth plans before the task script (`RW_AUTH_REF_DIR`, `RW_AUTH_INPUT_<NAME>`, `RW_AUTH_OUT_FILE` / `RW_AUTH_OUT_ENV`, `RW_AUTH_OUT_ERROR`), which is behaviour, not schema. | C (runner: send `reference`; CON-5 GKE auth), D (relay serves the auth archive), F (kubernetes `gke` auth script) |
+
+## Changes in contracts-v5
+
+Additive: no field was removed and every document that validated under
+`contracts-v4` still does, with the meaning it had (`$id`s stay `.../v1.json`).
+
+| # | Change | Affects |
+|---|---|---|
+| V5-1 | `materialize.nonSecret`. The executor redacts every materialized env value from task output, substring-matching any value of 8 or more characters, so non-secret variables destroyed the output they appear in (`PGDATABASE=postgres` turned every "postgres" into `***REDACTED***`; `AWS_REGION` and `AZURE_SUBSCRIPTION_ID` were mangled out of ARNs and canonical keys). `integration.schema.json` `credentialTypes.*.materialize` gains an optional `nonSecret`: an array of `envVarName` (`minItems` 1, `uniqueItems`), allowed only when `env` is the array form (`dependentSchemas`: requires `env`, `env` an array, no `file`), each name in the `env` list (`E_NON_SECRET_UNKNOWN`, a `rwtask validate` error: the schema cannot cross-reference). `auth-plan.schema.json` `materialize` (file XOR env until now, `maxProperties` 1) allows `env` with `nonSecret`: file alone, env alone or env with nonSecret, never file with nonSecret. papi copies the credential type's `materialize`, `nonSecret` included, into the plan. The executor (`rwtask serve`) leaves out of its redaction the `env` values whose name the credential type's plan lists, for a native plan (`materialized[].env`, the plan read from the lease `credentials[].authPlan`) and a script plan (`RW_AUTH_OUT_ENV` pairs). Files are always secret, and a value marked non-secret that is also a secret elsewhere in the lease stays redacted. A document without the field behaves as before. | B/C (papi copies `materialize` including `nonSecret` into plans; the runner passes the plan through and, for the native result it materializes, scrubs only the secret names), F (postgres, aws and azure mark their non-secret names) |

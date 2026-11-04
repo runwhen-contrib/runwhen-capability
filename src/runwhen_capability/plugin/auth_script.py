@@ -10,7 +10,8 @@ the task script, and hand back what it produced.
         redactor=Redactor([...]),
     )
     result.env      # variables to export to the task: the file type's path, or the script's pairs
-    result.secrets  # every produced value, for the envelope's redaction
+    result.secrets  # every produced secret value, for the envelope's redaction (not the
+                    # env values of the names in the plan's materialize.nonSecret)
 
 What the script sees is the frozen contract: `RW_AUTH_REF_DIR/<key>` (one file per reference
 key, 0600 in a 0700 directory; the variable is set, to an empty directory, when there is no
@@ -90,7 +91,8 @@ class AuthScriptError(Exception):
 class AuthResult:
     #: variable -> value to export to the task (the file's path, or the script's pairs)
     env: dict[str, str]
-    #: every value the script produced (file content, env values) for the redaction list
+    #: every secret value the script produced (file content, env values of the names the plan
+    #: does not list in `materialize.nonSecret`) for the redaction list
     secrets: list[str] = field(default_factory=list)
 
 
@@ -414,4 +416,7 @@ def run_script_plan(
             "internal", f"auth script {rel} exited 0 but wrote nothing to RW_AUTH_OUT_ENV"
         )
     pairs = _parse_env_lines(raw, rel, allowed_env, taken)
-    return AuthResult(pairs, [value for value in pairs.values() if value])
+    non_secret = set(materialize.get("nonSecret") or ())
+    return AuthResult(
+        pairs, [value for name, value in pairs.items() if value and name not in non_secret]
+    )

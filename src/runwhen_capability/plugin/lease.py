@@ -35,7 +35,10 @@ variables. The one exception is the platform-minted credential: a `files[].env` 
 `RW_SYNC_CREDENTIAL` in an entry whose credentialType is `runwhen/sync` (run.py
 PLATFORM_MINTED_FILE_ENV); the same name anywhere else, and every other RW_* name, is still
 refused. Every value, and every file's content (a minted credential's token too), is
-redacted from the envelope.
+redacted from the envelope, except the `env{}` values whose name the credential type's
+auth plan lists in `materialize.nonSecret` (contracts-v5; `authPlan` of the lease's
+`credentials[]` entry of that type): those are not secret and stay readable. A file is always
+secret, and a string that is secret anywhere else in the lease stays redacted everywhere.
 
 Credentials, script auth plans (contracts-v4). A `credentials[]` entry whose `authPlan.method`
 is a `script` is run here, before the task, by plugin/auth_script.py (its module docstring is
@@ -44,7 +47,8 @@ the task's) is loaded like the task's code, but asked of the relay by hash (`GET
 when it is not cached; the runner's `materialized[].reference` of the same credentialType is
 written to `$RW_AUTH_REF_DIR/<key>`; and what the script produces joins the task's environment
 (a file's path in `materialize.file.env`, or the `NAME=value` pairs) under the same reserved-name
-check and redaction as a materialized credential. A k8s-secret, vault or file reference without
+check and redaction as a materialized credential (minus the names in `materialize.nonSecret`).
+A k8s-secret, vault or file reference without
 reference material is `invalid_input`; any failure is an envelope with scope `auth` and the task
 script never starts. The auth script's directory (`auth-<n>/` in the task's) is deleted with the
 rest when the task ends, and the request's deadline (`deadline_s`) bounds the scripts and the task
@@ -67,7 +71,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -507,17 +511,39 @@ class _Materialized:
     allowed_env: frozenset[str] = frozenset()
     # credentialType -> reference material (key, content) for that type's script auth plan
     references: dict[str, list[tuple[str, bytes]]] = field(default_factory=dict)
+    # the names of `env` that the credential type's plan lists in materialize.nonSecret
+    non_secret: frozenset[str] = frozenset()
 
 
-def _parse_materialized(items: Sequence[Any]) -> _Materialized:
+def _non_secret_names(lease: dict) -> dict[str, frozenset[str]]:
+    """credentialType -> the env names its auth plan's `materialize.nonSecret` lists
+    (contracts-v5); a type without any is absent."""
+    out: dict[str, frozenset[str]] = {}
+    for entry in lease.get("credentials", []):
+        plan = entry.get("authPlan") if isinstance(entry, dict) else None
+        names = ((plan or {}).get("materialize") or {}).get("nonSecret")
+        if names:
+            out[plan["credentialType"]] = frozenset(names)
+    return out
+
+
+def _parse_materialized(
+    items: Sequence[Any], non_secret: Mapping[str, Collection[str]] | None = None
+) -> _Materialized:
     """The `materialized[]` of the poll response, checked against materializedCredential.
-    Raises LeaseError(invalid_input) naming the entry and the problem, never a value."""
+    Raises LeaseError(invalid_input) naming the entry and the problem, never a value.
+
+    Every materialized value is secret (added to `secrets`) except the env values whose name
+    the credential type's plan lists in `non_secret[credentialType]` (`materialize.nonSecret`).
+    Files always are. A non-secret value is only left out of `secrets`; if the same string is
+    a secret elsewhere (another name, a file) it is in `secrets` through that one."""
     env_pattern = re.compile(schema("common")["$defs"]["envVarName"]["pattern"])
     files: dict[str, tuple[bytes, int]] = {}
     env: dict[str, str] = {}
     secrets: list[str] = []
     allowed: set[str] = set()
     references: dict[str, list[tuple[str, bytes]]] = {}
+    open_names: set[str] = set()
 
     def bad(index: int, problem: str) -> LeaseError:
         return LeaseError("invalid_input", f"materialized[{index}]: {problem}")
@@ -586,8 +612,13 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
         for name, value in env_pairs.items():
             claim(index, name)
             env[name] = value
-            secrets.append(value)
-    return _Materialized(files, env, [x for x in secrets if x], frozenset(allowed), references)
+            if name in (non_secret or {}).get(item["credentialType"], ()):
+                open_names.add(name)
+            else:
+                secrets.append(value)
+    return _Materialized(
+        files, env, [x for x in secrets if x], frozenset(allowed), references, frozenset(open_names)
+    )
 
 
 def _parse_reference(
@@ -720,8 +751,9 @@ def _run_valid_lease(
         extra_env: dict[str, str] = {}
         redact = [v for v in credentials.values() if v]
         kubeconfig = _kubeconfig_value(doc, credentials)
-        parsed = _parse_materialized(materialized)
+        parsed = _parse_materialized(materialized, _non_secret_names(doc))
         redact.extend(parsed.secrets)
+        non_secret_env = set(parsed.non_secret)
         plans = _script_plans(doc)
         _check_reference_material(plans, parsed)
         if kubeconfig or parsed.files or plans:
@@ -742,6 +774,7 @@ def _run_valid_lease(
                 task_dir=task_dir,
                 extra_env=extra_env,
                 redact=redact,
+                non_secret_env=non_secret_env,
                 relay=relay,
                 archive_cache=archive_cache,
                 remaining=lambda: None if deadline_s is None else deadline_s - elapsed(),
@@ -771,6 +804,7 @@ def _run_valid_lease(
             scope_dir=scope_dir,
             extra_env=extra_env,
             allow_env=parsed.allowed_env,
+            non_secret_env=non_secret_env,
             redact=redact,
             artifact_uploader=uploader,
             log=log,
@@ -822,13 +856,15 @@ def _run_script_plans(
     task_dir: Path,
     extra_env: dict[str, str],
     redact: list[str],
+    non_secret_env: set[str],
     relay: RelayClient | None,
     archive_cache: Path | None,
     remaining: Callable[[], float | None],
     log: logging.Logger,
 ) -> None:
     """Runs each script plan (plugin/auth_script.py) before the task script and adds what it
-    produced to `extra_env` and its values to `redact`. Raises LeaseError (scope `auth`)
+    produced to `extra_env`, its secret values to `redact` and the names its plan lists in
+    `materialize.nonSecret` to `non_secret_env`. Raises LeaseError (scope `auth`)
     for the first plan that fails: the task script then never runs. Each plan gets
     `<task_dir>/auth-<n>/`, which the caller deletes with the task's directory."""
     for number, plan in enumerate(plans):
@@ -860,6 +896,7 @@ def _run_script_plans(
             raise LeaseError(exc.code, exc.message, exc.scope) from None
         extra_env.update(result.env)
         redact.extend(result.secrets)
+        non_secret_env.update(set(result.env) & set(plan["materialize"].get("nonSecret", ())))
 
 
 def _task_secrets_dir(root: Path) -> Path:

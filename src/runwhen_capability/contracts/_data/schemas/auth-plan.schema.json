@@ -101,11 +101,43 @@
           },
           "minItems": 1,
           "uniqueItems": true
+        },
+        "nonSecret": {
+          "type": "array",
+          "items": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "names from `env` whose values are not secret, so the executor does not redact them from task output (contracts-v5). Copied from the credential type's `materialize`; every other materialized value is secret, and a `file` always is."
         }
       },
       "additionalProperties": false,
       "minProperties": 1,
-      "maxProperties": 1
+      "maxProperties": 2,
+      "dependentSchemas": {
+        "nonSecret": {
+          "required": [
+            "env"
+          ]
+        },
+        "file": {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "env"
+                ]
+              },
+              {
+                "required": [
+                  "nonSecret"
+                ]
+              }
+            ]
+          }
+        }
+      }
     }
   },
   "required": [
