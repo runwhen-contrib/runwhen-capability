@@ -133,6 +133,26 @@ What a script sees (the runner and `rwtask run` set the same names):
 | Reference time | `ctx.now()` (aware UTC `datetime`) | `$RW_NOW` (`2026-11-04T09:14:02.123Z`), `$RW_NOW_EPOCH` (integer seconds) |
 | Outputs | the returned dict; `ctx.error(code, msg, scope=, hint=, details=)`; `raise RwError(code, msg)` | `rw_output_append <name> <json>`; `rw_output_set <name> <json>`; `rw_error <code> <msg> [scope]`; files in `$RW_OUT` |
 | Files | `$RW_OUT` (scratch and artifact files), `$RW_LIB_DIR` | `$RW_OUT`, `$RW_LIB_DIR` |
+| HTTP through the API server's pod/service proxy | `ctx.k8s_proxy_get(namespace, "pods"\|"services", name, port, path, scheme="http", timeout=30)` returns `{status, headers, body, truncated, location}` | `rw_k8s_proxy_get <namespace> <pods\|services> <name> <port> <path> [--scheme https] [--timeout N]` prints that object as one JSON line |
+
+**Proxied HTTP GETs (`ctx.k8s_proxy_get`, `rw_k8s_proxy_get`).** Use these, never
+`kubectl get --raw /api/v1/namespaces/<ns>/{pods,services}/<name>:<port>/proxy/<path>`:
+`kubectl get --raw` through the proxy follows a backend's 301/302/307, and when the `Location`
+is absolute and names another host client-go re-sends the runner's `Authorization: Bearer`
+token to it, so a probed pod or an SSO redirect can capture the credential (security finding
+S17). The helper runs `kubectl proxy` on a loopback port for the call and reads through it with
+a client that sends no credential and never follows a redirect. The answer is the backend's own
+`status`, lowercased `headers` and `body` (text; 4 MiB at most, `truncated` says it was cut),
+also for a 404 or 503, which are data. `location` is the redirect target only when it is a
+relative path or points back into the same proxy path; for any other target it is `null`, the
+`location` header is removed and `x-rw-redirect-dropped: <host>` is added, so a skill can
+report that the backend redirected elsewhere. Errors are `RwError`s with a D64 code
+(`dependency`: no kubectl; `unreachable`; `timeout`; `invalid_input`; `permission_denied` only
+when the API server itself answers 401/403 with a `Status` object, since the backend's own 403 is
+data). `kind` is `pods` or `services`, `port` a number or a port name, `path` relative to the
+backend's root (a `?query` is kept; `..` segments are refused). `KUBECONFIG` is the task's
+environment, as for `kubectl`. `rwtask test` records the call as `type: k8s-proxy-get` and
+replays it without starting a proxy.
 
 **`RW_TASK_CONTRACT=v13`** is how a script tells the V13 contract from a classic
 bundle's, and both the runner and `rwtask run` set it. Under it `ctx.run` raises
@@ -162,6 +182,7 @@ the helpers without sourcing anything.
 | `rw_error <code> <msg> [scope]` | record a structured error (`code` is one of the closed list under Result envelope) and carry on; a clean exit with errors is `partial`, the exit status alone decides `failed` |
 | `rw_skip [reason]` | end the task `skipped`, exit 0 |
 | `rw_artifact <name> <path>` | register a file as an artifact output (or write it to `$RW_OUT/<name>`) |
+| `rw_k8s_proxy_get <ns> <pods\|services> <name> <port> <path> [--scheme https] [--timeout N]` | GET through the API server's proxy, never following a redirect; prints `{status, headers, body, truncated, location}` as one JSON line; on failure records the error itself (as `rw_error` does) and exits non-zero |
 
 `$RW_OUT` is a directory fresh for this task, free to write to; the file named
 after an artifact output is what the platform stores. `$RW_LIB_DIR` is the

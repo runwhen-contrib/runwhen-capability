@@ -20,7 +20,7 @@ Static codes (validate() only, no execution):
 - E_EFFECTS_REQUIRED -- a task that isn't readOnly declares no effects.
 - E_UNKNOWN_SDK_HELPER -- a bash task calls an `rw_*` command rw.sh doesn't define
   (only rw_input, rw_append, rw_set, rw_skip, rw_artifact, rw_output_append,
-  rw_output_set and rw_error exist) and the
+  rw_output_set, rw_error and rw_k8s_proxy_get exist) and the
   script doesn't define itself. An authoring gate: the bundle host ignores it at run time.
 - E_SCHEMA_FEATURE -- a schema uses a JSON Schema feature custom tasks may not
   use (regex keywords: `pattern`, `patternProperties`).

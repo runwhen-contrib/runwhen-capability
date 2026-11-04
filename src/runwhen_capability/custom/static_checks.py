@@ -587,16 +587,17 @@ RW_SH_HELPERS = (
     "rw_output_append",
     "rw_output_set",
     "rw_error",
+    "rw_k8s_proxy_get",
 )
 
 # An rw_* word in command position: _COMMAND_START, plus a backtick
 # substitution. Not followed by `=`/`+=` (an assignment to a variable that
 # happens to start with rw_) or by a word character.
 _RW_COMMAND_RE = re.compile(
-    r"(?m)(?:" + _COMMAND_START + r"|`[ \t]*)\b(rw_[a-z_]+)(?![A-Za-z0-9_]|\+?=)"
+    r"(?m)(?:" + _COMMAND_START + r"|`[ \t]*)\b(rw_[a-z0-9_]+)(?![A-Za-z0-9_]|\+?=)"
 )
 _RW_FUNCTION_DEF_RE = re.compile(
-    r"(?m)^[ \t]*(?:function[ \t]+(rw_[a-z_]+)\b|(rw_[a-z_]+)[ \t]*\(\s*\))"
+    r"(?m)^[ \t]*(?:function[ \t]+(rw_[a-z0-9_]+)\b|(rw_[a-z0-9_]+)[ \t]*\(\s*\))"
 )
 
 

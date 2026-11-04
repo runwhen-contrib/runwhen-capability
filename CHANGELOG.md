@@ -7,6 +7,22 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `ctx.k8s_proxy_get(namespace, kind, name, port, path, *, scheme="http", timeout=30)` and bash
+  `rw_k8s_proxy_get <namespace> <pods|services> <name> <port> <path> [--scheme https] [--timeout N]`
+  (`runwhen_capability/k8s_proxy.py`, security finding S17): a GET through the Kubernetes API
+  server's pod/service proxy that never follows a redirect. `kubectl get --raw .../proxy/...`
+  follows a backend's 301/302/307 and re-sends the runner's bearer token to an absolute
+  `Location` on another host. The helper runs `kubectl proxy --port=0 --address=127.0.0.1` in its
+  own process group for the call (stopped with SIGTERM, then SIGKILL after 2 s), reads through it
+  with a no-redirect client that sends no credential, and returns `{status, headers, body,
+  truncated, location}`: the backend's status and body (also for 4xx/5xx), `location` only for a
+  relative target or one into the same proxy path, otherwise `null` with an
+  `x-rw-redirect-dropped: <host>` header. Errors carry D64 codes (`dependency`, `unreachable`,
+  `timeout`, `invalid_input`, `permission_denied` for the API server's own 401/403 `Status`).
+  The bash helper runs `$RW_PYTHON -m runwhen_capability.k8s_proxy get ...` (the host now sets
+  `RW_PYTHON` for bash tasks), prints one JSON line and, on failure, records the error in
+  `$RW_ERRORS_FILE` and exits non-zero. It is in `RW_SH_HELPERS`, so `rwtask validate` knows it,
+  and the unknown-helper check now reads helper names with digits (`rw_k8s_...`).
 - `rwtask serve` runs script auth plans before the task script (lane C's CON-5, GKE auth): for each
   lease `credentials[]` entry whose `authPlan.method` is a `script`, `plugin/auth_script.py` reads
   the plan's archive (fetched through the relay by hash when not cached: `RelayClient.open_code(sha256)`

@@ -1334,6 +1334,9 @@ def _execute(
             "RW_SDK": str(rw_sdk_dir),
             # command_not_found_handle (E_COMMAND_NOT_FOUND), read before the task runs.
             "BASH_ENV": str(rw_sdk_dir / "bash_env.sh"),
+            # The interpreter that has this SDK, for rw.sh's `rw_k8s_proxy_get`
+            # (`python3 -m runwhen_capability.k8s_proxy`), whatever python3 is on PATH.
+            "RW_PYTHON": sys.executable,
         }
         for name, value in resolved_inputs.items():
             text = value if isinstance(value, str) else json.dumps(value)

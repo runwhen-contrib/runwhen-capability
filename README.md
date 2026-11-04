@@ -54,6 +54,13 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
 - `Context` is the task's only boundary: `ctx.credential(name)`, `ctx.run(argv)` (bounded output,
   timeouts, process-group kill), `ctx.artifacts`, `ctx.git`, `ctx.sarif`, `ctx.findings`,
   `ctx.repo_fs`, `ctx.workdir`, `ctx.log`.
+- To read a pod's or service's HTTP API through the Kubernetes API server's proxy, use
+  `ctx.k8s_proxy_get(namespace, "pods" | "services", name, port, path, scheme="http", timeout=30)`
+  (bash: `rw_k8s_proxy_get`), not `kubectl get --raw .../proxy/...`: kubectl follows a backend's
+  redirect to another host and sends the runner's bearer token there (S17). The helper returns
+  `{status, headers, body, truncated, location}`, never follows a redirect (a redirect to another
+  host comes back as the 3xx with `location: None` and an `x-rw-redirect-dropped` header), and
+  returns the backend's 4xx and 5xx as data; `rwtask test` records and replays it.
 - Each task ends `ok`, `failed` (it raised; `error` says why) or `skipped` (it raised
   `SkipTask(reason)`; `reason` says why). Either way the rest of the request still runs. Only
   tasks can skip: a setup that raises `SkipTask` has failed.
