@@ -1,9 +1,9 @@
-# V13 plugins contracts (contracts-v5)
+# V13 plugins contracts (contracts-v6)
 
 Every seam between the lanes of the V13 plugins program, frozen at M0 (`contracts-v1`)
-and extended additively in `contracts-v2`, `contracts-v3`, `contracts-v4` and `contracts-v5` (see [Changes in contracts-v2](#changes-in-contracts-v2),
+and extended additively in `contracts-v2`, `contracts-v3`, `contracts-v4`, `contracts-v5` and `contracts-v6` (see [Changes in contracts-v2](#changes-in-contracts-v2),
 [Changes in contracts-v3](#changes-in-contracts-v3), [Changes in contracts-v4](#changes-in-contracts-v4),
-[Changes in contracts-v5](#changes-in-contracts-v5)). The
+[Changes in contracts-v5](#changes-in-contracts-v5), [Changes in contracts-v6](#changes-in-contracts-v6)). The
 schemas in [`contracts/`](contracts/) are normative; this page says what they
 cannot: who produces and consumes each document, the rules that are not
 expressible in JSON Schema, and the calls made at freeze.
@@ -18,11 +18,11 @@ Design source: the V13 wiki ([skill spec](https://wiki.sdlc.shared.runwhen.com/#
 ## Using the contracts
 
 ```bash
-pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v5"
+pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v6"
 ```
 
-The `contracts-v5` tag is pending: until it exists, pin the commit
-(`@<sha>`, the `v13/plugins` merge commit that introduced contracts-v5) in place of `@contracts-v5`.
+The `contracts-v6` tag is pending: until it exists, pin the commit
+(`@<sha>`, the `v13/plugins-m2` merge commit that introduced contracts-v6) in place of `@contracts-v6`.
 
 ```python
 from runwhen_capability.contracts import archive, check, load_yaml, validate
@@ -604,3 +604,14 @@ Additive: no field was removed and every document that validated under
 | # | Change | Affects |
 |---|---|---|
 | V5-1 | `materialize.nonSecret`. The executor redacts every materialized env value from task output, substring-matching any value of 8 or more characters, so non-secret variables destroyed the output they appear in (`PGDATABASE=postgres` turned every "postgres" into `***REDACTED***`; `AWS_REGION` and `AZURE_SUBSCRIPTION_ID` were mangled out of ARNs and canonical keys). `integration.schema.json` `credentialTypes.*.materialize` gains an optional `nonSecret`: an array of `envVarName` (`minItems` 1, `uniqueItems`), allowed only when `env` is the array form (`dependentSchemas`: requires `env`, `env` an array, no `file`), each name in the `env` list (`E_NON_SECRET_UNKNOWN`, a `rwtask validate` error: the schema cannot cross-reference). `auth-plan.schema.json` `materialize` (file XOR env until now, `maxProperties` 1) allows `env` with `nonSecret`: file alone, env alone or env with nonSecret, never file with nonSecret. papi copies the credential type's `materialize`, `nonSecret` included, into the plan. The executor (`rwtask serve`) leaves out of its redaction the `env` values whose name the credential type's plan lists, for a native plan (`materialized[].env`, the plan read from the lease `credentials[].authPlan`) and a script plan (`RW_AUTH_OUT_ENV` pairs). Files are always secret, and a value marked non-secret that is also a secret elsewhere in the lease stays redacted. A document without the field behaves as before. | B/C (papi copies `materialize` including `nonSecret` into plans; the runner passes the plan through and, for the native result it materializes, scrubs only the secret names), F (postgres, aws and azure mark their non-secret names) |
+
+## Changes in contracts-v6
+
+Additive: no route, field or code was removed, and every request and response that was valid
+under `contracts-v5` still is, with the meaning it had. Only `registry-api.openapi.yaml`
+changed; the JSON Schemas did not.
+
+| # | Change | Affects |
+|---|---|---|
+| V6-1 | Registry API addendum (lane D, M4; plugin-registry#6 @482f0d6). New routes: `POST /v1/sources/{id}:publish?message=` (tar or gzip plugin tree; 201 `IndexEntry` for a new version, 200 for an idempotent retry of the same content) and `POST /v1/sources/{id}:draft?branch=&message=` (201 `DraftResult {source, branch, commit, path, changed}`; a missing branch is created at the base tip even when nothing changed). Both accept only a source with a `write:` config. A tree that carries none of what the archive leaves out (root `tests/`, `runwhen.lock`, `.runwhen/`, `skills/*/tests/`) keeps those from the branch; one that carries any of it is authoritative for the whole directory. New problem codes: `E_BUSY` (409: another export, import or source write is running, or too many uploads), `E_INVALID_SNAPSHOT` (422: malformed snapshot layout or manifest), `E_BRANCH_MOVED` (409: the branch moved twice during a publish), `E_WRITE_DISABLED` (403: no `write:` config). `Source.kind` gains `snapshot` (`SourceRef.kind` had it). `/v1/snapshot` documents 404 (unknown `plugin=`) and 409 `E_BUSY`; `/v1/import` documents 413. `latestOnly` follows the index's `latest` rule (newest release, else newest prerelease). A snapshot's `runtimes.json` holds git-published runtimes only, in the `/v1/runtimes` item shape with upstream refs (`mirrored: false`). Imported versions carry `source.kind = snapshot`, `id = snapshot`, and keep the exporter's repo, tag and commit as sanitised provenance; `snapshot.json` `source` is informational. | B (papi registry client: new codes, `snapshot` kind), D (server, already shipped), E/G (publish and draft from the builder and UI, if used) |
+
