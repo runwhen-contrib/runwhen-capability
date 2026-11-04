@@ -7,6 +7,16 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- **The runner's attempt token (`X-RW-Dispatch`) is echoed on result, artifact and code requests
+  (lane C, runner#112)** (`runwhen_capability/relay.py`, `serve.py`, `models.py`): the `POST
+  /v1/tasks/next` answer may carry `dispatch`, a decimal uint64 string naming this attempt
+  (`TaskHostRequest.dispatch`, via `models.parse_dispatch`). It is kept for the request's whole
+  life and sent as `X-RW-Dispatch: <dispatch>` on `POST .../result`, `PUT .../artifacts/{name}`,
+  `GET .../artifacts/in/{input}` and `GET .../code` (plain, and `?sha256=` for another plugin's or
+  an auth script's archive); `relay.task_headers` builds the headers of every one of them, so a new
+  route cannot forget it. An absent or invalid `dispatch` (an older runner; `abc`, `-1`, empty, over
+  2**64-1) is None: no header is sent and the task is not failed. The value is only ever logged at
+  debug.
 - **contracts-v6: registry API addendum (lane D, M4)** (`contracts/registry-api.openapi.yaml`): `POST
   /v1/sources/{id}:publish` and `:draft`, problem codes `E_BUSY`, `E_INVALID_SNAPSHOT`,
   `E_BRANCH_MOVED`, `E_WRITE_DISABLED`, `Source.kind: snapshot`, and the snapshot/import semantics,
