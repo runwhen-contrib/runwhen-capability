@@ -60,7 +60,8 @@ run (the envelope carries the lease's provenance when the lease is valid). Other
 validated against the `lease` contract and run through the same child runner as a bundle,
 in its own scope, which is always wiped. The poll response's
 `materialized[]` (secret files and variables the runner produced) is written under
-`$RW_CREDENTIALS_DIR`, exported to the task and deleted at its end. The result POSTed is
+`$RW_CREDENTIALS_DIR`, exported to the task and deleted at its end; a lease credential whose
+auth plan is a script runs it first (plugin/auth_script.py). The result POSTed is
 `{"status": "ok", "result": <the bare D64 result envelope>}` -- not the classic
 `{version, setup, tasks}` -- including when the envelope's own status is `failed`;
 `status: failed` is only for a request this executor could not process at all.

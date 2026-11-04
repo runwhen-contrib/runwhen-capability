@@ -1,0 +1,5 @@
+# expect: /reference/files/0/key does not match
+credentialType: kubernetes/kubeconfig
+reference:
+  files:
+    - { key: ../escape, content: "x" }

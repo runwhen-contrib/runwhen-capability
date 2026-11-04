@@ -1,8 +1,8 @@
-# V13 plugins contracts (contracts-v3)
+# V13 plugins contracts (contracts-v4)
 
 Every seam between the lanes of the V13 plugins program, frozen at M0 (`contracts-v1`)
-and extended additively in `contracts-v2` and `contracts-v3` (see [Changes in contracts-v2](#changes-in-contracts-v2),
-[Changes in contracts-v3](#changes-in-contracts-v3)). The
+and extended additively in `contracts-v2`, `contracts-v3` and `contracts-v4` (see [Changes in contracts-v2](#changes-in-contracts-v2),
+[Changes in contracts-v3](#changes-in-contracts-v3), [Changes in contracts-v4](#changes-in-contracts-v4)). The
 schemas in [`contracts/`](contracts/) are normative; this page says what they
 cannot: who produces and consumes each document, the rules that are not
 expressible in JSON Schema, and the calls made at freeze.
@@ -17,11 +17,11 @@ Design source: the V13 wiki ([skill spec](https://wiki.sdlc.shared.runwhen.com/#
 ## Using the contracts
 
 ```bash
-pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v3"
+pip install "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@contracts-v4"
 ```
 
-The `contracts-v3` tag is pending: until it exists, pin the commit
-(`@<sha>`, the head of the `lane-a/contracts-v3` branch) in place of `@contracts-v3`.
+The `contracts-v4` tag is pending: until it exists, pin the commit
+(`@<sha>`, the `v13/plugins` merge commit that introduced contracts-v4) in place of `@contracts-v4`.
 
 ```python
 from runwhen_capability.contracts import archive, check, load_yaml, validate
@@ -319,14 +319,22 @@ the runner (`Dispatcher.NextTask`), which hands the executor the result as
 `materialized[]` on `/v1/tasks/next` (`auth-plan.schema.json#/$defs/materializedCredential`);
 a **script** method in the executor as an SDK pre-step. The SDK writes files
 under `$RW_CREDENTIALS_DIR` (a memory-backed emptyDir), mode 0600, and deletes
-them when the task ends; nothing is cached across task runs. The script
-contract:
+them when the task ends; nothing is cached across task runs. For a script
+method the runner also sends the credential reference's material (it holds the
+secret; the executor never reads a secret store) as `materialized[].reference`
+(`{files: [{key, content, encoding?}]}`, `key` = the secret's key, or `value`
+for one unnamed value; contracts-v4), an entry of its own that carries no
+`files` or `env`. The SDK writes each file to `$RW_AUTH_REF_DIR/<key>`
+(directory 0700, files 0600, per task) and keeps them until the task ends, then
+deletes them: the produced credential may point at them (a GKE kubeconfig's
+`exec` entry with `GOOGLE_APPLICATION_CREDENTIALS=$RW_AUTH_REF_DIR/key.json`).
+The script contract:
 
 | | |
 |---|---|
 | Runs in | the executor, in the task's runtime image (which ships `gke-gcloud-auth-plugin`, `aws`, `kubelogin`), before the task script; working dir = the integration's plugin root |
 | Interpreter | by extension: `.py` → `python3`, `.sh` → `bash` with `set -euo pipefail` |
-| Reference | `RW_AUTH_REF_DIR/<key>` per key of a secret/vault/file reference (`value` when it has one unnamed value); nothing for `in-cluster-sa` (standard SA mount) or `cloud-identity` (ambient) |
+| Reference | `RW_AUTH_REF_DIR/<key>` per key of a secret/vault/file reference (`value` when it has one unnamed value), written from `materialized[].reference` and kept until the task ends; nothing for `in-cluster-sa` (standard SA mount) or `cloud-identity` (ambient). A k8s-secret, vault or file reference without `materialized[].reference` fails the task `invalid_input` |
 | Inputs | `RW_AUTH_INPUT_<NAME>` |
 | Output | file types: write `RW_AUTH_OUT_FILE`; env types: `NAME=value` lines to `RW_AUTH_OUT_ENV` |
 | Failure | non-zero exit fails the task run before its script starts (`status: failed`); the auth script may write one `{code, message}` JSON line to `RW_AUTH_OUT_ERROR` (default `internal`, scope `auth`) |
@@ -492,3 +500,12 @@ Additive: no field was removed and every document that validated under
 |---|---|---|
 | V2-3 | Canonical root key. `types.yaml`: a root type may declare `canonicalKey: <camelName>` (Kubernetes: `kubeSystemUid`); on a non-root type it is a schema error. `common.schema.json#/$defs/rootIdentity` is `{canonicalKey: {name, value}}`; `rw.discovery.summary.v1` and `rw.access.v1` each gain an optional top-level `root` of that shape. papi re-keys the root to `<name>=<value>`; if another root holds that key, it re-points the reporting connection and marks its own old root `superseded` (no automatic subtree merge). Compile carries `canonicalKey` through in `integration.definition`; no semantic check beyond the schema. Settles F21. | C (papi root dedupe), F (kubernetes discover and check-permissions report it) |
 | V3-1 | A skill's `skills/<skill>/tests/**` is dev-only and never packaged, like the root `tests/`, `runwhen.lock` and `.runwhen/`: `rwtask compile` and `rwtask pull` drop it (silently; not in the archive nor `skills[].files`; it stays an allowed authoring path), `rwtask test` reads fixtures from the plugin directory, and `rwtask validate` warns `W_SCRIPT_READS_TESTS` when a script or `lib/` file mentions a `tests/` path. archive.md section 2 and 3a say so. The registry must apply the same exclusion when it builds or re-normalises an archive, or the sha256 differs between builders. | D (registry ingest, upload re-normalisation), F (runwhen-plugins skill authors) |
+
+## Changes in contracts-v4
+
+Additive: no field was removed and every document that validated under
+`contracts-v3` still does (`$id`s stay `.../v1.json`).
+
+| # | Change | Affects |
+|---|---|---|
+| V4-1 | Script auth plans get their reference material. `auth-plan.schema.json#/$defs/materializedCredential` gains an optional `reference: {files: [{key, content, encoding?}]}` (`key` = a secret's key, or `value`; `minItems` 1; strict), which excludes `files` and `env` in the same entry. The runner sends it on `/v1/tasks/next` for a plan whose method is a `script` and whose reference is a `k8s-secret`, `vault` or `file`; the SDK writes it to `$RW_AUTH_REF_DIR/<key>` for the auth script and keeps it until the task ends (see "Auth plan"). `rwtask serve` now runs script auth plans before the task script (`RW_AUTH_REF_DIR`, `RW_AUTH_INPUT_<NAME>`, `RW_AUTH_OUT_FILE` / `RW_AUTH_OUT_ENV`, `RW_AUTH_OUT_ERROR`), which is behaviour, not schema. | C (runner: send `reference`; CON-5 GKE auth), D (relay serves the auth archive), F (kubernetes `gke` auth script) |

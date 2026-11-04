@@ -7,6 +7,27 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `rwtask serve` runs script auth plans before the task script (lane C's CON-5, GKE auth): for each
+  lease `credentials[]` entry whose `authPlan.method` is a `script`, `plugin/auth_script.py` reads
+  the plan's archive (fetched through the relay by hash when not cached: `RelayClient.open_code(sha256)`
+  asks `GET /v1/tasks/{id}/code?sha256=sha256:<hex>`, same size/hash checks; proposed to the runner),
+  writes `materialized[].reference` to `$RW_AUTH_REF_DIR/<key>`, and runs `integration/<path>`
+  (`.py` under `python3`, `.sh` under `bash -euo pipefail`; working directory = the plugin root) with
+  `RW_AUTH_INPUT_<NAME>`, `RW_AUTH_OUT_FILE` (file types) or `RW_AUTH_OUT_ENV` (env types: `NAME=value`
+  lines, names limited to the plan's `materialize.env`) and `RW_AUTH_OUT_ERROR` (one `{code, message}`
+  line, code from the D64 set), under the child runner's discipline (host-only and RW_* variables
+  stripped, private HOME, own process group, a timeout of min(60s, the request's remaining deadline)).
+  The produced file (mode `materialize.file.mode`) or variables are exported to the task and redacted
+  with the reference material; stdout/stderr are never task output. A missing reference for a
+  k8s-secret, vault or file reference is `invalid_input`; a script failure is the script's own code
+  or `internal`/`timeout`, scope `auth`, and the task script never runs. Everything is deleted when the
+  task ends. `RW_AUTH_*` never reaches the task.
+- contracts-v4 (tag pending): `auth-plan.schema.json#/$defs/materializedCredential` gains an optional
+  `reference: {files: [{key, content, encoding?}]}`, the reference material a script auth plan's
+  script reads from `$RW_AUTH_REF_DIR/<key>`; an entry with `reference` has no `files` or `env`.
+  CONTRACTS.md "Auth plan" and "Changes in contracts-v4" (V4-1) say so; generated models and the
+  packaged copy follow. `tests/contracts` fixtures may now be one `$defs` entry of their schema
+  (`examples/auth-plan/materialized/`).
 - A skill's `skills/<skill>/tests/**` (recorded fixtures) is dev-only and never packaged (lane F),
   exactly like the root `tests/`, `runwhen.lock` and `.runwhen/`. `load_entries` / `load_dir`
   (so `rwtask compile` and `rwtask validate`) and `rwtask pull`'s git path drop it silently: not in

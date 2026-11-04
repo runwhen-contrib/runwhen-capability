@@ -159,13 +159,77 @@
           "propertyNames": {
             "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
           }
+        },
+        "reference": {
+          "type": "object",
+          "properties": {
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 253,
+                    "pattern": "^[A-Za-z0-9._-]+$",
+                    "not": {
+                      "enum": [
+                        ".",
+                        ".."
+                      ]
+                    },
+                    "description": "the reference's secret key (a vault key, a file name), or `value` for one unnamed value; it becomes the file name under RW_AUTH_REF_DIR"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "encoding": {
+                    "enum": [
+                      "utf-8",
+                      "base64"
+                    ]
+                  }
+                },
+                "required": [
+                  "key",
+                  "content"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1
+            }
+          },
+          "required": [
+            "files"
+          ],
+          "additionalProperties": false,
+          "description": "script auth plans only: the credential reference's material, which the executor writes to RW_AUTH_REF_DIR/<key> for the auth script (and keeps until the task ends). Not combined with `files` or `env`, which are a native plan's result."
         }
       },
       "required": [
         "credentialType"
       ],
       "additionalProperties": false,
-      "description": "runner -> executor (`/v1/tasks/next` `materialized[]`): the result of a native plan. Secret; never logged, never leaves the pod."
+      "description": "runner -> executor (`/v1/tasks/next` `materialized[]`): the result of a native plan (`files`, `env`), or the reference material a script plan reads (`reference`). Secret; never logged, never leaves the pod.",
+      "dependentSchemas": {
+        "reference": {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "files"
+                ]
+              },
+              {
+                "required": [
+                  "env"
+                ]
+              }
+            ]
+          }
+        }
+      }
     }
   }
 }

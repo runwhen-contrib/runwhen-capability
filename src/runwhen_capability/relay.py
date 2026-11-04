@@ -372,14 +372,17 @@ class RelayClient:
                     self._raise_for(resp)
         return InputStream(resp, input)
 
-    def open_code(self) -> InputStream:
+    def open_code(self, sha256: str | None = None) -> InputStream:
         """Opens the request's plugin code archive (`GET .../code`) for streaming,
-        as an InputStream the caller reads and must close. Failures are as in
-        `open_input`; a 404 (the lease has no `code.archive`) is
+        as an InputStream the caller reads and must close. With `sha256`
+        (`sha256:<hex>`) it asks for that archive instead (`?sha256=`): another
+        plugin's archive the lease names, an auth script's. Failures are as in
+        `open_input`; a 404 (the lease has no `code.archive`, or no such archive) is
         ArtifactUndeclaredError."""
         with _transport_errors("downloading the code archive"):
             resp = self.session.get(
                 self._url("code"),
+                params={"sha256": sha256} if sha256 else None,
                 headers=self._auth(),
                 stream=True,
                 timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
