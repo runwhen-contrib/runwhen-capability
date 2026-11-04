@@ -306,3 +306,147 @@ def test_the_reference_time_does_not_leak_into_the_environment(monkeypatch):
     monkeypatch.delenv("RW_NOW_EPOCH", raising=False)
     with make_context(now=datetime(2026, 11, 4, tzinfo=UTC)):
         assert "RW_NOW" not in os.environ and "RW_NOW_EPOCH" not in os.environ
+
+
+# -- stubbing ctx.k8s_proxy_get --------------------------------------------------------------
+
+HEALTH_REQUEST = {
+    "namespace": "web",
+    "kind": "services",
+    "name": "vault",
+    "port": 8200,
+    "path": "/v1/sys/health",
+}
+
+
+def proxy_main(ctx):
+    """A script that probes twice and records what the helper said."""
+    first = ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health")
+    second = ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/seal-status", timeout=5)
+    return {"statuses": [first["status"], second["status"]], "body": first["body"]}
+
+
+def test_k8s_proxy_get_is_answered_from_declared_calls_in_order_without_a_proxy():
+    calls = [
+        {"request": HEALTH_REQUEST, "response": {"status": 200, "body": '{"sealed":false}'}},
+        {
+            "request": {**HEALTH_REQUEST, "path": "/v1/sys/seal-status", "scheme": "http"},
+            "response": {"status": 503, "headers": {"x": "y"}, "truncated": True},
+        },
+    ]
+    with _tc() as tc:
+        proxy = stub_commands(tc, k8s_proxy_get=calls)
+        env = run_main(proxy_main, tc)
+        assert [r["path"] for r in tc.k8s_proxy_requests] == [
+            "/v1/sys/health",
+            "/v1/sys/seal-status",
+        ]
+        assert tc.k8s_proxy_unconsumed() == 0
+    assert proxy == []  # the argv list ctx.run was called with
+    assert env["status"] == "ok"
+    assert env["outputs"] == {"statuses": [200, 503], "body": '{"sealed":false}'}
+
+
+def test_a_stubbed_call_returns_the_full_dict_with_defaults():
+    got = {}
+
+    def main(ctx):
+        got.update(ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health"))
+        return {}
+
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy_get=[{"request": HEALTH_REQUEST, "response": {"status": 302}}])
+        run_main(main, tc)
+    assert got == {
+        "status": 302,
+        "headers": {},
+        "body": "",
+        "truncated": False,
+        "location": None,
+    }
+
+
+def test_a_stubbed_error_is_raised_like_a_real_one():
+    error = {"code": "permission_denied", "message": "the API server refused", "scope": "web/x"}
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy_get=[{"request": HEALTH_REQUEST, "error": error}])
+        env = run_main(proxy_main, tc)
+    assert env["status"] == "failed"
+    assert [e["code"] for e in env["errors"]] == ["permission_denied"]
+
+
+def test_a_different_or_extra_proxy_request_is_an_assertion_error_naming_both():
+    other = {**HEALTH_REQUEST, "path": "/v1/sys/leader"}
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy_get=[{"request": other, "response": {"status": 200}}])
+        with tc.environ(), pytest.raises(AssertionError) as raised:
+            tc.ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health")
+        assert "k8s-proxy-get http web/services/vault:8200 /v1/sys/leader" in str(raised.value)
+        assert "k8s-proxy-get http web/services/vault:8200 /v1/sys/health" in str(raised.value)
+        assert tc.k8s_proxy_unconsumed() == 1  # a mismatch consumes nothing
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy_get=[])
+        with pytest.raises(AssertionError, match="no further"):
+            tc.ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health")
+
+
+def test_cli_stubs_alone_leave_ctx_k8s_proxy_get_to_the_real_helper(
+    monkeypatch,
+):
+    with _tc() as tc:
+        stub_commands(tc, {GET_PODS: (0, '{"items": []}', "")})  # CLI stubs only
+        called = []
+        monkeypatch.setattr(
+            "runwhen_capability.k8s_proxy.task_get", lambda *a, **k: called.append(a) or {}
+        )
+        tc.ctx.k8s_proxy_get("web", "services", "vault", 8200, "x")
+    assert called  # not stubbed, so the real helper would have run
+
+
+def test_proxy_stubs_may_be_added_later_and_cli_stubs_still_work():
+    with _tc() as tc:
+        stub_commands(tc, {GET_PODS: (0, '{"items": []}', "")})
+        stub_commands(tc, k8s_proxy_get=[{"request": HEALTH_REQUEST, "response": {"status": 200}}])
+        assert tc.ctx.run(list(GET_PODS)).returncode == 0
+        assert (
+            tc.ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health")["status"]
+            == 200
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "not a dict",
+        {"response": {"status": 200}},
+        {"request": {"namespace": "web"}, "response": {"status": 200}},
+        {"request": HEALTH_REQUEST},
+        {"request": HEALTH_REQUEST, "response": {"status": 200}, "error": {"code": "timeout"}},
+        {"request": HEALTH_REQUEST, "response": {"body": "no status"}},
+        {"request": HEALTH_REQUEST, "error": {"code": "nope", "message": "m"}},
+    ],
+)
+def test_a_malformed_proxy_stub_is_a_type_error(bad):
+    with _tc() as tc, pytest.raises(TypeError):
+        stub_commands(tc, k8s_proxy_get=[bad])
+
+
+def test_the_scenario_call_shape_is_accepted_as_it_is():
+    """A recorded `type: k8s-proxy-get` call can be pasted in as a stub."""
+    call = {
+        "type": "k8s-proxy-get",
+        "request": {**HEALTH_REQUEST, "scheme": "http"},
+        "response": {
+            "status": 200,
+            "headers": {},
+            "body": "",
+            "truncated": False,
+            "location": None,
+        },
+    }
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy_get=[call])
+        assert (
+            tc.ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health")["status"]
+            == 200
+        )

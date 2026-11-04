@@ -184,9 +184,13 @@ def test_proxy_get_returns_a_normal_answer_and_a_relative_redirect(cluster, monk
     ok = proxy_get(cluster["namespace"], "pods", "redirector", 8080, "/ok", timeout=60)
     assert (ok.status, ok.body) == (200, b"hello from the pod")
     relative = proxy_get(cluster["namespace"], "pods", "redirector", "8080", "relative", timeout=60)
-    # the API server's proxy rewrites a backend-relative Location into its own path space
-    prefix = f"/api/v1/namespaces/{cluster['namespace']}/pods/redirector:8080/proxy"
-    assert (relative.status, relative.location) == (302, f"{prefix}/somewhere/else")
+    # the API server rewrites a backend-relative Location into its own path space; the helper
+    # strips that prefix again
+    assert (relative.status, relative.location) == (302, "/somewhere/else")
+    assert relative.headers["location"].endswith("/proxy/somewhere/else")
+    # the location goes straight back in as a path (the pod redirects it to the other host)
+    again = proxy_get(cluster["namespace"], "pods", "redirector", 8080, relative.location)
+    assert (again.status, again.location) == (302, None)
 
 
 def test_an_api_server_refusal_is_permission_denied(cluster, monkeypatch):
@@ -194,3 +198,29 @@ def test_an_api_server_refusal_is_permission_denied(cluster, monkeypatch):
     with pytest.raises(RwError) as raised:
         proxy_get(cluster["namespace"], "pods", "redirector", 8080, "/ok", timeout=60)
     assert raised.value.code == "permission_denied"
+
+
+def test_a_missing_pod_is_not_found(cluster, monkeypatch):
+    monkeypatch.setenv("KUBECONFIG", cluster["runner"])
+    with pytest.raises(RwError) as raised:
+        proxy_get(cluster["namespace"], "pods", "no-such-pod", 8080, "/ok", timeout=60)
+    assert raised.value.code == "not_found"
+
+
+def test_a_port_nobody_listens_on_is_unreachable(cluster, monkeypatch):
+    monkeypatch.setenv("KUBECONFIG", cluster["runner"])
+    with pytest.raises(RwError) as raised:
+        proxy_get(cluster["namespace"], "pods", "redirector", 9999, "/ok", timeout=60)
+    assert raised.value.code == "unreachable"
+
+
+def test_no_proxy_directory_or_process_is_left_behind(cluster, monkeypatch):
+    import glob
+    import tempfile
+
+    monkeypatch.setenv("KUBECONFIG", cluster["runner"])
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "rwk-*")))
+    proxy_get(cluster["namespace"], "pods", "redirector", 8080, "/ok", timeout=60)
+    assert set(glob.glob(os.path.join(tempfile.gettempdir(), "rwk-*"))) == before
+    left = subprocess.run(["pgrep", "-f", "kubectl proxy --unix-socket"], capture_output=True)
+    assert left.returncode == 1  # nothing matches

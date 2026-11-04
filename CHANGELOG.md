@@ -7,6 +7,24 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `ctx.k8s_proxy_get` / `rw_k8s_proxy_get` (S17), refined:
+  - It now runs `kubectl proxy --unix-socket=<0700 temp dir>/p.sock` (readiness: the "Starting to
+    serve on <socket>" line kubectl 1.3x prints, else the socket file after 0.5 s; the directory is
+    under the temporary directory or /tmp when that path is too long, and removed in `finally`)
+    instead of a loopback TCP port, so nothing else on the machine can reach the proxy. The client
+    is an `http.client.HTTPConnection` over AF_UNIX with the same never-follow redirect handler.
+  - `location` of a kept redirect is the backend-relative path plus query: the API server rewrites
+    a backend's path-absolute Location into `/api/v1/namespaces/<ns>/<kind>/<[https:]name:port>/proxy/...`
+    and the helper strips that prefix, so the value can be passed back as `path` (`headers["location"]`
+    keeps the raw value). A path into a different pod, service or port is a cross-target redirect:
+    `location` None, `x-rw-redirect-dropped: <ns>/<kind>/<target>`.
+  - API-server `Status` bodies (`kind: Status`, `apiVersion: v1`, error status) are mapped:
+    401/403 `permission_denied`, 404 with `reason: NotFound` `not_found`, 503 / `ServiceUnavailable` /
+    "no endpoints available" / "error trying to reach service" `unreachable`. Everything else, notably
+    a backend's own plain-JSON 503 (Vault sealed), is returned as data.
+  - `runwhen_capability.testing.stub_commands(tc, k8s_proxy_get=[{request, response | error}, ...])`
+    stubs `ctx.k8s_proxy_get` for a skill's Python unit test, matched in order against the declared
+    requests as a replay matches them (`tc.k8s_proxy_requests`, `tc.k8s_proxy_unconsumed()`).
 - `rwtask test` records and replays `k8s-proxy-get` calls (`ctx.k8s_proxy_get`, `rw_k8s_proxy_get`) as
   calls of their own. A scenario's `calls` items are now either `{argv, rc?, stdout?, stderr?, stdin?}`
   or `{type: k8s-proxy-get, request: {namespace, kind, name, port, path, scheme?}, response: {status,

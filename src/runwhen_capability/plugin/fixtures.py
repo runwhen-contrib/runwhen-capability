@@ -45,6 +45,7 @@ import yaml
 
 from ..contracts import load_yaml
 from ..k8s_proxy import CALL_TYPE as PROXY_CALL_TYPE
+from ..k8s_proxy import normalize_call as normalize_proxy_call
 from ..reftime import format_now, parse_now
 from ..rwerrors import ERROR_CODES
 
@@ -333,21 +334,7 @@ def _normal_call(call: dict) -> dict:
     """A call with its defaults filled: a CLI call's rc/stdout/stderr, a proxy call's scheme
     and response fields."""
     if call.get("type") == PROXY_CALL_TYPE:
-        out: dict[str, Any] = {
-            "type": PROXY_CALL_TYPE,
-            "request": {"scheme": "http", **call["request"]},
-        }
-        if "error" in call:
-            out["error"] = dict(call["error"])
-        else:
-            out["response"] = {
-                "headers": {},
-                "body": "",
-                "truncated": False,
-                "location": None,
-                **call["response"],
-            }
-        return out
+        return normalize_proxy_call(call)
     return {
         "argv": list(call["argv"]),
         "rc": 0,

@@ -225,6 +225,7 @@ def test_a_failed_proxy_call_is_recorded_and_replays_as_the_same_error(
 ):
     status = {
         "kind": "Status",
+        "apiVersion": "v1",
         "status": "Failure",
         "message": 'services "vault" is forbidden: cannot get proxy',
         "code": 403,
@@ -250,7 +251,13 @@ def test_a_failed_proxy_call_in_a_bash_task_is_recorded_and_replays(
 ):
     import json
 
-    status = {"kind": "Status", "status": "Failure", "message": "denied", "code": 403}
+    status = {
+        "kind": "Status",
+        "apiVersion": "v1",
+        "status": "Failure",
+        "message": "denied",
+        "code": 403,
+    }
     kubectl.configure(api_status={"status": 403, "body": json.dumps(status)})
     record(rwtask, "proxy-mixed-sh")
     doc = load_yaml(scenario_path(plugin, "proxy-mixed-sh").read_text())

@@ -59,8 +59,12 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
   (bash: `rw_k8s_proxy_get`), not `kubectl get --raw .../proxy/...`: kubectl follows a backend's
   redirect to another host and sends the runner's bearer token there (S17). The helper returns
   `{status, headers, body, truncated, location}`, never follows a redirect (a redirect to another
-  host comes back as the 3xx with `location: None` and an `x-rw-redirect-dropped` header), and
-  returns the backend's 4xx and 5xx as data; `rwtask test` records and replays it.
+  host comes back as the 3xx with `location: None` and an `x-rw-redirect-dropped` header; a kept
+  one has `location` as a backend-relative path you can pass back as `path`), and returns the
+  backend's own 4xx and 5xx as data, raising only for the API server's own refusals (401/403
+  `permission_denied`, missing pod or service `not_found`, backend unreachable `unreachable`).
+  `rwtask test` records and replays it; in a unit test declare it with
+  `stub_commands(tc, k8s_proxy_get=[{"request": {...}, "response": {...}}])`.
 - Each task ends `ok`, `failed` (it raised; `error` says why) or `skipped` (it raised
   `SkipTask(reason)`; `reason` says why). Either way the rest of the request still runs. Only
   tasks can skip: a setup that raises `SkipTask` has failed.

@@ -8,8 +8,10 @@ import base64
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -61,6 +63,13 @@ def vault(tmp_path, monkeypatch, routes=None, **config):
     return install_fake_kubectl(tmp_path, monkeypatch, routes=routes, **config)
 
 
+@pytest.fixture
+def short_dir():
+    """A directory with a path short enough for a unix socket (tmp_path is not)."""
+    with tempfile.TemporaryDirectory(prefix="rwt-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
 def get_health(**kwargs) -> ProxyResponse:
     return proxy_get("vault", "services", "vault", 8200, "/v1/sys/health", **kwargs)
 
@@ -85,12 +94,41 @@ def test_a_200_returns_status_headers_and_body(tmp_path, monkeypatch):
     assert [r["path"] for r in fake.requests()] == [HEALTH]
 
 
-def test_kubectl_proxy_is_started_loopback_only_with_a_host_filter(tmp_path, monkeypatch):
+def test_kubectl_proxy_serves_on_a_private_unix_socket_with_a_host_filter(tmp_path, monkeypatch):
     fake = vault(tmp_path, monkeypatch)
     get_health()
-    assert fake.commands() == [
-        ["proxy", "--port=0", "--address=127.0.0.1", r"--accept-hosts=^127\.0\.0\.1$"]
-    ]
+    (command,) = fake.commands()
+    assert command[0] == "proxy" and len(command) == 3
+    assert command[1].startswith("--unix-socket=/")  # no TCP port: --port is refused with it
+    assert command[2] == r"--accept-hosts=^127\.0\.0\.1$"
+    sock = command[1].split("=", 1)[1]
+    (serving,) = fake.serving()
+    assert serving["socket"] == sock
+    assert serving["dir_mode"] == 0o700
+    assert len(sock) < 100
+    assert not Path(sock).parent.exists()  # the directory is removed afterwards
+
+
+def test_the_socket_directory_is_removed_after_a_failure_too(tmp_path, monkeypatch):
+    fake = vault(tmp_path, monkeypatch, api_status=status_body(403))
+    with pytest.raises(RwError):
+        get_health()
+    (serving,) = fake.serving()
+    assert not Path(serving["socket"]).parent.exists()
+
+
+def test_a_long_temporary_directory_falls_back_to_a_short_one(tmp_path, monkeypatch):
+    fake = vault(tmp_path, monkeypatch)
+    deep = tmp_path / ("d" * 40) / ("e" * 40)
+    deep.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(deep))
+    assert get_health().status == 200
+    assert len(fake.serving()[0]["socket"]) < 100
+
+
+def test_a_proxy_that_prints_nothing_is_used_once_its_socket_exists(tmp_path, monkeypatch):
+    vault(tmp_path, monkeypatch, silent=True)
+    assert get_health().status == 200
 
 
 def test_no_credential_header_is_sent(tmp_path, monkeypatch):
@@ -101,7 +139,7 @@ def test_no_credential_header_is_sent(tmp_path, monkeypatch):
     (request,) = fake.requests()
     names = {k.lower() for k in request["headers"]}
     assert not names & {"authorization", "cookie", "proxy-authorization", "x-api-key"}
-    assert request["host"].startswith("127.0.0.1:")
+    assert request["host"] == "127.0.0.1"
 
 
 def test_https_backends_use_the_scheme_prefix_and_named_ports_work(tmp_path, monkeypatch):
@@ -184,29 +222,75 @@ def test_other_absolute_locations_are_dropped(tmp_path, monkeypatch, other_host,
     assert other_host.seen == []
 
 
-def test_a_relative_redirect_is_reported_and_not_followed(tmp_path, monkeypatch):
-    fake = vault(tmp_path, monkeypatch, routes=redirect("/ui/"))
+PREFIX = "/api/v1/namespaces/vault/services/vault:8200/proxy"
+
+
+@pytest.mark.parametrize(
+    ("sent", "location"),
+    [
+        ("/ui/", "/ui/"),
+        ("/somewhere/else?x=1", "/somewhere/else?x=1"),  # the fake prefixes it, like the API server
+        (PREFIX + "/ui/?a=1", "/ui/?a=1"),  # already in the proxy path space
+        (PREFIX, "/"),
+        (PREFIX + "/", "/"),
+        (PREFIX + "?a=1", "/?a=1"),
+        ("http://{proxy}" + PREFIX + "/ui/?a=1", "/ui/?a=1"),  # absolute, back into this proxy
+        ("ui/", "ui/"),  # relative without a slash is left as it is
+    ],
+)
+def test_a_redirect_within_the_target_is_reported_as_a_backend_relative_path(
+    tmp_path, monkeypatch, sent, location
+):
+    fake = vault(tmp_path, monkeypatch, routes=redirect(sent))
     got = get_health()
-    assert (got.status, got.location) == (302, "/ui/")
-    assert got.headers["location"] == "/ui/"
+    assert (got.status, got.location) == (302, location)
     assert "x-rw-redirect-dropped" not in got.headers
     assert len(fake.requests()) == 1  # not followed
 
 
-def test_a_redirect_into_the_same_proxy_prefix_is_reported_as_a_path(tmp_path, monkeypatch):
-    proxy_path = "/api/v1/namespaces/vault/services/vault:8200/proxy/ui/?a=1"
-    fake = vault(tmp_path, monkeypatch, routes=redirect("http://{proxy}" + proxy_path))
+def test_the_raw_location_header_is_kept_only_for_a_kept_redirect(tmp_path, monkeypatch):
+    vault(tmp_path, monkeypatch, routes=redirect("/ui/?a=1"))
     got = get_health()
-    assert got.location == proxy_path
-    assert "x-rw-redirect-dropped" not in got.headers
+    assert got.location == "/ui/?a=1"
+    assert got.headers["location"] == PREFIX + "/ui/?a=1"  # the raw value, as received
+
+
+def test_a_location_can_be_passed_straight_back_as_the_path(tmp_path, monkeypatch):
+    routes = redirect("/ui/?a=1")
+    routes[PREFIX + "/ui/?a=1"] = {"body": "landed"}
+    fake = vault(tmp_path, monkeypatch, routes=routes)
+    first = get_health()
+    second = proxy_get("vault", "services", "vault", 8200, first.location)
+    assert second.body == b"landed", [r["path"] for r in fake.requests()]
+
+
+@pytest.mark.parametrize(
+    ("sent", "dropped"),
+    [
+        ("/api/v1/namespaces/other/services/vault:8200/proxy/x", "other/services/vault:8200"),
+        ("/api/v1/namespaces/vault/pods/vault:8200/proxy/x", "vault/pods/vault:8200"),
+        ("/api/v1/namespaces/vault/services/vault:9999/proxy/x", "vault/services/vault:9999"),
+        (
+            "/api/v1/namespaces/vault/services/https:vault:8200/proxy",
+            "vault/services/https:vault:8200",
+        ),
+        ("http://{proxy}/api/v1/namespaces/other/pods/p:80/proxy/x", "other/pods/p:80"),
+    ],
+)
+def test_a_redirect_to_another_pod_service_or_port_is_dropped(tmp_path, monkeypatch, sent, dropped):
+    fake = vault(tmp_path, monkeypatch, routes=redirect(sent))
+    got = get_health()
+    assert got.location is None
+    assert got.headers["x-rw-redirect-dropped"] == dropped
+    assert "location" not in got.headers
     assert len(fake.requests()) == 1
 
 
-def test_a_redirect_to_the_proxy_but_another_path_is_dropped(tmp_path, monkeypatch):
+def test_a_redirect_to_the_proxy_host_but_another_path_is_dropped(tmp_path, monkeypatch):
     fake = vault(tmp_path, monkeypatch, routes=redirect("http://{proxy}/api/v1/secrets"))
     got = get_health()
     assert got.location is None
-    assert got.headers["x-rw-redirect-dropped"].startswith("127.0.0.1:")
+    assert got.headers["x-rw-redirect-dropped"] == "127.0.0.1"
     assert len(fake.requests()) == 1
 
 
@@ -237,6 +321,69 @@ def test_an_api_server_refusal_is_permission_denied(tmp_path, monkeypatch, code)
     assert raised.value.code == "permission_denied"
     assert "forbidden" in raised.value.message
     assert fake.proxy_is_gone()
+
+
+def api_status(code: int, reason: str, message: str, api_version: str | None = "v1") -> dict:
+    body = {
+        "kind": "Status",
+        "status": "Failure",
+        "message": message,
+        "reason": reason,
+        "code": code,
+    }
+    if api_version:
+        body["apiVersion"] = api_version
+    return {"status": code, "body": json.dumps(body)}
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (api_status(404, "NotFound", 'services "vault" not found'), "not_found"),
+        (api_status(404, "NotFound", 'pods "vault-0" not found'), "not_found"),
+        (
+            api_status(
+                503,
+                "ServiceUnavailable",
+                "error trying to reach service: dial tcp 10.0.0.1:8200: connection refused",
+            ),
+            "unreachable",
+        ),
+        (api_status(503, "ServiceUnavailable", "anything"), "unreachable"),
+        (api_status(503, "Whatever", 'no endpoints available for service "vault"'), "unreachable"),
+        (api_status(500, "InternalError", "error trying to reach service: EOF"), "unreachable"),
+        (api_status(401, "Unauthorized", "Unauthorized"), "permission_denied"),
+    ],
+)
+def test_an_api_server_status_is_mapped_to_a_code(tmp_path, monkeypatch, status, code):
+    fake = vault(tmp_path, monkeypatch, api_status=status)
+    with pytest.raises(RwError) as raised:
+        get_health()
+    assert raised.value.code == code
+    assert raised.value.scope == "vault/services/vault:8200"
+    assert fake.proxy_is_gone()
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        {"status": 503, "body": '{"errors":[]}'},  # Vault sealed: the backend's own answer
+        {"status": 503, "body": '{"errors":["Vault is sealed"]}'},
+        {"status": 404, "body": '{"errors":[]}'},
+        {"status": 500, "body": "internal error"},
+        api_status(500, "InternalError", "something else broke"),  # a Status, but not mapped
+        api_status(404, "Gone", "not the NotFound reason"),
+        api_status(403, "Forbidden", "no apiVersion", api_version=None),  # not v1: not ours
+        api_status(503, "ServiceUnavailable", "wrong apiVersion", api_version="v2"),
+        {"status": 503, "body": '[{"kind":"Status","apiVersion":"v1"}]'},
+        {"status": 503, "body": "error trying to reach service"},  # text, not a Status
+    ],
+)
+def test_other_error_answers_are_data(tmp_path, monkeypatch, route):
+    vault(tmp_path, monkeypatch, routes={HEALTH: route})
+    got = get_health()
+    assert got.status == route["status"]
+    assert got.body == route["body"].encode()
 
 
 def test_kubectl_missing_is_a_dependency_error(tmp_path, monkeypatch):
@@ -277,19 +424,18 @@ def test_a_proxy_that_never_says_it_is_serving_times_out_and_is_killed(tmp_path,
     assert fake.proxy_is_gone()
 
 
-def test_a_slow_backend_times_out(tmp_path, monkeypatch):
-    # a backend that holds the connection: the fake proxy answers, a 'sleeping' route does not
+def test_a_slow_backend_times_out(tmp_path, monkeypatch, short_dir):
+    """A proxy that accepts the connection and never answers."""
     fake = vault(tmp_path, monkeypatch)
-    import socket
-
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
+    dead_end = short_dir / "dead.sock"
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(dead_end))
     listener.listen(5)
     real_start = k8s_proxy._start_proxy
 
     def start_with_a_dead_end(*args, **kwargs):
-        proc, _port, err = real_start(*args, **kwargs)
-        return proc, listener.getsockname()[1], err
+        proc, _sock, workdir, err = real_start(*args, **kwargs)
+        return proc, str(dead_end), workdir, err
 
     monkeypatch.setattr(k8s_proxy, "_start_proxy", start_with_a_dead_end)
     try:
@@ -301,15 +447,21 @@ def test_a_slow_backend_times_out(tmp_path, monkeypatch):
     assert fake.proxy_is_gone()
 
 
-def test_a_refused_connection_to_the_proxy_is_unreachable(tmp_path, monkeypatch):
+@pytest.mark.parametrize("missing", [True, False])
+def test_a_socket_nobody_serves_is_unreachable(tmp_path, monkeypatch, short_dir, missing):
     fake = vault(tmp_path, monkeypatch)
+    stale = short_dir / "stale.sock"
+    if not missing:  # a socket file with nothing listening: connection refused
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(str(stale))
+        s.close()
     real_start = k8s_proxy._start_proxy
 
-    def start_with_a_wrong_port(*args, **kwargs):
-        proc, port, err = real_start(*args, **kwargs)
-        return proc, 1, err  # nothing listens on port 1
+    def start_with_a_wrong_socket(*args, **kwargs):
+        proc, _sock, workdir, err = real_start(*args, **kwargs)
+        return proc, str(stale), workdir, err
 
-    monkeypatch.setattr(k8s_proxy, "_start_proxy", start_with_a_wrong_port)
+    monkeypatch.setattr(k8s_proxy, "_start_proxy", start_with_a_wrong_socket)
     with pytest.raises(RwError) as raised:
         get_health()
     assert raised.value.code == "unreachable"

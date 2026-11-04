@@ -383,12 +383,14 @@ class Context:
         301/302/307 to another host with the runner's bearer token (S17).
 
         Returns `{status, headers, body, truncated, location}`: the backend's own status and
-        body (a 404 or 503 is data, not an error), headers lowercased, the body as text cut at
-        4 MiB (`truncated`), and `location` the redirect target only when it is a relative path
-        or points back into the same proxy path. Any other target is dropped:
-        `location` is None and the header `x-rw-redirect-dropped` names its host. Raises
-        RwError: `permission_denied` when the API server itself refuses (401/403),
-        `unreachable`, `timeout`, `dependency` (no kubectl), `invalid_input`. KUBECONFIG is the
+        body (a 404 or a plain 503 from the backend is data, not an error), headers lowercased,
+        the body as text cut at 4 MiB (`truncated`), and `location` the redirect target only
+        when it stays on the same pod/service/port, as a backend-relative path plus query that
+        can be passed back as `path`. Any other target is dropped: `location` is None, the
+        `location` header is removed and `x-rw-redirect-dropped` names where it pointed. Raises
+        RwError: `permission_denied` (the API server itself answers 401/403), `not_found` (no
+        such pod or service), `unreachable` (the proxy cannot reach the backend), `timeout`,
+        `dependency` (no kubectl), `invalid_input`. KUBECONFIG is the
         task's environment; `rwtask test` records and replays the call (`k8s-proxy-get`)."""
         # Imported here: `python3 -m runwhen_capability.k8s_proxy` (bash's helper) must not find
         # the module already imported by the package, or runpy warns on stderr.

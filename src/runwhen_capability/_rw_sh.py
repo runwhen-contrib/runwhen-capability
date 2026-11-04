@@ -29,9 +29,9 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 # rw_k8s_proxy_get does what `kubectl get --raw /api/v1/namespaces/<ns>/services/<name>:<port>/
 # proxy/<path>` does -- without its flaw: kubectl follows a backend's redirect to another host
 # and sends the runner's bearer token there (S17). The backend's own status and body come back
-# as data (a 404 is not an error); `location` is set only for a relative redirect target, and a
-# redirect to another host is dropped (`location` null, header `x-rw-redirect-dropped` names
-# the host).
+# as data (a 404 is not an error); `location` is set only for a redirect that stays on the same
+# pod/service/port, as a path you can pass back, and any other redirect is dropped (`location`
+# null, header `x-rw-redirect-dropped` names where it pointed).
 # On failure it records the error itself (as rw_error does, so do not call rw_error again for
 # it), prints a line to stderr and returns non-zero; under `set -e` that ends the task.
 #

@@ -140,19 +140,31 @@ What a script sees (the runner and `rwtask run` set the same names):
 `kubectl get --raw` through the proxy follows a backend's 301/302/307, and when the `Location`
 is absolute and names another host client-go re-sends the runner's `Authorization: Bearer`
 token to it, so a probed pod or an SSO redirect can capture the credential (security finding
-S17). The helper runs `kubectl proxy` on a loopback port for the call and reads through it with
-a client that sends no credential and never follows a redirect. The answer is the backend's own
-`status`, lowercased `headers` and `body` (text; 4 MiB at most, `truncated` says it was cut),
-also for a 404 or 503, which are data. `location` is the redirect target only when it is a
-relative path or points back into the same proxy path; for any other target it is `null`, the
-`location` header is removed and `x-rw-redirect-dropped: <host>` is added, so a skill can
-report that the backend redirected elsewhere. Errors are `RwError`s with a D64 code
-(`dependency`: no kubectl; `unreachable`; `timeout`; `invalid_input`; `permission_denied` only
-when the API server itself answers 401/403 with a `Status` object, since the backend's own 403 is
-data). `kind` is `pods` or `services`, `port` a number or a port name, `path` relative to the
-backend's root (a `?query` is kept; `..` segments are refused). `KUBECONFIG` is the task's
-environment, as for `kubectl`. `rwtask test` records the call as `type: k8s-proxy-get` and
-replays it without starting a proxy.
+S17). The helper runs `kubectl proxy --unix-socket=<private 0700 dir>/p.sock` for the call (no
+TCP port is opened) and reads through it with a client that sends no credential and never
+follows a redirect. The answer is the backend's own `status`, lowercased `headers` and `body`
+(text; 4 MiB at most, `truncated` says it was cut), also for a 404 or 503, which are data.
+`location` is the redirect target only when it stays on the same pod/service/port, and then it
+is the **backend-relative path plus query** (`/somewhere/else?x=1`: the API server rewrites a
+backend's Location into `/api/v1/namespaces/<ns>/<kind>/<[https:]name:port>/proxy/...`, and the
+helper strips that prefix), which can be passed straight back as `path`; `headers["location"]`
+keeps the raw value in that case. For any other target (an absolute URL for another host, or a
+path into a different pod, service or port) `location` is `null`, the `location` header is
+removed and `x-rw-redirect-dropped: <host or ns/kind/target>` is added, so a skill can report that
+the backend redirected elsewhere.
+
+Errors are `RwError`s with a D64 code. `dependency`: no kubectl; `unreachable`; `timeout`;
+`invalid_input`. A response is the **API server's own** (not the backend's) when its body is a
+`Status` object (`"kind": "Status"`, `"apiVersion": "v1"`) with an error status code, and only
+then: 401/403 is `permission_denied`; 404 with `reason: NotFound` (no such pod or service) is
+`not_found`; 503, `reason: ServiceUnavailable`, or a message containing "no endpoints available"
+or "error trying to reach service" (the proxy cannot reach the backend) is `unreachable`. Every
+other answer, including a backend's own plain 403/404/503 (Vault sealed's `{"errors": []}`) and
+any other `Status`, is returned as data. `kind` is `pods` or `services`, `port` a number or a
+port name, `path` relative to the backend's root (a `?query` is kept; `..` segments are
+refused). `KUBECONFIG` is the task's environment, as for `kubectl`. `rwtask test` records the
+call as `type: k8s-proxy-get` and replays it without starting a proxy; a Python unit test
+declares it with `stub_commands(tc, k8s_proxy_get=[{request, response | error}, ...])`.
 
 **`RW_TASK_CONTRACT=v13`** is how a script tells the V13 contract from a classic
 bundle's, and both the runner and `rwtask run` set it. Under it `ctx.run` raises
@@ -192,7 +204,8 @@ Stdout and stderr are logs and are never parsed for outputs.
 **Testing a script.** `runwhen_capability.testing` (`make_context`, `run_main`,
 `stub_commands`) builds the same context and environment the runner does, so a
 Python script's unit test sees `ctx.resource`, `ctx.settings`, `ctx.run` and
-`ctx.error` with the V13 semantics and no cluster. `rwtask test` replays
+`ctx.error` with the V13 semantics and no cluster (`stub_commands` stubs `ctx.run` by argv and,
+with `k8s_proxy_get=[...]`, `ctx.k8s_proxy_get`). `rwtask test` replays
 recorded CLI calls through PATH shims, for bash and Python scripts alike; a
 `ctx.k8s_proxy_get` / `rw_k8s_proxy_get` call is recorded and replayed too, as a call of its own
 (`type: k8s-proxy-get` between the CLI calls, replayed without starting a proxy).
