@@ -90,6 +90,17 @@ with open(os.environ["RW_AUTH_OUT_ENV"], "w") as out:
     out.write("PGPASSWORD=" + password + "\\n")
 print("on stdout:", password)
 """,
+    # a postgres-shaped env credential: two non-secret values and the password
+    "auth/pgenv.py": """\
+import os
+import pathlib
+
+password = pathlib.Path(os.environ["RW_AUTH_REF_DIR"], "value").read_text().strip()
+with open(os.environ["RW_AUTH_OUT_ENV"], "w") as out:
+    out.write("PGHOST=db.prod.internal\\n")
+    out.write("PGDATABASE=" + os.environ["RW_AUTH_INPUT_DATABASE"] + "\\n")
+    out.write("PGPASSWORD=" + password + "\\n")
+""",
     # fails with the {code, message} the input names, and a secret in the message
     "auth/fail.sh": """\
 token="$(cat "$RW_AUTH_REF_DIR/token")"

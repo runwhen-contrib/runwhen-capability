@@ -29,12 +29,13 @@ recorded, it writes `E_FIXTURE_MISMATCH: expected <argv> got <argv>` to stderr, 
 the mismatch to `$RW_SHIM_MISMATCH` for the host, consumes nothing and exits 97. After
 the run the host reads `mismatches()` and `unconsumed()` (calls recorded but never made).
 
-A scenario's calls are not only CLI calls: `ctx.k8s_proxy_get` / `rw_k8s_proxy_get`
-(k8s_proxy.py) are calls of their own, `{type: k8s-proxy-get, request, response | error}`.
+A scenario's calls are not only CLI calls: `ctx.k8s_proxy_get` / `rw_k8s_proxy_get` and
+`ctx.k8s_proxy_request` / `rw_k8s_proxy_request` (k8s_proxy.py) are calls of their own,
+`{type: k8s-proxy-get | k8s-proxy-request, request, response | error}`.
 They share this session's files: under `RW_SHIM_MODE=record` the helper appends its line to
 `$RW_SHIM_LOG` after the real call (so the log keeps the order of mixed calls); under
 `replay` it takes the next index from `$RW_SHIM_STATE` the same way a shim does, requires a
-`k8s-proxy-get` with an equal request (else `E_FIXTURE_MISMATCH`, exit 97, an entry in
+proxy call (either type) with an equal request (else `E_FIXTURE_MISMATCH`, exit 97, an entry in
 `$RW_SHIM_MISMATCH` whose `expected` is a description instead of an argv), and starts no
 proxy. A shim that finds a proxy call where it expected its own is the same mismatch.
 
@@ -92,6 +93,7 @@ SHIM_ENV_NAMES = (
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 
 _SHIM_PY = r"""
+import base64
 import fcntl
 import json
 import os
@@ -168,10 +170,12 @@ def record(argv, stdin):
 
 
 def describe(call):
-    # a recorded call that is not a CLI call: k8s-proxy-get (runwhen_capability.k8s_proxy)
+    # a recorded call that is not a CLI call: k8s-proxy-get / k8s-proxy-request; the same text
+    # as runwhen_capability.k8s_proxy.describe_request
     request = call.get("request") or {}
-    return "%s %s %s/%s/%s:%s %s" % (
-        call.get("type"),
+    method = str(request.get("method") or "GET").upper()
+    text = "%s %s %s/%s/%s:%s %s" % (
+        "k8s-proxy-get" if method == "GET" else "k8s-proxy-request " + method,
         request.get("scheme") or "http",
         request.get("namespace"),
         request.get("kind"),
@@ -179,6 +183,25 @@ def describe(call):
         request.get("port"),
         request.get("path"),
     )
+    headers = dict((str(k).lower(), v) for k, v in (request.get("headers") or {}).items())
+    if headers:
+        text += " headers=" + json.dumps(headers, sort_keys=True)
+    if request.get("bodyBase64") is not None:
+        try:
+            body = base64.b64decode(str(request["bodyBase64"]), validate=True)
+        except ValueError:
+            raw = str(request["bodyBase64"])
+            body = b"<invalid base64: " + raw.encode("utf-8", "replace") + b">"
+    elif request.get("body") is not None:
+        body = str(request["body"]).encode("utf-8", "replace")
+    else:
+        body = b""
+    if body:
+        shown = body.decode("utf-8", "replace")
+        text += " body=" + json.dumps(shown[:60])
+        if len(shown) > 60:
+            text += "... (%d bytes)" % len(body)
+    return text
 
 
 def replay(argv, stdin):

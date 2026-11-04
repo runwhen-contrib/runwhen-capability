@@ -77,8 +77,8 @@ def file_plan(script="auth/fake.sh", *, archive_info, inputs=None, mode="0600", 
     }
 
 
-def env_plan(script="auth/envpy.py", *, archive_info, inputs=None, names=None):
-    return {
+def env_plan(script="auth/envpy.py", *, archive_info, inputs=None, names=None, non_secret=None):
+    plan = {
         "connection": "prod-db",
         "integration": "authint@0.1.0",
         "authMethod": "login",
@@ -88,6 +88,35 @@ def env_plan(script="auth/envpy.py", *, archive_info, inputs=None, names=None):
         "inputs": ENV_INPUTS if inputs is None else inputs,
         "materialize": {"env": names or ["PGUSER", "PGPASSWORD"]},
     }
+    if non_secret:
+        plan["materialize"]["nonSecret"] = non_secret
+    return plan
+
+
+PG_PASSWORD = "hunter2-db-password"
+PG_NAMES = ["PGHOST", "PGDATABASE", "PGPASSWORD"]
+
+
+def native_pg_plan(non_secret=None):
+    """A native passthrough plan of a postgres-like env credential type (nothing to run)."""
+    plan = {
+        "connection": "prod-db",
+        "integration": "postgres@1.0.0",
+        "authMethod": "password",
+        "credentialType": "postgres/connection",
+        "reference": {"kind": "k8s-secret", "ref": "k8s:secret@ns/db"},
+        "method": {"native": "passthrough"},
+        "materialize": {"env": PG_NAMES},
+    }
+    if non_secret:
+        plan["materialize"]["nonSecret"] = non_secret
+    return plan
+
+
+def native_pg(*, database="postgres", **extra):
+    """The runner's materialized[] entry for native_pg_plan."""
+    env = {"PGHOST": "db.prod.internal", "PGDATABASE": database, "PGPASSWORD": PG_PASSWORD}
+    return {"credentialType": "postgres/connection", "env": env, **extra}
 
 
 @pytest.fixture
@@ -245,6 +274,104 @@ def test_an_env_plan_exports_the_scripts_pairs_scrubbed(harness):
     assert report["authVars"] == []
     assert "hunter2-db-password" not in json.dumps(envelope)  # nor on stdout
     harness.assert_clean()
+
+
+# -- non-secret names (contracts-v5 materialize.nonSecret) -----------------------------------------
+
+PG_NON_SECRET = ["PGHOST", "PGDATABASE"]
+
+
+def pg_env(envelope) -> dict:
+    assert envelope["status"] == "ok", envelope["errors"]
+    return envelope["outputs"]["report"]["env"]
+
+
+def test_a_native_env_value_is_redacted_unless_its_name_is_non_secret(harness):
+    names = ",".join(PG_NAMES)
+    envelope = harness.run([native_pg_plan()], materialized=[native_pg()], names=names)
+    assert pg_env(envelope) == dict.fromkeys(PG_NAMES, "***REDACTED***")  # as before the field
+
+    envelope = harness.run([native_pg_plan(PG_NON_SECRET)], materialized=[native_pg()], names=names)
+    assert pg_env(envelope) == {
+        "PGHOST": "db.prod.internal",
+        "PGDATABASE": "postgres",
+        "PGPASSWORD": "***REDACTED***",
+    }
+    assert PG_PASSWORD not in json.dumps(envelope)
+
+
+def test_non_secret_values_stay_readable_inside_other_text(harness):
+    # "postgres" is the database name and part of the host: both survive when non-secret
+    entry = native_pg()
+    entry["env"]["PGHOST"] = "postgres.prod.internal"
+    envelope = harness.run(
+        [native_pg_plan(PG_NON_SECRET)], materialized=[entry], names=",".join(PG_NAMES)
+    )
+    assert pg_env(envelope)["PGHOST"] == "postgres.prod.internal"
+
+
+def test_a_non_secret_value_equal_to_a_secret_one_stays_redacted(harness):
+    names = ",".join(PG_NAMES)
+    entry = native_pg(database=PG_PASSWORD)  # PGDATABASE is non-secret, but it is the password
+    envelope = harness.run([native_pg_plan(PG_NON_SECRET)], materialized=[entry], names=names)
+    assert pg_env(envelope) == {
+        "PGHOST": "db.prod.internal",
+        "PGDATABASE": "***REDACTED***",
+        "PGPASSWORD": "***REDACTED***",
+    }
+
+
+def test_a_non_secret_value_equal_to_a_file_content_stays_redacted(harness):
+    entry = native_pg(
+        database="some-file-content", files=[{"env": "PGPASSFILE", "content": "some-file-content"}]
+    )
+    envelope = harness.run(
+        [native_pg_plan(PG_NON_SECRET)], materialized=[entry], names=",".join(PG_NAMES)
+    )
+    assert pg_env(envelope)["PGDATABASE"] == "***REDACTED***"
+
+
+def test_a_script_env_plan_redacts_only_the_names_not_marked_non_secret(harness):
+    names = ",".join(PG_NAMES)
+    plan = env_plan(
+        "auth/pgenv.py",
+        archive_info=harness.install(),
+        inputs={"database": "postgres"},
+        names=PG_NAMES,
+        non_secret=PG_NON_SECRET,
+    )
+    envelope = harness.run([plan], materialized=[ENV_REFERENCE], names=names)
+    assert pg_env(envelope) == {
+        "PGHOST": "db.prod.internal",
+        "PGDATABASE": "postgres",
+        "PGPASSWORD": "***REDACTED***",
+    }
+    assert PG_PASSWORD not in json.dumps(envelope)
+    harness.assert_clean()
+
+
+def test_a_script_env_plan_without_non_secret_redacts_every_value(harness):
+    plan = env_plan(
+        "auth/pgenv.py",
+        archive_info=harness.install(),
+        inputs={"database": "postgres"},
+        names=PG_NAMES,
+    )
+    envelope = harness.run([plan], materialized=[ENV_REFERENCE], names=",".join(PG_NAMES))
+    assert pg_env(envelope) == dict.fromkeys(PG_NAMES, "***REDACTED***")
+
+
+def test_a_script_non_secret_value_equal_to_the_reference_stays_redacted(harness):
+    plan = env_plan(
+        "auth/pgenv.py",
+        archive_info=harness.install(),
+        inputs={"database": PG_PASSWORD},
+        names=PG_NAMES,
+        non_secret=PG_NON_SECRET,
+    )
+    envelope = harness.run([plan], materialized=[ENV_REFERENCE], names=",".join(PG_NAMES))
+    assert pg_env(envelope)["PGDATABASE"] == "***REDACTED***"
+    assert pg_env(envelope)["PGHOST"] == "db.prod.internal"
 
 
 # -- failures ------------------------------------------------------------------------------------

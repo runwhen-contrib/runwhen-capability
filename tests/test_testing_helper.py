@@ -347,6 +347,31 @@ def test_k8s_proxy_get_is_answered_from_declared_calls_in_order_without_a_proxy(
     assert env["outputs"] == {"statuses": [200, 503], "body": '{"sealed":false}'}
 
 
+def test_a_stubbed_response_drops_per_request_api_server_headers():
+    got = {}
+
+    def main(ctx):
+        got.update(ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health"))
+        return {}
+
+    noisy = {
+        "audit-id": "abc",
+        "Date": "Tue, 04 Nov 2026 10:00:00 GMT",
+        "x-kubernetes-pf-flowschema-uid": "f",
+        "x-kubernetes-pf-prioritylevel-uid": "p",
+        "content-type": "text/plain",
+    }
+    with _tc() as tc:
+        stub_commands(
+            tc,
+            k8s_proxy_get=[
+                {"request": HEALTH_REQUEST, "response": {"status": 200, "headers": noisy}}
+            ],
+        )
+        run_main(main, tc)
+    assert got["headers"] == {"content-type": "text/plain"}
+
+
 def test_a_stubbed_call_returns_the_full_dict_with_defaults():
     got = {}
 
@@ -450,3 +475,189 @@ def test_the_scenario_call_shape_is_accepted_as_it_is():
             tc.ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health")["status"]
             == 200
         )
+
+
+# -- stubbing ctx.k8s_proxy_request, and headers -----------------------------------------------
+
+LOKI = ("web", "services", "loki", 3100)
+
+
+def loki_request(method="PUT", path="/ring/forget", **extra):
+    return {
+        "namespace": "web",
+        "kind": "services",
+        "name": "loki",
+        "port": 3100,
+        "path": path,
+        "method": method,
+        **extra,
+    }
+
+
+def test_k8s_proxy_declares_requests_of_any_method_matched_in_order():
+    calls = [
+        {"request": loki_request("GET", "/ring"), "response": {"status": 200, "body": "ring"}},
+        {
+            "request": loki_request(
+                body='{"id":"a"}', headers={"Content-Type": "application/json"}
+            ),
+            "response": {"status": 204},
+        },
+        {"request": loki_request("DELETE", "/ring/a"), "response": {"status": 202}},
+    ]
+    with _tc() as tc:
+        proxy = stub_commands(tc, k8s_proxy=calls)
+        assert proxy == []
+        ctx = tc.ctx
+        got = [
+            ctx.k8s_proxy_get(*LOKI, "/ring")["body"],
+            ctx.k8s_proxy_request(
+                "PUT",
+                *LOKI,
+                "/ring/forget",
+                body=b'{"id":"a"}',
+                headers={"content-type": "application/json"},
+            )["status"],
+            ctx.k8s_proxy_request("DELETE", *LOKI, "/ring/a")["status"],
+        ]
+        assert got == ["ring", 204, 202]
+        assert tc.k8s_proxy_unconsumed() == 0
+        assert [r.get("method") for r in tc.k8s_proxy_requests] == [None, "PUT", "DELETE"]
+
+
+def test_k8s_proxy_get_is_the_same_keyword_and_the_two_cannot_be_mixed_in_one_call():
+    with _tc() as tc:
+        stub_commands(
+            tc,
+            k8s_proxy_get=[{"request": loki_request("PUT"), "response": {"status": 204}}],
+        )
+        assert tc.ctx.k8s_proxy_request("PUT", *LOKI, "/ring/forget")["status"] == 204
+    with _tc() as tc, pytest.raises(TypeError, match="not both"):
+        stub_commands(tc, k8s_proxy=[], k8s_proxy_get=[])
+
+
+def test_a_declared_get_answers_either_function_and_a_get_with_a_header_must_match_it():
+    declared = {
+        "request": loki_request("GET", "/ring", headers={"Accept": "application/json"}),
+        "response": {"status": 200},
+    }
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy=[declared, declared, declared])
+        assert tc.ctx.k8s_proxy_get(*LOKI, "/ring", headers={"accept": "application/json"})
+        assert tc.ctx.k8s_proxy_request(
+            "GET", *LOKI, "/ring", headers={"ACCEPT": "application/json"}
+        )
+        with pytest.raises(AssertionError) as raised:
+            tc.ctx.k8s_proxy_get(*LOKI, "/ring")  # the header is missing
+        assert 'headers={"accept": "application/json"}' in str(raised.value)
+        assert tc.k8s_proxy_unconsumed() == 1
+
+
+@pytest.mark.parametrize(
+    ("call", "needle"),
+    [
+        (
+            lambda c: c.k8s_proxy_request("POST", *LOKI, "/ring/forget", body="{}"),
+            "got k8s-proxy-request POST http web/services/loki:3100 /ring/forget body=",
+        ),
+        (
+            lambda c: c.k8s_proxy_request("PUT", *LOKI, "/ring/forget", body="{ }"),
+            'body="{ }"',
+        ),
+        (
+            lambda c: c.k8s_proxy_request(
+                "PUT", *LOKI, "/ring/forget", body="{}", headers={"Content-Type": "text/plain"}
+            ),
+            'headers={"content-type": "text/plain"}',
+        ),
+        (
+            lambda c: c.k8s_proxy_request("PUT", *LOKI, "/ring/forget"),
+            "got k8s-proxy-request PUT http web/services/loki:3100 /ring/forget",
+        ),
+        (
+            lambda c: c.k8s_proxy_get(*LOKI, "/ring/forget"),
+            "got k8s-proxy-get http web/services/loki:3100 /ring/forget",
+        ),
+    ],
+)
+def test_a_changed_method_body_or_header_is_an_assertion_error_naming_the_method(call, needle):
+    declared = {
+        "request": loki_request(body="{}", headers={"Content-Type": "application/json"}),
+        "response": {"status": 204},
+    }
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy=[declared])
+        with pytest.raises(AssertionError) as raised:
+            call(tc.ctx)
+        message = str(raised.value)
+        assert "expected k8s-proxy-request PUT http web/services/loki:3100 /ring/forget" in message
+        assert needle in message
+        assert tc.k8s_proxy_unconsumed() == 1  # a mismatch consumes nothing
+
+
+def test_a_body_may_be_declared_as_base64_and_matches_the_bytes():
+    declared = {
+        "request": loki_request(bodyBase64="/wA="),  # b"\xff\x00"
+        "response": {"status": 204},
+    }
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy=[declared, declared])
+        assert tc.ctx.k8s_proxy_request("PUT", *LOKI, "/ring/forget", body=b"\xff\x00")
+        with pytest.raises(AssertionError):
+            tc.ctx.k8s_proxy_request("PUT", *LOKI, "/ring/forget", body=b"\xff")
+
+
+def test_the_stub_refuses_what_the_real_call_refuses_before_matching():
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy=[{"request": loki_request("GET"), "response": {"status": 200}}])
+        for call in (
+            lambda c: c.k8s_proxy_get(*LOKI, "/ring", headers={"Authorization": "x"}),
+            lambda c: c.k8s_proxy_request("GET", *LOKI, "/ring", body="x"),
+            lambda c: c.k8s_proxy_request("TRACE", *LOKI, "/ring"),
+        ):
+            with pytest.raises(RwError) as raised:
+                call(tc.ctx)
+            assert raised.value.code == "invalid_input"
+        assert tc.k8s_proxy_unconsumed() == 1
+
+
+@pytest.mark.parametrize(
+    "request_extra",
+    [
+        {"method": "TRACE"},
+        {"method": "GET", "body": "x"},
+        {"headers": {"Authorization": "x"}},
+        {"body": "x", "bodyBase64": "eA=="},
+        {"bodyBase64": "***"},
+        {"body": 5},
+    ],
+)
+def test_a_malformed_request_stub_is_a_type_error(request_extra):
+    bad = {"request": loki_request(**request_extra), "response": {"status": 200}}
+    with _tc() as tc, pytest.raises(TypeError):
+        stub_commands(tc, k8s_proxy=[bad])
+
+
+def test_a_k8s_proxy_get_typed_stub_cannot_be_a_write():
+    bad = {"type": "k8s-proxy-get", "request": loki_request("PUT"), "response": {"status": 200}}
+    with _tc() as tc, pytest.raises(TypeError):
+        stub_commands(tc, k8s_proxy=[bad])
+    with _tc() as tc, pytest.raises(TypeError):
+        stub_commands(tc, k8s_proxy=[{**bad, "type": "curl"}])
+
+
+def test_the_recorded_request_call_shape_is_accepted_as_it_is():
+    call = {
+        "type": "k8s-proxy-request",
+        "request": {**loki_request(body="{}"), "scheme": "http"},
+        "response": {
+            "status": 204,
+            "headers": {},
+            "body": "",
+            "truncated": False,
+            "location": None,
+        },
+    }
+    with _tc() as tc:
+        stub_commands(tc, k8s_proxy=[call])
+        assert tc.ctx.k8s_proxy_request("PUT", *LOKI, "/ring/forget", body="{}")["status"] == 204

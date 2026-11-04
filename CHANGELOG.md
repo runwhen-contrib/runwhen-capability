@@ -7,6 +7,66 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- **`ctx.k8s_proxy_request` / `rw_k8s_proxy_request`, request headers and longer port names (S17,
+  lane F's last three extensions)** (`runwhen_capability/k8s_proxy.py`):
+  - `proxy_request(method, namespace, kind, name, port, path, *, body=None, headers=None,
+    scheme="http", timeout=30, max_body=...)` for GET, HEAD, PUT, POST, DELETE and PATCH (anything
+    else is `invalid_input`); `proxy_get` is its GET wrapper. A body is bytes or str (UTF-8), at most
+    4 MiB, and only PUT, POST, PATCH and DELETE may carry one; without a `Content-Type` it goes out
+    as `application/octet-stream`. A redirect is an answer for every method (urllib's handler is
+    overridden for all of them; a `Location` urllib cannot parse is now dropped like any other
+    instead of failing the call). `kubectl proxy`'s `--reject-methods` default is `^$`, so no flag
+    changes; the default `--reject-paths` stays. Task API: `ctx.k8s_proxy_request(method, ...)`
+    returns the same dict as `k8s_proxy_get`. bash: `rw_k8s_proxy_request <METHOD> <ns>
+    <pods|services> <name> <port> <path> [--data STRING | --data-file FILE] [--header 'Name: value']...
+    [--scheme https] [--timeout N]`, the same JSON line and error behaviour; it is in
+    `RW_SH_HELPERS`, the diagnostics text and the static checks.
+  - `headers=` on `ctx.k8s_proxy_get` / `ctx.k8s_proxy_request` and a repeatable `--header` on both
+    bash helpers. Allowed, in any case: Accept (default `*/*`), Content-Type, Content-MD5, If-Match,
+    If-None-Match, Range. Anything else (Authorization, Cookie, Host, Proxy-*, X-Forwarded-*,
+    Impersonate-*, Connection, ...) is `invalid_input` naming the header, as is a CR, LF, NUL or
+    other control character, or a non-ASCII one, in a name or value, or a name given twice. Our
+    User-Agent stays.
+  - Port names: a service's port name is a DNS-1123 label of up to 63 characters (the Artifactory
+    chart's `http-artifactory`, 16, was refused as a pod-style name); a pod's is an IANA service
+    name (at most 15 characters, a letter, no `--`; it was `[a-z0-9-]{1,15}`); 1-65535 as before.
+  - Fixtures: `k8s_proxy_get` still records `type: k8s-proxy-get`, with `headers` in its request only
+    when given, so existing scenarios stay valid. Any other call is `type: k8s-proxy-request` with
+    `request: {method, namespace, kind, name, port, path, scheme, headers?, body? | bodyBase64?}`
+    (header names lower-cased; `body` is UTF-8 text, `bodyBase64` for bytes that are not UTF-8 or
+    text a scenario file would not keep, such as control characters). Replay matches exactly on
+    method, headers, body and the rest, with the old rules for port and scheme; a recorded
+    `k8s-proxy-get` is a GET with no body, so either type replays a GET. Mismatch messages name the
+    method (`k8s-proxy-request PUT http ns/kind/name:port /path headers={...} body="..."`). The
+    scenario schema, its loading checks (`rwtask test` refuses a header off the allowlist or a body
+    on a GET in a fixture) and the shims' mismatch text follow.
+  - `testing.stub_commands(tc, k8s_proxy=[...])` declares the calls of both `ctx.k8s_proxy_get` and
+    `ctx.k8s_proxy_request` (items shaped like a recorded call; `method` defaults to GET), matched in
+    order on method, headers and body as a replay matches them. `k8s_proxy_get=` is the same keyword
+    under its first name and still works.
+  - The helpers do not decide whether a task may write: a `readOnly: true` task that calls a write
+    method is the plugin's declaration problem, for review and RBAC. Against a real API server
+    (kind, kubectl 1.36) `kubectl replace|create|delete --raw .../proxy/...` all follow a 302 and
+    re-send the bearer token (as a GET), and `delete --raw` follows a 307 as well; the helper contacts
+    nobody. CONTRACTS.md "What a script sees" and the README follow.
+- **contracts-v5 (tag pending), `materialize.nonSecret`** (lane F's postgres/aws/azure on a real runner):
+  the executor redacted every materialized env value, substring-matching any value of 8 or more
+  characters, so `PGDATABASE=postgres` turned every "postgres" in task output into `***REDACTED***`
+  and `AWS_REGION` / `AZURE_SUBSCRIPTION_ID` were mangled out of ARNs and canonical keys.
+  `integration.schema.json` `credentialTypes.*.materialize` gains an optional `nonSecret` (an array of
+  env names, `minItems` 1, `uniqueItems`), allowed only with `env` as a list (not `fromTaskVars`, not
+  `file`) and naming only names in that list: `rwtask validate` reports one that is not as
+  `E_NON_SECRET_UNKNOWN`. `auth-plan.schema.json` `materialize` allows `env` with `nonSecret`
+  (never `file` with it). `rwtask serve` leaves the listed names out of its redaction, for a native
+  plan (`materialized[].env`, with the names read from the lease's `credentials[].authPlan`) and a
+  script plan (`auth_script.run_script_plan` returns only the other values in `AuthResult.secrets`;
+  `plugin.run.execute` takes `non_secret_env`). A `file` is always secret, and a non-secret value that
+  is also a secret elsewhere in the lease stays redacted. Without the field nothing changes.
+  CONTRACTS.md "Changes in contracts-v5" (V5-1), the credential type and Auth plan prose, the
+  install line, examples (`integration/synthetic-postgres-non-secret.yaml`,
+  `auth-plan/synthetic-postgres-non-secret.yaml` and invalid cases), generated models and the
+  packaged copy follow. Affects B/C (papi copies `materialize` into plans, the runner passes the plan
+  through) and F (postgres, aws and azure mark their non-secret names).
 - `ctx.k8s_proxy_get` / `rw_k8s_proxy_get` (S17), refined:
   - It now runs `kubectl proxy --unix-socket=<0700 temp dir>/p.sock` (readiness: the "Starting to
     serve on <socket>" line kubectl 1.3x prints, else the socket file after 0.5 s; the directory is
@@ -173,6 +233,12 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Fixed
 
+- `k8s_proxy_get` / `k8s_proxy_request` (and the bash helpers) drop the per-request API-server
+  response headers `audit-id`, `date` and `x-kubernetes-pf-*` (flow-control UIDs) from `headers`:
+  they identify the cluster's audit trail and differ on every call, so `rwtask test --record` stored
+  them in `k8s-proxy-get` / `k8s-proxy-request` fixtures. They are dropped from the answer itself,
+  so a live run, a recording and a replay show a task the same headers; an older scenario that
+  still holds them replays without them, and so does a `stub_commands(k8s_proxy=...)` response.
 - `ctx.settings` snake_cases only the top-level setting names. It used to rewrite keys at every depth,
   so an object-typed setting whose keys are user data (`patterns: {connRefused: ...}`) arrived with
   its keys changed. Nested values now keep their keys verbatim (still readable as attributes where

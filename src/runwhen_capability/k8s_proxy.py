@@ -1,14 +1,18 @@
-"""`proxy_get`: a GET through the Kubernetes API server's pod/service proxy that never
-follows a redirect (security finding S17).
+"""`proxy_get` / `proxy_request`: a request (GET, or a write) through the Kubernetes API
+server's pod/service proxy that never follows a redirect (security finding S17).
 
 `kubectl get --raw /api/v1/namespaces/<ns>/services/<name>:<port>/proxy/<path>` follows a
-backend's 301/302/307. When the `Location` is absolute and names another host, client-go
-re-sends `Authorization: Bearer <the runner's token>` there, so anyone who controls a pod a
-skill probes (or an SSO realm that redirects an anonymous request to an external IdP) can
-capture the runner's cluster credential. kubectl has no flag that turns the following off.
+backend's 301/302/307, and `kubectl replace|create|delete --raw` against the same path follow a
+302 as well (re-issued as a GET; `delete` follows a 307 too). When the `Location` is absolute
+and names another host, client-go re-sends `Authorization: Bearer <the runner's token>` there,
+so anyone who controls a pod a skill probes (or an SSO realm that redirects an anonymous
+request to an external IdP) can capture the runner's cluster credential. kubectl has no flag
+that turns the following off.
 
     reply = proxy_get("vault", "services", "vault", 8200, "/v1/sys/health")
     reply.status, reply.body, reply.location
+    proxy_request("PUT", "loki", "services", "loki", 3100, "/ring/forget", body='{"id":"a"}',
+                  headers={"Content-Type": "application/json"})
 
 How: `kubectl proxy --unix-socket=<private dir>/p.sock` runs for the duration of the call, in
 its own process group, and the request goes to it over that socket (a directory of mode 0700 under
@@ -16,10 +20,12 @@ the temporary directory, or /tmp when that path is too long for a socket) with a
 no credential of its own (kubectl's proxy adds the cluster credential on its way to the API
 server, and the API server's proxy never hands it to the backend). No TCP port is opened, so
 nothing else on the machine can use the proxy; its `--accept-hosts` accepts only the Host
-`127.0.0.1`. kubectl 1.3x prints "Starting to serve on <socket>" once it listens, which is the
-readiness signal (a proxy that stays silent is used once its socket file exists). The client
-treats a 3xx as an answer, never a thing to follow. The proxy is terminated (SIGTERM, then SIGKILL
-after 2 s) and its directory removed when the call ends, whatever happened.
+`127.0.0.1`. Its `--reject-methods` default (`^$`) rejects no method, and the default
+`--reject-paths` (pod exec and attach) is kept. kubectl 1.3x prints "Starting to serve on
+<socket>" once it listens, which is the readiness signal (a proxy that stays silent is used once
+its socket file exists). The client treats a 3xx as an answer, never a thing to follow, whatever
+the method. The proxy is terminated (SIGTERM, then SIGKILL after 2 s) and its directory removed
+when the call ends, whatever happened.
 
 `location` of a redirect is reported only when it stays on the same pod/service/port: the API
 server rewrites a backend's path-absolute Location into its own path space
@@ -30,6 +36,8 @@ another pod, service or port) `location` is None, the `location` header is remov
 (it is kept, raw, only for a kept redirect) and `x-rw-redirect-dropped: <host or
 ns/kind/target>` says where it pointed. The answer is the backend's own, status and body, also
 for a 4xx or 5xx, which is data, not an error.
+The API server's per-request headers (`audit-id`, `date`, `x-kubernetes-pf-*`) are dropped from
+`headers`, see `NOISE_HEADERS`.
 
 Errors (D64 codes): kubectl missing (`dependency`), a proxy that does not start (the code of its
 stderr, else `internal`) or a connection that fails (`unreachable`), a deadline (`timeout`), bad
@@ -42,25 +50,53 @@ body that is not a v1 Status (a backend's plain-JSON 503 such as Vault sealed's 
 is returned as data. The heuristic is narrow on purpose: a backend that itself speaks Kubernetes
 Status objects with these shapes would be mistaken for the API server.
 
-The API for tasks is `ctx.k8s_proxy_get(...)` and bash's `rw_k8s_proxy_get`, both through
-`task_get`, which returns a JSON-able dict (the body as text) and records and replays the call
-for `rwtask test` (`type: k8s-proxy-get` in a scenario's `calls`; plugin/shims.py describes the
-shared state files): with `RW_SHIM_MODE=record` the real call is made and appended to
-`$RW_SHIM_LOG`; with `RW_SHIM_MODE=replay` no proxy is started and the next recorded call, which
-must be this request, answers.
+Methods are GET, HEAD, PUT, POST, DELETE and PATCH (anything else is `invalid_input`); every
+one is answered by the backend's status and headers and, except HEAD, its body. A body is bytes or
+str (UTF-8), at most 4 MiB, and only PUT, POST, PATCH and DELETE may carry one. Without a
+`Content-Type` a body is sent as `application/octet-stream` (urllib's own default would be a
+form). The request headers a caller may set are Accept, Content-Type, Content-MD5, If-Match,
+If-None-Match and Range, in any case; every other header, among them Authorization, Cookie,
+Host, Proxy-*, X-Forwarded-* and Impersonate-*, is `invalid_input`, as is a CR, LF, NUL or any
+other control character (a tab apart) or non-ASCII character in a name or value. Our own
+User-Agent is always sent, and `Accept: */*` unless the caller sets one. The helper does not
+decide whether a task may write: a task that declares `readOnly: true` and calls a write method
+is that plugin's declaration problem, for review and RBAC to catch.
+
+A port name is checked against what the kind accepts: a service's port name is a DNS-1123 label
+(up to 63 characters), a pod's an IANA_SVC_NAME (up to 15 characters, at least one letter, no
+`--`); a number from 1 to 65535 works for both.
+
+The API for tasks is `ctx.k8s_proxy_get(...)` / `ctx.k8s_proxy_request(...)` and bash's
+`rw_k8s_proxy_get` / `rw_k8s_proxy_request`, through `task_get` / `task_request`, which return a
+JSON-able dict (the body as text) and record and replay the call for `rwtask test` (`type:
+k8s-proxy-get` for a GET made by `task_get`, `type: k8s-proxy-request` for the rest, in a
+scenario's `calls`; plugin/shims.py describes the shared state files): with `RW_SHIM_MODE=record`
+the real call is made and appended to `$RW_SHIM_LOG`; with `RW_SHIM_MODE=replay` no proxy is
+started and the next recorded call, which must be this request, answers. A recorded request is
+`{method?, namespace, kind, name, port, path, scheme, headers?, body? | bodyBase64?}`: header
+names lower-cased, the body as `body` (UTF-8 text) or, when it is not valid UTF-8 or YAML could
+not keep the text intact, `bodyBase64`. Replay matches exactly on method, headers, body and the
+rest; a `k8s-proxy-get` is a GET with no body, so either type replays a GET (a request without a
+`method` is a GET), and an empty body is no body.
 
     python3 -m runwhen_capability.k8s_proxy get <namespace> <pods|services> <name> <port> <path>
+        [--header 'Name: value']... [--scheme https] [--timeout N]
+    python3 -m runwhen_capability.k8s_proxy request <METHOD> <namespace> <pods|services> <name>
+        <port> <path> [--data STRING | --data-file FILE] [--header 'Name: value']...
         [--scheme https] [--timeout N]
 
-prints that dict as one JSON line; on an error it exits 1 after writing the error to
+print that dict as one JSON line; on an error they exit 1 after writing the error to
 `$RW_ERRORS_FILE` (the shape `rw_error` writes) and a line to stderr.
 
-A script's unit test declares the call with `testing.stub_commands(tc, k8s_proxy_get=[...])`.
+A script's unit test declares the call with `testing.stub_commands(tc, k8s_proxy=[...])`
+(`k8s_proxy_get=` is the same keyword under its first name).
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import contextlib
 import fcntl
 import http.client
@@ -80,6 +116,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -88,11 +125,32 @@ from .rwerrors import RwCommandError, RwError, classify_command_error
 #: How much of a response body is kept (4 MiB).
 DEFAULT_MAX_BODY = 4 * 1024 * 1024
 
-#: `type` of a scenario's call item (plugin/fixtures.py).
+#: `type` of a scenario's call item (plugin/fixtures.py): a GET made by `task_get` ...
 CALL_TYPE = "k8s-proxy-get"
+#: ... and any request made by `task_request`.
+REQUEST_CALL_TYPE = "k8s-proxy-request"
+CALL_TYPES = (CALL_TYPE, REQUEST_CALL_TYPE)
+
+#: The methods a request may use; kubectl proxy's --reject-methods default (`^$`) rejects none.
+METHODS = ("GET", "HEAD", "PUT", "POST", "DELETE", "PATCH")
+#: The methods that may carry a body.
+BODY_METHODS = ("PUT", "POST", "PATCH", "DELETE")
+#: How large a request body may be (4 MiB).
+MAX_REQUEST_BODY = 4 * 1024 * 1024
+#: The request headers a caller may set; case-insensitive. Everything else is refused, so a
+#: task can never set a credential, an identity, routing or framing header.
+ALLOWED_HEADERS = ("Accept", "Content-Type", "Content-MD5", "If-Match", "If-None-Match", "Range")
+_ALLOWED_BY_LOWER = {name.lower(): name for name in ALLOWED_HEADERS}
 
 #: The header that says a redirect's target was dropped, with that target's host.
 DROPPED_HEADER = "x-rw-redirect-dropped"
+
+#: Response headers the helper never returns: per-request API-server or transport noise that
+#: identifies the cluster's audit trail (`audit-id`) or changes on every call (`date`, the
+#: `x-kubernetes-pf-*` flow-control UIDs), so it would break fixture stability. Dropped from a
+#: live answer, a recording and a replay alike, so a task sees the same headers in all three.
+NOISE_HEADERS = frozenset({"audit-id", "date"})
+NOISE_HEADER_PREFIXES = ("x-kubernetes-pf-",)
 
 #: How long a terminated proxy gets before it is killed.
 _TERM_GRACE = 2.0
@@ -110,7 +168,8 @@ _SILENT_GRACE = 0.5
 _HOST = "127.0.0.1"
 _PROXY_PATH = re.compile(r"^/api/v1/namespaces/([^/]+)/(pods|services)/([^/]+)/proxy(?=/|$)")
 _LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
-_PORT_NAME = re.compile(r"^[a-z0-9-]{1,15}$")
+#: A pod's port name: IANA_SVC_NAME. Also at most 15 characters, a letter in it, no "--".
+_POD_PORT_NAME = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _PATH_SAFE = "/:@!$&'()*+,;=-._~"
 _QUERY_SAFE = _PATH_SAFE + "?"
 _BARE_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
@@ -169,7 +228,9 @@ def _check_dns_name(value: Any, what: str, *, subdomain: bool) -> str:
     return value
 
 
-def _check_port(value: Any) -> str:
+def _check_port(value: Any, kind: str) -> str:
+    """The port as text. A name must be one the kind can have: a service's port name is a
+    DNS-1123 label (63 characters), a pod's an IANA_SVC_NAME (15 characters, a letter, no `--`)."""
     if isinstance(value, bool) or not isinstance(value, int | str):
         raise _invalid(f"port must be 1-65535 or a port name, not {value!r}")
     if isinstance(value, str) and value.isascii() and value.isdigit():
@@ -178,8 +239,24 @@ def _check_port(value: Any) -> str:
         if not 1 <= value <= 65535:
             raise _invalid(f"port {value} is outside 1-65535")
         return str(value)
-    if not _PORT_NAME.match(value):
-        raise _invalid(f"port {value!r} is neither a number nor a port name ([a-z0-9-]{{1,15}})")
+    if kind == "services":
+        ok = bool(_LABEL.match(value))
+        rule = "a DNS-1123 label: lower-case letters, digits and '-', at most 63 characters"
+    else:
+        ok = (
+            len(value) <= 15
+            and bool(_POD_PORT_NAME.match(value))
+            and any("a" <= c <= "z" for c in value)
+            and "--" not in value
+        )
+        rule = (
+            "an IANA_SVC_NAME: lower-case letters, digits and '-', at most 15 characters, "
+            "at least one letter, no '--'"
+        )
+    if not ok:
+        raise _invalid(
+            f"port {value!r} is neither a number nor a port name of a {kind[:-1]} ({rule})"
+        )
     return value
 
 
@@ -209,6 +286,74 @@ def _check_path(path: Any) -> str:
         return route
     query = urllib.parse.quote(_BARE_PERCENT.sub("%25", query), safe=_QUERY_SAFE + "%")
     return f"{route}?{query}"
+
+
+def _check_method(method: Any) -> str:
+    if not isinstance(method, str) or method not in METHODS:
+        raise _invalid(f"method must be one of {', '.join(METHODS)}, not {method!r}")
+    return method
+
+
+def _check_body(method: str, body: Any) -> bytes | None:
+    """The request body as bytes, None for no body (an empty one is none). `invalid_input`
+    for a body of another type, over 4 MiB, or on a method that carries none."""
+    if body is None:
+        return None
+    if isinstance(body, str):
+        try:
+            data = body.encode("utf-8")
+        except UnicodeEncodeError:
+            raise _invalid("body text cannot be encoded as UTF-8") from None
+    elif isinstance(body, bytes | bytearray):
+        data = bytes(body)
+    else:
+        raise _invalid(f"body must be bytes or str, not {type(body).__name__}")
+    if len(data) > MAX_REQUEST_BODY:
+        raise _invalid(f"the request body is {len(data)} bytes; the limit is 4 MiB")
+    if not data:
+        return None
+    if method not in BODY_METHODS:
+        raise _invalid(f"a {method} request cannot carry a body (only {', '.join(BODY_METHODS)})")
+    return data
+
+
+def check_headers(headers: Any) -> dict[str, str]:
+    """`{lower-case name: value}` of the request headers, `invalid_input` for anything off the
+    allowlist (the message names it), a name or value with a control character (CR, LF and NUL
+    included, a tab in a value apart), a non-ASCII one, or a name given twice."""
+    if headers is None:
+        return {}
+    if not isinstance(headers, Mapping):
+        raise _invalid(
+            f"headers must be a mapping of names to values, not {type(headers).__name__}"
+        )
+    clean: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise _invalid(f"header {name!r}: names and values must be strings")
+        if any(c in "\r\n\x00" for c in name + value):
+            raise _invalid(f"header {name!r}: names and values may not contain CR, LF or NUL")
+        if _has_control(name) or _has_control(value.replace("\t", " ")):
+            raise _invalid(f"header {name!r}: names and values may not contain control characters")
+        if not name.isascii() or not value.isascii():
+            raise _invalid(f"header {name!r}: names and values must be ASCII")
+        lowered = name.lower()
+        if lowered not in _ALLOWED_BY_LOWER:
+            raise _invalid(
+                f"header {name!r} is not allowed; the request headers a task may set are "
+                f"{', '.join(ALLOWED_HEADERS)}"
+            )
+        if lowered in clean:
+            raise _invalid(f"header {name!r} is given twice")
+        clean[lowered] = value
+    return clean
+
+
+def check_call_args(method: Any, headers: Any, body: Any) -> tuple[dict[str, str], bytes | None]:
+    """The checked `(headers, body)` of a call to `method`, or `invalid_input`: what a task's
+    call is held to before it is made, recorded, replayed or stubbed."""
+    _check_method(method)
+    return check_headers(headers), _check_body(method, body)
 
 
 # -- kubectl proxy ----------------------------------------------------------------------------
@@ -370,6 +515,13 @@ class _NeverFollow(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
+    # urllib parses the Location before it asks redirect_request, and raises on one it cannot
+    # parse (`http://[::1/x`), which would turn the redirect into an error; the answer is data.
+    def http_error_302(self, req, fp, code, msg, headers):
+        return None
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
 
 class _UnixConnection(http.client.HTTPConnection):
     """An HTTP connection over an AF_UNIX socket (the URL's host is only the Host header)."""
@@ -407,6 +559,19 @@ def _opener(socket_path: str) -> urllib.request.OpenerDirector:
     return opener
 
 
+def _request(
+    url: str, method: str, data: bytes | None, headers: Mapping[str, str]
+) -> urllib.request.Request:
+    """The request object: the caller's (already checked) headers under their canonical names;
+    the opener adds our User-Agent and, if the caller set none, `Accept: */*`."""
+    request = urllib.request.Request(url, data=data, method=method)
+    for lowered, value in headers.items():
+        request.add_header(_ALLOWED_BY_LOWER[lowered], value)
+    if data is not None and "content-type" not in headers:
+        request.add_header("Content-Type", "application/octet-stream")  # not urllib's form type
+    return request
+
+
 def _read_body(response, max_body: int, deadline: float) -> tuple[bytes, bool]:
     chunks: list[bytes] = []
     size = 0
@@ -422,12 +587,23 @@ def _read_body(response, max_body: int, deadline: float) -> tuple[bytes, bool]:
     return data[:max_body], len(data) > max_body
 
 
+def strip_noise_headers(headers: Mapping[str, Any]) -> dict[str, Any]:
+    """`headers` without the per-request API-server headers (see `NOISE_HEADERS`); names match in
+    any case."""
+    return {
+        name: value
+        for name, value in headers.items()
+        if (lowered := str(name).lower()) not in NOISE_HEADERS
+        and not lowered.startswith(NOISE_HEADER_PREFIXES)
+    }
+
+
 def _headers(raw) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, value in raw.items():
         key = key.lower()
         out[key] = f"{out[key]}, {value}" if key in out else value
-    return out
+    return strip_noise_headers(out)
 
 
 def _is_timeout(exc: BaseException) -> bool:
@@ -517,29 +693,36 @@ def _check_location(value: str | None, prefix: str) -> tuple[str | None, str | N
     return value, None
 
 
-def proxy_get(
+def proxy_request(
+    method: str,
     namespace: str,
     kind: Kind,
     name: str,
     port: int | str,
     path: str,
     *,
+    body: bytes | str | None = None,
+    headers: Mapping[str, str] | None = None,
     scheme: Scheme = "http",
     timeout: float = 30,
     max_body: int = DEFAULT_MAX_BODY,
     kubectl: str = "kubectl",
 ) -> ProxyResponse:
-    """GET `path` from `<name>:<port>` of the pod or service `namespace/name` through the API
-    server's proxy, without ever following a redirect. See the module docstring.
+    """`method` (GET, HEAD, PUT, POST, DELETE or PATCH) on `path` of `<name>:<port>` of the pod or
+    service `namespace/name` through the API server's proxy, without ever following a redirect.
+    See the module docstring.
 
-    `scheme` is the protocol the API server speaks to the backend; `timeout` bounds the whole
-    call (proxy start included); a body is cut at `max_body` bytes. KUBECONFIG is the
-    environment's. Raises RwError (RwCommandError when kubectl failed) with a D64 code."""
+    `body` (bytes or str, 4 MiB at most; PUT, POST, PATCH and DELETE only) and `headers` (the
+    allowlist in ALLOWED_HEADERS) are the request's; `scheme` is the protocol the API server
+    speaks to the backend; `timeout` bounds the whole call (proxy start included); a response
+    body is cut at `max_body` bytes. KUBECONFIG is the environment's. Raises RwError
+    (RwCommandError when kubectl failed) with a D64 code."""
+    _check_method(method)
     _check_dns_name(namespace, "namespace", subdomain=False)
     if kind not in ("pods", "services"):
         raise _invalid(f"kind must be 'pods' or 'services', not {kind!r}")
     _check_dns_name(name, "name", subdomain=True)
-    port_text = _check_port(port)
+    port_text = _check_port(port, kind)
     route = _check_path(path)
     if scheme not in ("http", "https"):
         raise _invalid(f"scheme must be 'http' or 'https', not {scheme!r}")
@@ -547,6 +730,8 @@ def proxy_get(
         raise _invalid(f"timeout must be a positive number of seconds, not {timeout!r}")
     if isinstance(max_body, bool) or not isinstance(max_body, int) or max_body <= 0:
         raise _invalid(f"max_body must be a positive number of bytes, not {max_body!r}")
+    request_headers = check_headers(headers)
+    data = _check_body(method, body)
 
     target = f"{'https:' if scheme == 'https' else ''}{name}:{port_text}"
     prefix = f"/api/v1/namespaces/{namespace}/{kind}/{target}/proxy"
@@ -561,7 +746,9 @@ def proxy_get(
         response = None
         try:
             try:
-                response = _opener(sock).open(url, timeout=remaining)
+                response = _opener(sock).open(
+                    _request(url, method, data, request_headers), timeout=remaining
+                )
             except urllib.error.HTTPError as exc:  # any non-2xx, redirects included
                 response = exc
             status = response.status if hasattr(response, "status") else response.code
@@ -602,6 +789,35 @@ def proxy_get(
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def proxy_get(
+    namespace: str,
+    kind: Kind,
+    name: str,
+    port: int | str,
+    path: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    scheme: Scheme = "http",
+    timeout: float = 30,
+    max_body: int = DEFAULT_MAX_BODY,
+    kubectl: str = "kubectl",
+) -> ProxyResponse:
+    """`proxy_request` with method GET."""
+    return proxy_request(
+        "GET",
+        namespace,
+        kind,
+        name,
+        port,
+        path,
+        headers=headers,
+        scheme=scheme,
+        timeout=timeout,
+        max_body=max_body,
+        kubectl=kubectl,
+    )
+
+
 # -- the task API, with fixtures --------------------------------------------------------------
 
 
@@ -616,20 +832,59 @@ def _append_line(variable: str, entry: dict) -> None:
         os.close(fd)
 
 
+def _body_of(request: Mapping) -> bytes | None:
+    """The body a recorded or declared request carries (`body` text or `bodyBase64`), None for
+    none or an empty one."""
+    if request.get("bodyBase64") is not None:
+        try:
+            data = base64.b64decode(str(request["bodyBase64"]), validate=True)
+        except (binascii.Error, ValueError):
+            data = (
+                b"<invalid base64: " + str(request["bodyBase64"]).encode("utf-8", "replace") + b">"
+            )
+    elif request.get("body") is not None:
+        data = str(request["body"]).encode("utf-8", "replace")
+    else:
+        data = b""
+    return data or None
+
+
+def _headers_of(request: Mapping) -> dict[str, Any]:
+    return {str(k).lower(): v for k, v in (request.get("headers") or {}).items()}
+
+
+def _method_of(request: Mapping) -> str:
+    return str(request.get("method") or "GET").upper()
+
+
 def same_request(a: dict, b: dict) -> bool:
-    """Two requests are the same call: equal namespace, kind, name, path and scheme (default
-    http); the port as text, so 8200 equals "8200"."""
+    """Two requests are the same call: equal method (default GET), namespace, kind, name, path,
+    scheme (default http), headers (names case-insensitive) and body (`body` or `bodyBase64`,
+    an empty body is none); the port as text, so 8200 equals "8200"."""
 
     def norm(r: dict) -> dict:
-        return {**r, "port": str(r.get("port")), "scheme": r.get("scheme") or "http"}
+        return {
+            "method": _method_of(r),
+            "namespace": r.get("namespace"),
+            "kind": r.get("kind"),
+            "name": r.get("name"),
+            "port": str(r.get("port")),
+            "path": r.get("path"),
+            "scheme": r.get("scheme") or "http",
+            "headers": _headers_of(r),
+            "body": _body_of(r),
+        }
 
     return norm(a) == norm(b)
 
 
 def describe_request(request: dict) -> str:
-    """The call as the mismatch messages (and plugin/shims.py's `describe`) spell it."""
-    return "{} {} {}/{}/{}:{} {}".format(
-        CALL_TYPE,
+    """The call as the mismatch messages (and plugin/shims.py's `describe`) spell it: a GET as
+    `k8s-proxy-get`, any other method as `k8s-proxy-request <METHOD>`, then scheme, target and
+    path, then `headers={...}` and `body="..."` when there are any."""
+    method = _method_of(request)
+    text = "{} {} {}/{}/{}:{} {}".format(
+        CALL_TYPE if method == "GET" else f"{REQUEST_CALL_TYPE} {method}",
         request.get("scheme") or "http",
         request.get("namespace"),
         request.get("kind"),
@@ -637,14 +892,55 @@ def describe_request(request: dict) -> str:
         request.get("port"),
         request.get("path"),
     )
+    headers = _headers_of(request)
+    if headers:
+        text += " headers=" + json.dumps(headers, sort_keys=True)
+    body = _body_of(request)
+    if body:
+        shown = body.decode("utf-8", "replace")
+        text += (
+            " body="
+            + json.dumps(shown[:60])
+            + (f"... ({len(body)} bytes)" if len(shown) > 60 else "")
+        )
+    return text
+
+
+def request_problem(request: Mapping, call_type: str) -> str | None:
+    """Why a recorded or declared request cannot be a call, None when it can: a method, header
+    or body that `proxy_request` would refuse, a `body` together with `bodyBase64`, or a method
+    or body on a `k8s-proxy-get`."""
+    method = request.get("method", "GET")
+    if call_type == CALL_TYPE and (method != "GET" or "body" in request or "bodyBase64" in request):
+        return f"a {CALL_TYPE} call is a GET with no body; use {REQUEST_CALL_TYPE}"
+    if "body" in request and "bodyBase64" in request:
+        return "give body or bodyBase64, not both"
+    data = None
+    try:
+        _check_method(method)
+        check_headers(request.get("headers"))
+        if request.get("bodyBase64") is not None:
+            try:
+                data = base64.b64decode(str(request["bodyBase64"]), validate=True)
+            except (binascii.Error, ValueError):
+                return "bodyBase64 is not valid base64"
+        else:
+            data = request.get("body")
+        _check_body(method, data)
+    except RwError as exc:
+        return exc.message
+    return None
 
 
 def normalize_call(call: dict) -> dict:
-    """A recorded `k8s-proxy-get` call with its defaults filled: the request's scheme and the
-    response's headers, body, truncated and location."""
+    """A recorded proxy call with its defaults filled: the request's scheme and the response's
+    headers, body, truncated and location. Its `type` stays (default: `k8s-proxy-request` when
+    the request names a method, else `k8s-proxy-get`). The per-request API-server headers an old
+    recording may hold are dropped from the response (`strip_noise_headers`)."""
+    request = {"scheme": "http", **call["request"]}
     out: dict[str, Any] = {
-        "type": CALL_TYPE,
-        "request": {"scheme": "http", **call["request"]},
+        "type": call.get("type") or (REQUEST_CALL_TYPE if "method" in request else CALL_TYPE),
+        "request": request,
     }
     if "error" in call:
         out["error"] = dict(call["error"])
@@ -656,6 +952,8 @@ def normalize_call(call: dict) -> dict:
             "location": None,
             **call["response"],
         }
+        # an old recording may still hold them
+        out["response"]["headers"] = strip_noise_headers(out["response"]["headers"] or {})
     return out
 
 
@@ -687,7 +985,7 @@ def _replay(request: dict) -> dict:
         if expected is None:
             problem = f"expected no further call got {describe_request(request)}"
             expected_text = None
-        elif expected.get("type") != CALL_TYPE:
+        elif expected.get("type") not in CALL_TYPES:
             expected_text = shlex.join(expected["argv"])
             problem = f"expected {expected_text} got {describe_request(request)}"
         elif not same_request(expected.get("request") or {}, request):
@@ -712,40 +1010,87 @@ def _replay(request: dict) -> dict:
     return answer_from_call(expected)
 
 
-def task_get(
+def _yaml_safe(text: str) -> bool:
+    """Text a scenario file keeps intact: no control character but newline, carriage return and
+    tab, and none of the Unicode line separators or the byte order mark."""
+    return all(
+        c in "\n\r\t" or (" " <= c < "\x7f") or (c > "\x9f" and c not in "\u2028\u2029\ufeff")
+        for c in text
+    )
+
+
+def recorded_request(
+    method: str | None,
+    namespace: str,
+    kind: str,
+    name: str,
+    port: int | str,
+    path: str,
+    scheme: str,
+    headers: dict[str, str],
+    body: bytes | None,
+) -> dict[str, Any]:
+    """The request as a scenario spells it: `method` only for a `k8s-proxy-request`, header
+    names lower-cased, the body as `body` or `bodyBase64`."""
+    request: dict[str, Any] = {} if method is None else {"method": method}
+    request.update(namespace=namespace, kind=kind, name=name, port=port, path=path, scheme=scheme)
+    if headers:
+        request["headers"] = dict(headers)
+    if body:
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if text is not None and _yaml_safe(text):
+            request["body"] = text
+        else:
+            request["bodyBase64"] = base64.b64encode(body).decode("ascii")
+    return request
+
+
+def _task_call(
+    call_type: str,
+    method: str,
     namespace: str,
     kind: Kind,
     name: str,
     port: int | str,
     path: str,
     *,
-    scheme: Scheme = "http",
-    timeout: float = 30,
-    max_body: int = DEFAULT_MAX_BODY,
-    kubectl: str = "kubectl",
+    body: bytes | str | None,
+    headers: Mapping[str, str] | None,
+    scheme: Scheme,
+    timeout: float,
+    max_body: int,
+    kubectl: str,
 ) -> dict[str, Any]:
-    """`proxy_get` for a task: `{status, headers, body, truncated, location}` with the body as
-    text, recorded to `$RW_SHIM_LOG` under `RW_SHIM_MODE=record` and answered from
-    `$RW_SHIM_CALLS` under `RW_SHIM_MODE=replay` (no proxy is started then). A failed call is
-    recorded as `error: {code, message, scope?, hint?}` and raised again on replay."""
+    # The method, headers and body are checked first: a bad one is a mistake in the task, the
+    # same in every mode, and not a call to record or replay.
+    clean_headers, data = check_call_args(method, headers, body)
     mode = os.environ.get("RW_SHIM_MODE")
-    request = {
-        "namespace": namespace,
-        "kind": kind,
-        "name": name,
-        "port": port,
-        "path": path,
-        "scheme": scheme,
-    }
+    request = recorded_request(
+        method if call_type == REQUEST_CALL_TYPE else None,
+        namespace,
+        kind,
+        name,
+        port,
+        path,
+        scheme,
+        clean_headers,
+        data,
+    )
     if mode == "replay":
         return _replay(request)
     try:
-        result = proxy_get(
+        result = proxy_request(
+            method,
             namespace,
             kind,
             name,
             port,
             path,
+            body=data,
+            headers=clean_headers,
             scheme=scheme,
             timeout=timeout,
             max_body=max_body,
@@ -758,11 +1103,80 @@ def task_get(
                 error["scope"] = exc.scope
             if exc.hint is not None:
                 error["hint"] = exc.hint
-            _append_line("RW_SHIM_LOG", {"type": CALL_TYPE, "request": request, "error": error})
+            _append_line("RW_SHIM_LOG", {"type": call_type, "request": request, "error": error})
         raise
     if mode == "record":
-        _append_line("RW_SHIM_LOG", {"type": CALL_TYPE, "request": request, "response": result})
+        _append_line("RW_SHIM_LOG", {"type": call_type, "request": request, "response": result})
     return result
+
+
+def task_request(
+    method: str,
+    namespace: str,
+    kind: Kind,
+    name: str,
+    port: int | str,
+    path: str,
+    *,
+    body: bytes | str | None = None,
+    headers: Mapping[str, str] | None = None,
+    scheme: Scheme = "http",
+    timeout: float = 30,
+    max_body: int = DEFAULT_MAX_BODY,
+    kubectl: str = "kubectl",
+) -> dict[str, Any]:
+    """`proxy_request` for a task: `{status, headers, body, truncated, location}` with the body
+    as text, recorded to `$RW_SHIM_LOG` as a `k8s-proxy-request` under `RW_SHIM_MODE=record` and
+    answered from `$RW_SHIM_CALLS` under `RW_SHIM_MODE=replay` (no proxy is started then). A
+    failed call is recorded as `error: {code, message, scope?, hint?}` and raised again on
+    replay."""
+    return _task_call(
+        REQUEST_CALL_TYPE,
+        method,
+        namespace,
+        kind,
+        name,
+        port,
+        path,
+        body=body,
+        headers=headers,
+        scheme=scheme,
+        timeout=timeout,
+        max_body=max_body,
+        kubectl=kubectl,
+    )
+
+
+def task_get(
+    namespace: str,
+    kind: Kind,
+    name: str,
+    port: int | str,
+    path: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    scheme: Scheme = "http",
+    timeout: float = 30,
+    max_body: int = DEFAULT_MAX_BODY,
+    kubectl: str = "kubectl",
+) -> dict[str, Any]:
+    """`task_request` with method GET, recorded as a `k8s-proxy-get` (a request without a
+    `method`, so existing scenarios stay valid)."""
+    return _task_call(
+        CALL_TYPE,
+        "GET",
+        namespace,
+        kind,
+        name,
+        port,
+        path,
+        body=None,
+        headers=headers,
+        scheme=scheme,
+        timeout=timeout,
+        max_body=max_body,
+        kubectl=kubectl,
+    )
 
 
 # -- command line ---------------------------------------------------------------------------
@@ -783,38 +1197,109 @@ def _record_error(error: RwError) -> None:
             os.close(fd)
 
 
-def main(argv: list[str] | None = None) -> int:
+_VALUE_OPTIONS = ("--data", "--data-file", "--header", "--scheme", "--timeout")
+
+
+def _attach_option_values(argv: list[str]) -> list[str]:
+    """`--data X` as `--data=X`, so that a value that looks like an option (`--data -x`) is
+    still the value."""
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in _VALUE_OPTIONS and i + 1 < len(argv):
+            out.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
+
+
+def _header_args(values: list[str] | None) -> dict[str, str]:
+    """`--header 'Name: value'` arguments as a mapping (checked later by `check_headers`)."""
+    headers: dict[str, str] = {}
+    for raw in values or []:
+        name, colon, value = raw.partition(":")
+        if not colon:
+            raise _invalid(f"--header wants 'Name: value', not {raw!r}")
+        name = name.strip(" \t")
+        if name in headers:
+            raise _invalid(f"header {name!r} is given twice")
+        headers[name] = value.strip(" \t")
+    return headers
+
+
+def _data_file(path: str) -> bytes:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(MAX_REQUEST_BODY + 1)
+    except OSError as exc:
+        raise _invalid(f"cannot read --data-file {path!r}: {exc.strerror or exc}") from None
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python3 -m runwhen_capability.k8s_proxy",
-        description="GET through the Kubernetes API server's pod/service proxy, never "
+        description="A request through the Kubernetes API server's pod/service proxy, never "
         "following a redirect; prints {status, headers, body, truncated, location} as JSON.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    get = commands.add_parser("get", help="one proxied GET")
-    get.add_argument("namespace")
-    get.add_argument("kind", help="pods or services")
-    get.add_argument("name")
-    get.add_argument("port", help="a port number or a port name")
-    get.add_argument("path", help="relative to the backend's root; may carry ?query")
-    get.add_argument("--scheme", default="http", help="http (default) or https")
-    get.add_argument("--timeout", type=float, default=30, help="seconds for the whole call")
-    args = parser.parse_args(argv)
-    try:
-        result = task_get(
-            args.namespace,
-            args.kind,
-            args.name,
-            args.port,
-            args.path,
-            scheme=args.scheme,
-            timeout=args.timeout,
+
+    def common(command: argparse.ArgumentParser) -> None:
+        command.add_argument("namespace")
+        command.add_argument("kind", help="pods or services")
+        command.add_argument("name")
+        command.add_argument("port", help="a port number or a port name")
+        command.add_argument("path", help="relative to the backend's root; may carry ?query")
+        command.add_argument(
+            "--header",
+            action="append",
+            metavar="'NAME: VALUE'",
+            help=f"a request header ({', '.join(ALLOWED_HEADERS)}); repeatable",
         )
+        command.add_argument("--scheme", default="http", help="http (default) or https")
+        command.add_argument("--timeout", type=float, default=30, help="seconds for the whole call")
+
+    common(commands.add_parser("get", help="one proxied GET"))
+    request = commands.add_parser("request", help="one proxied request, any method")
+    request.add_argument("method", help=", ".join(METHODS))
+    common(request)
+    body = request.add_mutually_exclusive_group()
+    body.add_argument("--data", help="the request body (UTF-8 text)")
+    body.add_argument("--data-file", help="a file to send as the request body (4 MiB at most)")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(_attach_option_values(sys.argv[1:] if argv is None else argv))
+    name = "rw_k8s_proxy_get" if args.command == "get" else "rw_k8s_proxy_request"
+    try:
+        headers = _header_args(args.header)
+        options = {"headers": headers, "scheme": args.scheme, "timeout": args.timeout}
+        if args.command == "get":
+            result = task_get(args.namespace, args.kind, args.name, args.port, args.path, **options)
+        else:
+            body = None
+            if args.data is not None:
+                body = args.data.encode("utf-8", "surrogateescape")
+            elif args.data_file is not None:
+                body = _data_file(args.data_file)
+            result = task_request(
+                args.method,
+                args.namespace,
+                args.kind,
+                args.name,
+                args.port,
+                args.path,
+                body=body,
+                **options,
+            )
     except FixtureMismatch as exc:
         print(exc.message, file=sys.stderr)
         return _MISMATCH_EXIT
     except RwError as exc:
         _record_error(exc)
-        print(f"rw_k8s_proxy_get: {exc.code}: {exc.message}", file=sys.stderr)
+        print(f"{name}: {exc.code}: {exc.message}", file=sys.stderr)
         return 1
     print(json.dumps(result, separators=(",", ":")))
     return 0

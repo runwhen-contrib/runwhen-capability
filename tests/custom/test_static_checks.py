@@ -335,6 +335,18 @@ def test_rw_k8s_proxy_get_is_a_known_helper_and_a_misspelling_of_it_is_not():
     assert "rw_k8s_proxy_gett" in message
 
 
+def test_rw_k8s_proxy_request_is_a_known_helper_and_a_misspelling_of_it_is_not():
+    assert "rw_k8s_proxy_request" in RW_SH_HELPERS
+    good = (
+        'rw_k8s_proxy_request PUT "$NS" services loki 3100 /ring/forget --data "$body" \\\n'
+        "  --header 'Content-Type: application/json'\n"
+    )
+    assert _messages_for(good, E_UNKNOWN_SDK_HELPER) == []
+    (message,) = _messages_for("rw_k8s_proxy_requests PUT a b c d e\n", E_UNKNOWN_SDK_HELPER)
+    assert "rw_k8s_proxy_requests" in message
+    assert "rw_k8s_proxy_request" in message  # the list of helpers names it
+
+
 def test_rw_artifact_undeclared_name_flagged():
     (message,) = _messages_for("seq 1 3 | rw_artifact mystery -\n", E_OUTPUT_UNDECLARED)
     assert "mystery" in message

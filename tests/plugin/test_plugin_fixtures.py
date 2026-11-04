@@ -708,6 +708,27 @@ def test_a_scenario_mixes_cli_calls_and_proxy_calls_with_defaults(tmp_path):
     assert fourth["argv"] == ["kubectl", "get", "events"]
 
 
+def test_an_old_scenario_loads_without_per_request_api_server_headers(tmp_path):
+    old = {
+        **PROXY_CALL,
+        "response": {
+            **PROXY_CALL["response"],
+            "headers": {
+                "audit-id": "abc",
+                "date": "Tue, 04 Nov 2026 10:00:00 GMT",
+                "x-kubernetes-pf-flowschema-uid": "f",
+                "x-kubernetes-pf-prioritylevel-uid": "p",
+                "content-type": "application/json",
+            },
+        },
+    }
+    text = dump_scenario(
+        resource=None, inputs={}, settings={}, identity={}, calls=[old], expect={"status": "ok"}
+    )
+    (call,) = load_scenario(write(tmp_path, text)).calls
+    assert call["response"]["headers"] == {"content-type": "application/json"}
+
+
 def test_proxy_calls_round_trip_through_dump_and_load(tmp_path):
     calls = [KUBECTL_CALL, PROXY_CALL]
     text = dump_scenario(
@@ -764,7 +785,7 @@ def test_a_bad_proxy_call_says_what_is_wrong(tmp_path, call, needle):
     assert needle in "\n".join(exc.value.errors)
 
 
-def proxy_cli(session, *args, path_tail="/usr/bin:/bin"):
+def proxy_cli(session, *args, path_tail="/usr/bin:/bin", command="get"):
     """`python -m runwhen_capability.k8s_proxy get ...` under the session's environment."""
     src = str(Path(__import__("runwhen_capability").__file__).parents[1])
     env = {
@@ -774,7 +795,7 @@ def proxy_cli(session, *args, path_tail="/usr/bin:/bin"):
         **session.env,
     }
     return subprocess.run(
-        [sys.executable, "-m", "runwhen_capability.k8s_proxy", "get", *args],
+        [sys.executable, "-m", "runwhen_capability.k8s_proxy", command, *args],
         env=env,
         capture_output=True,
         text=True,
@@ -922,3 +943,224 @@ def test_record_logs_proxy_calls_between_cli_calls_in_order(fake_bin, tmp_path, 
     assert calls[1]["response"]["status"] == 200 and calls[1]["response"]["body"] == "{}"
     # the proxy itself is not a recorded call: kubectl was started past the shim
     assert not any(c.get("argv", [""])[1:2] == ["proxy"] for c in calls)
+
+
+# -- k8s-proxy-request calls -----------------------------------------------------------------
+
+PUT_CALL = {
+    "type": "k8s-proxy-request",
+    "request": {
+        "method": "PUT",
+        "namespace": "vault",
+        "kind": "services",
+        "name": "vault",
+        "port": 8200,
+        "path": "/v1/x",
+        "scheme": "http",
+        "headers": {"content-type": "application/json"},
+        "body": '{"a":1}',
+    },
+    "response": {
+        "status": 204,
+        "headers": {},
+        "body": "",
+        "truncated": False,
+        "location": None,
+    },
+}
+PUT_ARGS = ("PUT", "vault", "services", "vault", "8200", "/v1/x")
+PUT_OPTIONS = ("--header", "Content-Type: application/json", "--data", '{"a":1}')
+
+
+def test_request_calls_round_trip_through_dump_and_load(tmp_path):
+    binary = {
+        **PUT_CALL,
+        "request": {**PUT_CALL["request"], "body": None, "bodyBase64": "/wA="},
+    }
+    del binary["request"]["body"]
+    calls = [
+        PUT_CALL,
+        binary,
+        {**PUT_CALL, "request": {**PUT_CALL["request"], "method": "DELETE"}},
+    ]
+    del calls[2]["request"]["body"]
+    text = dump_scenario(
+        resource=None, inputs={}, settings={}, identity={}, calls=calls, expect={"status": "ok"}
+    )
+    assert "type: k8s-proxy-request" in text and "bodyBase64: /wA=" in text
+    assert load_scenario(write(tmp_path, text)).calls == calls
+
+
+def test_a_get_may_carry_headers_in_its_old_call_shape(tmp_path):
+    call = {**PROXY_CALL, "request": {**PROXY_CALL["request"], "headers": {"accept": "a/b"}}}
+    text = dump_scenario(
+        resource=None, inputs={}, settings={}, identity={}, calls=[call], expect={"status": "ok"}
+    )
+    assert load_scenario(write(tmp_path, text)).calls == [call]
+
+
+def test_a_scenario_that_predates_methods_still_loads_and_defaults_are_filled(tmp_path):
+    (call,) = load_scenario(write(tmp_path, MIXED)).calls[1:2]
+    assert call["type"] == "k8s-proxy-get" and "method" not in call["request"]
+
+
+def test_a_request_call_without_a_scheme_gets_http(tmp_path):
+    scenario = load_scenario(
+        write(
+            tmp_path,
+            "calls:\n  - {type: k8s-proxy-request, request: {method: POST, namespace: a,"
+            " kind: pods, name: b, port: 1, path: x}, response: {status: 200}}\n"
+            "expect: {status: ok}\n",
+        )
+    )
+    assert scenario.calls[0]["request"]["scheme"] == "http"
+    assert scenario.calls[0]["response"]["truncated"] is False
+
+
+REQUEST = "namespace: a, kind: pods, name: b, port: 1, path: x"
+
+
+@pytest.mark.parametrize(
+    ("call", "needle"),
+    [
+        (f"{{type: k8s-proxy-request, request: {{{REQUEST}}}, response: {{status: 200}}}}",
+         "calls[0].request: 'method' is a required"),
+        (f"{{type: k8s-proxy-request, request: {{method: TRACE, {REQUEST}}},"
+         " response: {status: 200}}", "calls[0].request.method"),
+        (f"{{type: k8s-proxy-request, request: {{method: put, {REQUEST}}},"
+         " response: {status: 200}}", "calls[0].request.method"),
+        (f"{{type: k8s-proxy-request, request: {{method: PUT, {REQUEST}, extra: 1}},"
+         " response: {status: 200}}", "unknown key(s) extra"),
+        (f"{{type: k8s-proxy-request, request: {{method: PUT, {REQUEST}, body: 5}},"
+         " response: {status: 200}}", "calls[0].request.body"),
+        (f"{{type: k8s-proxy-request, request: {{method: PUT, {REQUEST}, headers: {{a: 1}}}},"
+         " response: {status: 200}}", "calls[0].request.headers.a"),
+        (f"{{type: k8s-proxy-request, request: {{method: PUT, {REQUEST}}}}}",
+         "needs a response or an error"),
+        (f"{{type: k8s-proxy-request, request: {{method: GET, {REQUEST}, body: x}},"
+         " response: {status: 200}}", "a GET request cannot carry a body"),
+        (f"{{type: k8s-proxy-request, request: {{method: PUT, {REQUEST}, body: x,"
+         " bodyBase64: eA==}, response: {status: 200}}", "body or bodyBase64, not both"),
+        (f"{{type: k8s-proxy-request, request: {{method: PUT, {REQUEST}, bodyBase64: '***'}},"
+         " response: {status: 200}}", "bodyBase64 is not valid base64"),
+        (f"{{type: k8s-proxy-request, request: {{method: PUT, {REQUEST},"
+         " headers: {Authorization: x}}, response: {status: 200}}",
+         "header 'Authorization' is not allowed"),
+        (f"{{type: k8s-proxy-get, request: {{{REQUEST}, method: PUT}}, response: {{status: 200}}}}",
+         "unknown key(s) method"),
+        (f"{{type: k8s-proxy-get, request: {{{REQUEST}, body: x}}, response: {{status: 200}}}}",
+         "unknown key(s) body"),
+        (f"{{type: k8s-proxy-get, request: {{{REQUEST}, headers: {{Cookie: x}}}},"
+         " response: {status: 200}}", "header 'Cookie' is not allowed"),
+    ],
+)  # fmt: skip
+def test_a_bad_request_call_says_what_is_wrong(tmp_path, call, needle):
+    with pytest.raises(FixtureError) as exc:
+        load_scenario(write(tmp_path, f"calls: [{call}]\nexpect: {{status: ok}}\n"))
+    assert needle in "\n".join(exc.value.errors)
+
+
+def test_replay_serves_a_request_call_and_a_k8s_proxy_get_serves_a_get_request():
+    get_call = {**PROXY_CALL, "request": {**PROXY_CALL["request"], "headers": {"accept": "a/b"}}}
+    as_request = {
+        **get_call,
+        "type": "k8s-proxy-request",
+        "request": {**get_call["request"], "method": "GET"},
+    }
+    with ShimSession.replay([PUT_CALL, get_call, as_request], []) as session:
+        done = proxy_cli(session, *PUT_ARGS, *PUT_OPTIONS, command="request")
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout)["status"] == 204
+        # the recorded k8s-proxy-get answers a request GET, and the request GET a plain get
+        get_args = (
+            "vault",
+            "services",
+            "vault",
+            "8200",
+            "/v1/sys/health",
+            "--header",
+            "Accept: a/b",
+        )
+        done = proxy_cli(session, "GET", *get_args, command="request")
+        assert done.returncode == 0, done.stderr
+        done = proxy_cli(session, *get_args)
+        assert done.returncode == 0, done.stderr
+        assert (session.mismatches(), session.unconsumed()) == ([], 0)
+
+
+@pytest.mark.parametrize(
+    ("args", "needle"),
+    [
+        (("POST", *PUT_ARGS[1:], *PUT_OPTIONS), "got k8s-proxy-request POST http vault/services"),
+        (("DELETE", *PUT_ARGS[1:], *PUT_OPTIONS), "got k8s-proxy-request DELETE http"),
+        (("GET", *PUT_ARGS[1:], *PUT_OPTIONS[:2]), "got k8s-proxy-get http vault/services"),
+        (
+            (*PUT_ARGS, "--header", "Content-Type: application/json", "--data", '{"a":2}'),
+            'body="{\\"a\\":2}"',
+        ),
+        ((*PUT_ARGS, "--data", '{"a":1}'), "got k8s-proxy-request PUT http vault/services"),
+        (
+            (*PUT_ARGS, "--header", "Content-Type: text/plain", "--data", '{"a":1}'),
+            'headers={"content-type": "text/plain"}',
+        ),
+        ((*PUT_ARGS, *PUT_OPTIONS[:2]), "got k8s-proxy-request PUT http vault/services"),
+    ],
+)
+def test_replay_a_changed_method_header_or_body_is_a_mismatch_naming_the_method(args, needle):
+    with ShimSession.replay([PUT_CALL], []) as session:
+        done = proxy_cli(session, *args, command="request")
+        assert done.returncode == 97
+        assert (
+            "E_FIXTURE_MISMATCH: expected k8s-proxy-request PUT http vault/services/vault:8200 "
+            '/v1/x headers={"content-type": "application/json"} body="{\\"a\\":1}" got '
+        ) in done.stderr
+        assert needle in done.stderr
+        (mismatch,) = session.mismatches()
+        assert mismatch["expected"].startswith("k8s-proxy-request PUT")
+        assert session.unconsumed() == 1  # a mismatch consumes nothing
+
+
+def test_replay_matches_a_text_body_and_its_base64_spelling_and_header_case():
+    spelled = {
+        **PUT_CALL,
+        "request": {
+            **{k: v for k, v in PUT_CALL["request"].items() if k not in ("body", "headers")},
+            "headers": {"Content-Type": "application/json"},
+            "bodyBase64": "eyJhIjoxfQ==",
+        },
+    }
+    with ShimSession.replay([spelled], []) as session:
+        done = proxy_cli(session, *PUT_ARGS, *PUT_OPTIONS, command="request")
+        assert done.returncode == 0, done.stderr
+
+
+def test_replay_a_cli_call_where_a_request_call_is_recorded_names_the_method():
+    with ShimSession.replay([PUT_CALL, KUBECTL_CALL], ["kubectl"]) as session:
+        done = sh(session, "kubectl get pods")
+        assert done.returncode == 97
+        assert (
+            "E_FIXTURE_MISMATCH: expected k8s-proxy-request PUT http vault/services/vault:8200 "
+            '/v1/x headers={"content-type": "application/json"} body="{\\"a\\":1}" '
+            "got kubectl get pods"
+        ) in done.stderr
+
+
+def test_the_shims_describe_is_the_k8s_proxy_describe():
+    """plugin/shims.py carries its own copy of `describe_request` (it runs without the SDK)."""
+    from runwhen_capability.k8s_proxy import describe_request
+    from runwhen_capability.plugin.shims import _SHIM_PY
+
+    namespace: dict = {}
+    exec(_SHIM_PY.split("def replay(")[0], namespace)  # noqa: S102 -- the definitions only
+    long_body = "é" * 70
+    requests = [
+        PROXY_CALL["request"],
+        PUT_CALL["request"],
+        {**PUT_CALL["request"], "bodyBase64": "/wA=", "body": None},
+        {**PUT_CALL["request"], "body": long_body, "method": "PATCH"},
+        {**PROXY_CALL["request"], "method": "GET", "headers": {"Accept": "a", "Range": "r"}},
+        {**PROXY_CALL["request"], "method": "head", "scheme": None},
+    ]
+    for request in requests:
+        request = {k: v for k, v in request.items() if v is not None}
+        assert namespace["describe"]({"request": request}) == describe_request(request)

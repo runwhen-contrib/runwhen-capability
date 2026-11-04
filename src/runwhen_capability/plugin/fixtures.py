@@ -17,9 +17,15 @@ A scenario is one YAML file, `skills/<skill>/tests/<task>/<scenario>.yaml`:
         stderr: "..."                     # default ""
       - type: k8s-proxy-get               # ctx.k8s_proxy_get / rw_k8s_proxy_get (k8s_proxy.py)
         request: {namespace: vault, kind: services, name: vault, port: 8200,
-                  path: /v1/sys/health, scheme: http}      # scheme defaults to http
+                  path: /v1/sys/health, scheme: http,      # scheme defaults to http
+                  headers: {accept: application/json}}     # optional; names are case-insensitive
         response: {status: 200, headers: {}, body: "...", truncated: false, location: null}
         # or, for a call that failed:  error: {code: unreachable, message: "...", scope: ...}
+      - type: k8s-proxy-request           # ctx.k8s_proxy_request / rw_k8s_proxy_request
+        request: {method: PUT, namespace: vault, kind: services, name: vault, port: 8200,
+                  path: /v1/x, body: "{}"}                 # or bodyBase64: "e30=" (bytes)
+        response: {status: 204}
+        # A k8s-proxy-get is a GET with no body: replay treats it as k8s-proxy-request GET.
     expect:
       status: ok | partial | failed | skipped
       errorCodes: [permission_denied]     # optional; the envelope's codes as a set
@@ -45,7 +51,11 @@ import yaml
 
 from ..contracts import load_yaml
 from ..k8s_proxy import CALL_TYPE as PROXY_CALL_TYPE
+from ..k8s_proxy import CALL_TYPES as PROXY_CALL_TYPES
+from ..k8s_proxy import METHODS as PROXY_METHODS
+from ..k8s_proxy import REQUEST_CALL_TYPE as PROXY_REQUEST_CALL_TYPE
 from ..k8s_proxy import normalize_call as normalize_proxy_call
+from ..k8s_proxy import request_problem as proxy_request_problem
 from ..reftime import format_now, parse_now
 from ..rwerrors import ERROR_CODES
 
@@ -68,58 +78,83 @@ _CLI_CALL: dict[str, Any] = {
     },
 }
 
-_PROXY_CALL: dict[str, Any] = {
+_PROXY_RESPONSE: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["type", "request"],
+    "required": ["status"],
     "properties": {
-        "type": {"const": PROXY_CALL_TYPE},
-        "request": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["namespace", "kind", "name", "port", "path"],
-            "properties": {
-                "namespace": {"type": "string"},
-                "kind": {"enum": ["pods", "services"]},
-                "name": {"type": "string"},
-                "port": {"type": ["integer", "string"]},
-                "path": {"type": "string"},
-                "scheme": {"enum": ["http", "https"]},
-            },
-        },
-        "response": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["status"],
-            "properties": {
-                "status": {"type": "integer"},
-                "headers": _STRING_MAP,
-                "body": {"type": "string"},
-                "truncated": {"type": "boolean"},
-                "location": {"type": ["string", "null"]},
-            },
-        },
-        "error": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["code", "message"],
-            "properties": {
-                "code": {"enum": list(ERROR_CODES)},
-                "message": {"type": "string"},
-                "scope": {"type": "string"},
-                "hint": {"type": "string"},
-            },
-        },
+        "status": {"type": "integer"},
+        "headers": _STRING_MAP,
+        "body": {"type": "string"},
+        "truncated": {"type": "boolean"},
+        "location": {"type": ["string", "null"]},
     },
 }
 
-#: A call is a proxy call when it names a `type`; otherwise it is a CLI call (the original
-#: shape), so a mistake in either reports against its own schema.
+_PROXY_ERROR: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["code", "message"],
+    "properties": {
+        "code": {"enum": list(ERROR_CODES)},
+        "message": {"type": "string"},
+        "scope": {"type": "string"},
+        "hint": {"type": "string"},
+    },
+}
+
+_PROXY_REQUEST_PROPERTIES: dict[str, Any] = {
+    "namespace": {"type": "string"},
+    "kind": {"enum": ["pods", "services"]},
+    "name": {"type": "string"},
+    "port": {"type": ["integer", "string"]},
+    "path": {"type": "string"},
+    "scheme": {"enum": ["http", "https"]},
+    "headers": _STRING_MAP,
+}
+
+
+def _proxy_call(call_type: str, request_extra: dict[str, Any], required: list[str]) -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["type", "request"],
+        "properties": {
+            "type": {"const": call_type},
+            "request": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": required,
+                "properties": {**_PROXY_REQUEST_PROPERTIES, **request_extra},
+            },
+            "response": _PROXY_RESPONSE,
+            "error": _PROXY_ERROR,
+        },
+    }
+
+
+_PROXY_CALL = _proxy_call(PROXY_CALL_TYPE, {}, ["namespace", "kind", "name", "port", "path"])
+_PROXY_REQUEST_CALL = _proxy_call(
+    PROXY_REQUEST_CALL_TYPE,
+    {
+        "method": {"enum": list(PROXY_METHODS)},
+        "body": {"type": "string"},
+        "bodyBase64": {"type": "string"},
+    },
+    ["method", "namespace", "kind", "name", "port", "path"],
+)
+
+#: A call is a proxy call when it names one of the proxy `type`s; otherwise it is a CLI call (the
+#: original shape), so a mistake in either reports against its own schema.
 _CALL: dict[str, Any] = {
     "type": "object",
     "if": {"required": ["type"], "properties": {"type": {"const": PROXY_CALL_TYPE}}},
     "then": _PROXY_CALL,
-    "else": _CLI_CALL,
+    "else": {
+        "if": {"required": ["type"], "properties": {"type": {"const": PROXY_REQUEST_CALL_TYPE}}},
+        "then": _PROXY_REQUEST_CALL,
+        "else": _CLI_CALL,
+    },
 }
 
 SCENARIO_SCHEMA: dict[str, Any] = {
@@ -316,24 +351,27 @@ def _expectation_problems(expect: dict) -> list[str]:
 
 
 def _call_problems(calls: list[dict]) -> list[str]:
-    """What the schema cannot say about proxy calls: exactly one of response and error."""
+    """What the schema cannot say about proxy calls: exactly one of response and error, and a
+    request that a real call could be (an allowed header, a body only where one may go)."""
     problems = []
     for i, call in enumerate(calls):
-        if call.get("type") != PROXY_CALL_TYPE:
+        call_type = call.get("type")
+        if call_type not in PROXY_CALL_TYPES:
             continue
         if "response" in call and "error" in call:
-            problems.append(
-                f"calls[{i}]: a {PROXY_CALL_TYPE} call has a response or an error (not both)"
-            )
+            problems.append(f"calls[{i}]: a {call_type} call has a response or an error (not both)")
         elif "response" not in call and "error" not in call:
-            problems.append(f"calls[{i}]: a {PROXY_CALL_TYPE} call needs a response or an error")
+            problems.append(f"calls[{i}]: a {call_type} call needs a response or an error")
+        problem = proxy_request_problem(call["request"], call_type)
+        if problem:
+            problems.append(f"calls[{i}].request: {problem}")
     return problems
 
 
 def _normal_call(call: dict) -> dict:
     """A call with its defaults filled: a CLI call's rc/stdout/stderr, a proxy call's scheme
     and response fields."""
-    if call.get("type") == PROXY_CALL_TYPE:
+    if call.get("type") in PROXY_CALL_TYPES:
         return normalize_proxy_call(call)
     return {
         "argv": list(call["argv"]),
