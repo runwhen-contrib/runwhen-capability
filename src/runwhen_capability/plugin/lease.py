@@ -37,6 +37,19 @@ PLATFORM_MINTED_FILE_ENV); the same name anywhere else, and every other RW_* nam
 refused. Every value, and every file's content (a minted credential's token too), is
 redacted from the envelope.
 
+Credentials, script auth plans (contracts-v4). A `credentials[]` entry whose `authPlan.method`
+is a `script` is run here, before the task, by plugin/auth_script.py (its module docstring is
+the script contract): the plan's archive (the integration plugin's, which may be another than
+the task's) is loaded like the task's code, but asked of the relay by hash (`GET .../code?sha256=`)
+when it is not cached; the runner's `materialized[].reference` of the same credentialType is
+written to `$RW_AUTH_REF_DIR/<key>`; and what the script produces joins the task's environment
+(a file's path in `materialize.file.env`, or the `NAME=value` pairs) under the same reserved-name
+check and redaction as a materialized credential. A k8s-secret, vault or file reference without
+reference material is `invalid_input`; any failure is an envelope with scope `auth` and the task
+script never starts. The auth script's directory (`auth-<n>/` in the task's) is deleted with the
+rest when the task ends, and the request's deadline (`deadline_s`) bounds the scripts and the task
+together. `RW_AUTH_*` exists only in the auth script's environment.
+
 Credentials, old. Today's `credentials` map of the poll response (`{name: value}`) keeps its
 meaning: the value of a Kubernetes kubeconfig entry is written to a private file and
 `KUBECONFIG` points at it (as for a bundle's `k8s.kubeconfig` input). Every value of the
@@ -54,12 +67,13 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from .._redaction import Redactor
 from ..context import Context
 from ..contracts import ArchiveError, TreeEntry, archive_sha256, check, schema, validate
 from ..contracts import archive as archive_mod
@@ -67,6 +81,8 @@ from ..envelope import derive_envelope
 from ..errors import ArtifactError
 from ..models import OutputDecl
 from ..relay import TRANSPORT_ERROR, RelayClient
+from .auth_script import MAX_SECONDS as MAX_AUTH_SECONDS
+from .auth_script import REFERENCE_KEY, AuthScriptError, run_script_plan
 from .run import (
     PLATFORM_MINTED_FILE_ENV,
     ArtifactUploader,
@@ -182,7 +198,9 @@ def _remove_stale_temp_files(cache: Path) -> None:
         pass
 
 
-def _fetch_archive(relay: RelayClient, code_archive: dict, path: Path) -> bytes:
+def _fetch_archive(
+    relay: RelayClient, code_archive: dict, path: Path, *, by_hash: bool = False
+) -> bytes:
     """The archive `code_archive` (`{sha256, size}`) names, fetched from the runner relay
     (`GET /v1/tasks/{requestId}/code`), checked and stored at `path` (the cache's
     `<hex>.tar`). The body is read at most `size` (and MAX_ARCHIVE_BYTES) bytes plus one,
@@ -191,7 +209,8 @@ def _fetch_archive(relay: RelayClient, code_archive: dict, path: Path) -> bytes:
     sha256. Only bytes that pass are stored, written to a unique temporary file and renamed
     into place, so a concurrent fetch of the same archive in this pod, or a crash, never
     leaves a partial file under the final name. A failure is a `dependency` LeaseError
-    that names the archive and the relay's code, never the URL or the token."""
+    that names the archive and the relay's code, never the URL or the token. `by_hash` asks
+    the relay for the archive by its sha256 (an auth script's, not the request's own code)."""
     sha = code_archive["sha256"]
     size = code_archive["size"]
     if size > archive_mod.MAX_ARCHIVE_BYTES:
@@ -203,7 +222,7 @@ def _fetch_archive(relay: RelayClient, code_archive: dict, path: Path) -> bytes:
     _remove_stale_temp_files(path.parent)
     cap = size
     try:
-        with relay.open_code() as stream:
+        with relay.open_code(sha if by_hash else None) as stream:
             header = stream.headers.get("X-RW-Sha256")
             if header is not None and header.removeprefix("sha256:").lower() != (
                 sha.removeprefix("sha256:").lower()
@@ -266,13 +285,19 @@ def _fetch_archive(relay: RelayClient, code_archive: dict, path: Path) -> bytes:
 
 
 def load_code(
-    code: dict, cache_dir: Path | None = None, relay: RelayClient | None = None
+    code: dict,
+    cache_dir: Path | None = None,
+    relay: RelayClient | None = None,
+    *,
+    by_hash: bool = False,
 ) -> tuple[dict[str, bytes], frozenset[str]]:
     """(files by plugin-root path, executable paths) of a lease's `code`, after checking
     them against the sha256 the lease names. An archive that is not in the cache is
     fetched through `relay` and cached (`_fetch_archive`); with no relay it is a
     `dependency` error. A cached archive that fails its hash is fetched again once when
-    there is a relay (`internal` error when there is none). Raises LeaseError."""
+    there is a relay (`internal` error when there is none). `by_hash`: a fetch asks the
+    relay for this archive by sha256 rather than for the request's own (auth scripts).
+    Raises LeaseError."""
     if "inline" in code:
         inline = code["inline"]
         entries = []
@@ -310,7 +335,7 @@ def load_code(
                     path.unlink()
                 except OSError:
                     pass  # the fetch replaces it anyway
-                data = _fetch_archive(relay, code["archive"], path)
+                data = _fetch_archive(relay, code["archive"], path, by_hash=by_hash)
         except FileNotFoundError:
             if relay is None:
                 raise LeaseError(
@@ -318,7 +343,7 @@ def load_code(
                     f"archive {sha} is not in the cache and there is no runner relay to fetch "
                     "it from",
                 ) from None
-            data = _fetch_archive(relay, code["archive"], path)
+            data = _fetch_archive(relay, code["archive"], path, by_hash=by_hash)
         except OSError as exc:
             raise LeaseError("internal", f"archive {sha} could not be read: {exc}") from None
         try:
@@ -480,6 +505,8 @@ class _Materialized:
     secrets: list[str]  # every string to scrub from what comes back
     # PLATFORM_MINTED_FILE_ENV names set as a file of their own credential type's entry
     allowed_env: frozenset[str] = frozenset()
+    # credentialType -> reference material (key, content) for that type's script auth plan
+    references: dict[str, list[tuple[str, bytes]]] = field(default_factory=dict)
 
 
 def _parse_materialized(items: Sequence[Any]) -> _Materialized:
@@ -490,6 +517,7 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
     env: dict[str, str] = {}
     secrets: list[str] = []
     allowed: set[str] = set()
+    references: dict[str, list[tuple[str, bytes]]] = {}
 
     def bad(index: int, problem: str) -> LeaseError:
         return LeaseError("invalid_input", f"materialized[{index}]: {problem}")
@@ -508,8 +536,17 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
     for index, item in enumerate(items):
         if not isinstance(item, dict) or not isinstance(item.get("credentialType"), str):
             raise bad(index, "not a materializedCredential (credentialType is required)")
-        if set(item) - {"credentialType", "files", "env"}:
+        if set(item) - {"credentialType", "files", "env", "reference"}:
             raise bad(index, "unknown field")
+        if "reference" in item:
+            if item.get("files") or item.get("env"):
+                raise bad(index, "reference cannot come with files or env")
+            if item["credentialType"] in references:
+                raise bad(index, f"a second reference for {item['credentialType']!r}")
+            references[item["credentialType"]] = _parse_reference(
+                item["reference"], index, secrets, bad
+            )
+            continue
         for entry in item.get("files") or []:
             if not isinstance(entry, dict) or set(entry) - {"env", "mode", "content", "encoding"}:
                 raise bad(index, "a file has an unknown field or is not an object")
@@ -550,7 +587,47 @@ def _parse_materialized(items: Sequence[Any]) -> _Materialized:
             claim(index, name)
             env[name] = value
             secrets.append(value)
-    return _Materialized(files, env, [x for x in secrets if x], frozenset(allowed))
+    return _Materialized(files, env, [x for x in secrets if x], frozenset(allowed), references)
+
+
+def _parse_reference(
+    reference: Any, index: int, secrets: list[str], bad: Callable[[int, str], LeaseError]
+) -> list[tuple[str, bytes]]:
+    """The `reference.files` of a materialized entry as (key, content): checked against
+    materializedCredential, every content (and its base64 text) added to `secrets`."""
+    if not isinstance(reference, dict) or set(reference) - {"files"}:
+        raise bad(index, "reference must be {files: [...]}")
+    items = reference.get("files")
+    if not isinstance(items, list) or not items:
+        raise bad(index, "reference.files must be a non-empty list")
+    out: list[tuple[str, bytes]] = []
+    for entry in items:
+        if not isinstance(entry, dict) or set(entry) - {"key", "content", "encoding"}:
+            raise bad(index, "a reference file has an unknown field or is not an object")
+        key, content = entry.get("key"), entry.get("content")
+        if not isinstance(key, str) or not isinstance(content, str):
+            raise bad(index, "a reference file needs a string key and content")
+        if not REFERENCE_KEY.match(key) or key in (".", ".."):
+            raise bad(index, f"reference key {key!r} is not a file name")
+        if any(key == other for other, _ in out):
+            raise bad(index, f"reference key {key!r} is given twice")
+        encoding = entry.get("encoding", "utf-8")
+        if encoding not in ("utf-8", "base64"):
+            raise bad(index, f"reference file {key!r}: encoding must be utf-8 or base64")
+        if encoding == "base64":
+            try:
+                data = base64.b64decode(content, validate=True)
+            except (binascii.Error, ValueError):
+                raise bad(index, f"reference file {key!r}: content is not valid base64") from None
+            secrets.append(content)
+        else:
+            data = content.encode("utf-8")
+        try:
+            secrets.append(data.decode("utf-8"))
+        except UnicodeDecodeError:
+            pass
+        out.append((key, data))
+    return out
 
 
 def wipe_stale_credentials(root: Path | None = None) -> None:
@@ -625,6 +702,11 @@ def _run_valid_lease(
     log: logging.Logger,
 ) -> dict:
     """The envelope of a lease that satisfies the `lease` contract, without provenance."""
+    started = time.monotonic()
+
+    def elapsed() -> float:
+        return time.monotonic() - started
+
     try:
         spec = runspec_from_lease(doc, archive_cache=archive_cache, relay=relay)
     except LeaseError as exc:
@@ -640,7 +722,9 @@ def _run_valid_lease(
         kubeconfig = _kubeconfig_value(doc, credentials)
         parsed = _parse_materialized(materialized)
         redact.extend(parsed.secrets)
-        if kubeconfig or parsed.files:
+        plans = _script_plans(doc)
+        _check_reference_material(plans, parsed)
+        if kubeconfig or parsed.files or plans:
             task_dir = _task_secrets_dir(root)
         if kubeconfig:
             path = task_dir / "kubeconfig"
@@ -650,6 +734,27 @@ def _run_valid_lease(
             _write_secret_file(task_dir / name, data, mode)
             extra_env[name] = str(task_dir / name)
         extra_env.update(parsed.env)
+        if plans:
+            assert task_dir is not None
+            _run_script_plans(
+                plans,
+                parsed=parsed,
+                task_dir=task_dir,
+                extra_env=extra_env,
+                redact=redact,
+                relay=relay,
+                archive_cache=archive_cache,
+                remaining=lambda: None if deadline_s is None else deadline_s - elapsed(),
+                log=log,
+            )
+            if deadline_s is not None:
+                # the request's deadline covers the auth scripts too
+                left = deadline_s - elapsed()
+                if left <= 0:
+                    raise LeaseError(
+                        "timeout", "the request's deadline passed while the auth ran", "auth"
+                    )
+                spec.timeout_s = min(spec.timeout_s or left, left)
         check_extra_env(extra_env, allow=parsed.allowed_env)
         uploader = None
         if relay is not None:
@@ -659,7 +764,7 @@ def _run_valid_lease(
                 task_name=doc["task"]["name"],
                 scope_dir=scope_dir,
                 output_decls=output_decls,
-                deadline_at=None if deadline_s is None else time.monotonic() + deadline_s,
+                deadline_at=None if deadline_s is None else started + deadline_s,
             )
         outcome = execute(
             spec,
@@ -678,6 +783,83 @@ def _run_valid_lease(
     finally:
         if task_dir is not None:
             shutil.rmtree(task_dir, ignore_errors=True)
+
+
+# -- script auth plans -------------------------------------------------------------------------
+
+#: Reference kinds whose credential is ambient or mounted by the pod: no material is sent.
+_NO_MATERIAL_KINDS = frozenset({"in-cluster-sa", "cloud-identity"})
+
+
+def _script_plans(lease: dict) -> list[dict]:
+    """The `authPlan` of each lease credential whose method is a script, in lease order."""
+    return [
+        entry["authPlan"]
+        for entry in lease["credentials"]
+        if "authPlan" in entry and "script" in entry["authPlan"]["method"]
+    ]
+
+
+def _check_reference_material(plans: Sequence[dict], parsed: _Materialized) -> None:
+    """A script plan whose reference is a secret, vault path or file needs the runner's
+    `materialized[].reference` for its credential type (invalid_input, before any code is
+    fetched); in-cluster-sa and cloud-identity need none."""
+    for plan in plans:
+        credential_type = plan["credentialType"]
+        if (
+            credential_type not in parsed.references
+            and plan["reference"]["kind"] not in _NO_MATERIAL_KINDS
+        ):
+            raise LeaseError(
+                "invalid_input", f"no reference material for {credential_type}", "auth"
+            )
+
+
+def _run_script_plans(
+    plans: Sequence[dict],
+    *,
+    parsed: _Materialized,
+    task_dir: Path,
+    extra_env: dict[str, str],
+    redact: list[str],
+    relay: RelayClient | None,
+    archive_cache: Path | None,
+    remaining: Callable[[], float | None],
+    log: logging.Logger,
+) -> None:
+    """Runs each script plan (plugin/auth_script.py) before the task script and adds what it
+    produced to `extra_env` and its values to `redact`. Raises LeaseError (scope `auth`)
+    for the first plan that fails: the task script then never runs. Each plan gets
+    `<task_dir>/auth-<n>/`, which the caller deletes with the task's directory."""
+    for number, plan in enumerate(plans):
+        left = remaining()
+        if left is not None and left <= 0:
+            raise LeaseError(
+                "timeout", "the request's deadline passed before the auth script ran", "auth"
+            )
+        timeout_s = MAX_AUTH_SECONDS if left is None else min(MAX_AUTH_SECONDS, left)
+        try:
+            files, executable = load_code(
+                {"archive": plan["method"]["script"]["archive"]}, archive_cache, relay, by_hash=True
+            )
+        except LeaseError as exc:
+            raise LeaseError(exc.code, f"auth script archive: {exc.message}", "auth") from None
+        try:
+            result = run_script_plan(
+                plan,
+                files=files,
+                executable=executable,
+                reference=parsed.references.get(plan["credentialType"], []),
+                work_dir=task_dir / f"auth-{number}",
+                timeout_s=timeout_s,
+                redactor=Redactor([*redact]),
+                taken=extra_env,
+                log=log,
+            )
+        except AuthScriptError as exc:
+            raise LeaseError(exc.code, exc.message, exc.scope) from None
+        extra_env.update(result.env)
+        redact.extend(result.secrets)
 
 
 def _task_secrets_dir(root: Path) -> Path:
