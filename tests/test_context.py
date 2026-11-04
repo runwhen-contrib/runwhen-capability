@@ -363,3 +363,32 @@ def test_now_refuses_an_rw_now_that_is_not_a_utc_timestamp(tmp_path, monkeypatch
         monkeypatch.setenv("RW_NOW", bad)
         with pytest.raises(ValueError, match="RW_NOW"):
             _ctx(tmp_path).now()
+
+
+def test_k8s_proxy_request_and_get_pass_their_arguments_to_the_task_api(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "runwhen_capability.k8s_proxy.task_request",
+        lambda *args, **kwargs: seen.append(("request", args, kwargs)) or {"status": 204},
+    )
+    monkeypatch.setattr(
+        "runwhen_capability.k8s_proxy.task_get",
+        lambda *args, **kwargs: seen.append(("get", args, kwargs)) or {"status": 200},
+    )
+    ctx = Context(capability="c", operation="t", workdir=tmp_path)
+    assert ctx.k8s_proxy_request(
+        "PUT", "ns", "pods", "p", "metrics", "/x", body=b"b", headers={"Accept": "a"}, timeout=5
+    ) == {"status": 204}
+    assert ctx.k8s_proxy_get("ns", "pods", "p", 80, "/y", headers={"Range": "r"}) == {"status": 200}
+    assert seen == [
+        (
+            "request",
+            ("PUT", "ns", "pods", "p", "metrics", "/x"),
+            {"body": b"b", "headers": {"Accept": "a"}, "scheme": "http", "timeout": 5},
+        ),
+        (
+            "get",
+            ("ns", "pods", "p", 80, "/y"),
+            {"headers": {"Range": "r"}, "scheme": "http", "timeout": 30},
+        ),
+    ]
