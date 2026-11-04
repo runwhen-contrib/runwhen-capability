@@ -7,6 +7,18 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `rwtask test` records and replays `k8s-proxy-get` calls (`ctx.k8s_proxy_get`, `rw_k8s_proxy_get`) as
+  calls of their own. A scenario's `calls` items are now either `{argv, rc?, stdout?, stderr?, stdin?}`
+  or `{type: k8s-proxy-get, request: {namespace, kind, name, port, path, scheme?}, response: {status,
+  headers?, body?, truncated?, location?} | error: {code, message, scope?, hint?}}` (`plugin/fixtures.py`
+  schema, dump and load; `scheme` and the response fields default). With `RW_SHIM_MODE=record` the
+  helper appends its line to `$RW_SHIM_LOG` after the real call, in order with the shimmed CLI
+  calls (the `kubectl proxy` it starts is never a recorded call: the shim directory is skipped when it
+  looks for kubectl), and a call that failed is recorded as an `error` and raised again on replay.
+  With `RW_SHIM_MODE=replay` no proxy is started: the next recorded call must be a `k8s-proxy-get` with an
+  equal request, else `E_FIXTURE_MISMATCH` (exit 97 from the bash helper, an entry in the mismatch
+  file, as for a shim) and its response is returned. The shim session's consumed count and leftovers
+  cover both kinds of call, and a shim meeting a recorded proxy call reports it as a mismatch.
 - `ctx.k8s_proxy_get(namespace, kind, name, port, path, *, scheme="http", timeout=30)` and bash
   `rw_k8s_proxy_get <namespace> <pods|services> <name> <port> <path> [--scheme https] [--timeout N]`
   (`runwhen_capability/k8s_proxy.py`, security finding S17): a GET through the Kubernetes API

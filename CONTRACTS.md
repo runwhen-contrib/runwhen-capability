@@ -193,7 +193,9 @@ Stdout and stderr are logs and are never parsed for outputs.
 `stub_commands`) builds the same context and environment the runner does, so a
 Python script's unit test sees `ctx.resource`, `ctx.settings`, `ctx.run` and
 `ctx.error` with the V13 semantics and no cluster. `rwtask test` replays
-recorded CLI calls through PATH shims, for bash and Python scripts alike.
+recorded CLI calls through PATH shims, for bash and Python scripts alike; a
+`ctx.k8s_proxy_get` / `rw_k8s_proxy_get` call is recorded and replayed too, as a call of its own
+(`type: k8s-proxy-get` between the CLI calls, replayed without starting a proxy).
 A skill's `tests/` (the recorded fixtures) is authoring only: `rwtask compile`, `rwtask pull` and the
 registry never package it (archive.md section 2), so a script must not read it at run time
 (`rwtask validate` warns `W_SCRIPT_READS_TESTS`).

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -640,3 +641,284 @@ def test_an_unquoted_now_is_still_text(tmp_path):
 def test_now_must_be_a_utc_rfc3339_timestamp(tmp_path, value):
     with pytest.raises(FixtureError, match="now"):
         load_scenario(write(tmp_path, f'now: "{value}"\nexpect: {{status: ok}}\n'))
+
+
+# -- k8s-proxy-get calls ---------------------------------------------------------------------
+
+PROXY_CALL = {
+    "type": "k8s-proxy-get",
+    "request": {
+        "namespace": "vault",
+        "kind": "services",
+        "name": "vault",
+        "port": 8200,
+        "path": "/v1/sys/health",
+        "scheme": "http",
+    },
+    "response": {
+        "status": 200,
+        "headers": {"content-type": "application/json"},
+        "body": '{"sealed":false}',
+        "truncated": False,
+        "location": None,
+    },
+}
+KUBECTL_CALL = {"argv": ["kubectl", "get", "pods"], "rc": 0, "stdout": "pods\n", "stderr": ""}
+
+MIXED = """\
+calls:
+  - argv: [kubectl, get, pods]
+    stdout: "pods\\n"
+  - type: k8s-proxy-get
+    request: {namespace: vault, kind: services, name: vault, port: 8200, path: /v1/sys/health}
+    response: {status: 200, body: "{}"}
+  - type: k8s-proxy-get
+    request: {namespace: vault, kind: pods, name: v-0, port: metrics, path: m, scheme: https}
+    error: {code: unreachable, message: no route}
+  - argv: [kubectl, get, events]
+expect: {status: ok}
+"""
+
+
+def test_a_scenario_mixes_cli_calls_and_proxy_calls_with_defaults(tmp_path):
+    scenario = load_scenario(write(tmp_path, MIXED))
+    first, second, third, fourth = scenario.calls
+    assert first == {"argv": ["kubectl", "get", "pods"], "rc": 0, "stdout": "pods\n", "stderr": ""}
+    assert second == {
+        "type": "k8s-proxy-get",
+        "request": {
+            "namespace": "vault",
+            "kind": "services",
+            "name": "vault",
+            "port": 8200,
+            "path": "/v1/sys/health",
+            "scheme": "http",
+        },
+        "response": {
+            "status": 200,
+            "headers": {},
+            "body": "{}",
+            "truncated": False,
+            "location": None,
+        },
+    }
+    assert third["request"]["scheme"] == "https"
+    assert third["error"] == {"code": "unreachable", "message": "no route"}
+    assert "response" not in third
+    assert fourth["argv"] == ["kubectl", "get", "events"]
+
+
+def test_proxy_calls_round_trip_through_dump_and_load(tmp_path):
+    calls = [KUBECTL_CALL, PROXY_CALL]
+    text = dump_scenario(
+        resource=None, inputs={}, settings={}, identity={}, calls=calls, expect={"status": "ok"}
+    )
+    assert "type: k8s-proxy-get" in text
+    assert load_scenario(write(tmp_path, text)).calls == calls
+
+
+@pytest.mark.parametrize(
+    ("call", "needle"),
+    [
+        ("{type: k8s-proxy-get, response: {status: 200}}", "calls[0]: 'request' is a required"),
+        (
+            "{type: k8s-proxy-get, request: {namespace: a, kind: pods, name: b, port: 1}}",
+            "calls[0].request: 'path' is a required",
+        ),
+        (
+            "{type: k8s-proxy-get, request: {namespace: a, kind: nodes, name: b, port: 1, path: x},"
+            " response: {status: 200}}",
+            "calls[0].request.kind",
+        ),
+        (
+            "{type: k8s-proxy-get, request: {namespace: a, kind: pods, name: b, port: 1, path: x,"
+            " extra: 1}, response: {status: 200}}",
+            "unknown key(s) extra",
+        ),
+        (
+            "{type: k8s-proxy-get, request: {namespace: a, kind: pods, name: b, port: 1, path: x}}",
+            "needs a response or an error",
+        ),
+        (
+            "{type: k8s-proxy-get, request: {namespace: a, kind: pods, name: b, port: 1, path: x},"
+            " response: {status: 200}, error: {code: timeout, message: m}}",
+            "not both",
+        ),
+        (
+            "{type: k8s-proxy-get, request: {namespace: a, kind: pods, name: b, port: 1, path: x},"
+            " response: {status: ok}}",
+            "calls[0].response.status",
+        ),
+        (
+            "{type: k8s-proxy-get, request: {namespace: a, kind: pods, name: b, port: 1, path: x},"
+            " error: {code: nope, message: m}}",
+            "calls[0].error.code",
+        ),
+        ("{type: curl, argv: [x]}", "unknown key(s) type"),
+        ("{type: k8s-proxy-get, argv: [kubectl]}", "unknown key(s) argv"),
+    ],
+)
+def test_a_bad_proxy_call_says_what_is_wrong(tmp_path, call, needle):
+    with pytest.raises(FixtureError) as exc:
+        load_scenario(write(tmp_path, f"calls: [{call}]\nexpect: {{status: ok}}\n"))
+    assert needle in "\n".join(exc.value.errors)
+
+
+def proxy_cli(session, *args, path_tail="/usr/bin:/bin"):
+    """`python -m runwhen_capability.k8s_proxy get ...` under the session's environment."""
+    src = str(Path(__import__("runwhen_capability").__file__).parents[1])
+    env = {
+        "PATH": os.pathsep.join([*session.path_prepend, path_tail]),
+        "PYTHONPATH": src,
+        **{k: v for k, v in os.environ.items() if k.startswith("FAKE_KUBECTL")},
+        **session.env,
+    }
+    return subprocess.run(
+        [sys.executable, "-m", "runwhen_capability.k8s_proxy", "get", *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_replay_serves_a_mixed_sequence_in_order_and_counts_both_kinds():
+    calls = [KUBECTL_CALL, PROXY_CALL, {**KUBECTL_CALL, "argv": ["kubectl", "get", "events"]}]
+    with ShimSession.replay(calls, ["kubectl"]) as session:
+        assert sh(session, "kubectl get pods").stdout == "pods\n"
+        assert session.unconsumed() == 2
+        done = proxy_cli(session, "vault", "services", "vault", "8200", "/v1/sys/health")
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == PROXY_CALL["response"]
+        assert session.unconsumed() == 1
+        assert sh(session, "kubectl get events").returncode == 0
+        assert session.mismatches() == []
+        assert session.unconsumed() == 0
+
+
+def test_replay_starts_no_proxy_and_needs_no_kubectl_on_path():
+    with ShimSession.replay([PROXY_CALL], []) as session:
+        done = proxy_cli(
+            session, "vault", "services", "vault", "8200", "/v1/sys/health", path_tail=""
+        )
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout)["body"] == '{"sealed":false}'
+
+
+def test_replay_a_proxy_call_where_a_cli_call_is_recorded_is_a_mismatch():
+    with ShimSession.replay([KUBECTL_CALL, PROXY_CALL], ["kubectl"]) as session:
+        done = proxy_cli(session, "vault", "services", "vault", "8200", "/v1/sys/health")
+        assert done.returncode == 97
+        assert "E_FIXTURE_MISMATCH: expected kubectl get pods got k8s-proxy-get" in done.stderr
+        (mismatch,) = session.mismatches()
+        assert mismatch["index"] == 0
+        assert session.unconsumed() == 2  # a mismatch consumes nothing
+
+
+def test_replay_a_cli_call_where_a_proxy_call_is_recorded_is_a_mismatch():
+    with ShimSession.replay([PROXY_CALL, KUBECTL_CALL], ["kubectl"]) as session:
+        done = sh(session, "kubectl get pods")
+        assert done.returncode == 97
+        assert (
+            "E_FIXTURE_MISMATCH: expected k8s-proxy-get http vault/services/vault:8200 "
+            "/v1/sys/health got kubectl get pods"
+        ) in done.stderr
+        (mismatch,) = session.mismatches()
+        assert mismatch["index"] == 0 and "k8s-proxy-get" in mismatch["expected"]
+        assert mismatch["got"] == ["kubectl", "get", "pods"]
+        assert session.unconsumed() == 2
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("vault", "services", "vault", "8200", "/v1/sys/seal-status"),
+        ("vault", "pods", "vault", "8200", "/v1/sys/health"),
+        ("other", "services", "vault", "8200", "/v1/sys/health"),
+        ("vault", "services", "vault", "8201", "/v1/sys/health"),
+        ("vault", "services", "vault", "8200", "/v1/sys/health", "--scheme", "https"),
+    ],
+)
+def test_replay_a_different_proxy_request_is_a_mismatch(args):
+    with ShimSession.replay([PROXY_CALL], []) as session:
+        done = proxy_cli(session, *args)
+        assert done.returncode == 97
+        assert "E_FIXTURE_MISMATCH: expected k8s-proxy-get" in done.stderr
+        assert "got k8s-proxy-get" in done.stderr
+        assert len(session.mismatches()) == 1
+        assert session.unconsumed() == 1
+
+
+def test_replay_more_proxy_calls_than_recorded_is_a_mismatch():
+    with ShimSession.replay([PROXY_CALL], []) as session:
+        args = ("vault", "services", "vault", "8200", "/v1/sys/health")
+        assert proxy_cli(session, *args).returncode == 0
+        done = proxy_cli(session, *args)
+        assert done.returncode == 97
+        assert "expected no further call" in done.stderr
+
+
+def test_replay_raises_a_recorded_proxy_error_again(tmp_path):
+    error_call = {
+        "type": "k8s-proxy-get",
+        "request": PROXY_CALL["request"],
+        "error": {"code": "permission_denied", "message": "the API server refused", "scope": "s"},
+    }
+    errors = tmp_path / "errors.jsonl"
+    with ShimSession.replay([error_call], []) as session:
+        src = str(Path(__import__("runwhen_capability").__file__).parents[1])
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "runwhen_capability.k8s_proxy",
+                "get",
+                "vault",
+                "services",
+                "vault",
+                "8200",
+                "/v1/sys/health",
+            ],  # fmt: skip
+            env={
+                "PATH": "/usr/bin:/bin",
+                "PYTHONPATH": src,
+                "RW_ERRORS_FILE": str(errors),
+                **session.env,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert done.returncode == 1
+        assert json.loads(errors.read_text())["code"] == "permission_denied"
+        assert session.unconsumed() == 0
+
+
+def test_record_logs_proxy_calls_between_cli_calls_in_order(fake_bin, tmp_path, monkeypatch):
+    from k8s_proxy_fake import install_fake_kubectl
+
+    path = "/api/v1/namespaces/vault/services/vault:8200/proxy/v1/sys/health"
+    install_fake_kubectl(tmp_path, monkeypatch, routes={path: {"body": "{}"}})
+    real_kubectl_dir = str(tmp_path / "fake-kubectl-bin")
+    with ShimSession.record(["kubectl"], path=real_kubectl_dir) as session:
+        sh(session, "kubectl get pods", path_tail=real_kubectl_dir)
+        done = proxy_cli(
+            session,
+            "vault", "services", "vault", "8200", "/v1/sys/health",
+            path_tail=f"{real_kubectl_dir}:/usr/bin:/bin",
+        )  # fmt: skip
+        assert done.returncode == 0, done.stderr
+        sh(session, "kubectl get events", path_tail=real_kubectl_dir)
+        calls = session.recorded()
+    assert [c.get("type") or c["argv"][-1] for c in calls] == ["pods", "k8s-proxy-get", "events"]
+    assert calls[1]["request"] == {
+        "namespace": "vault",
+        "kind": "services",
+        "name": "vault",
+        "port": "8200",
+        "path": "/v1/sys/health",
+        "scheme": "http",
+    }
+    assert calls[1]["response"]["status"] == 200 and calls[1]["response"]["body"] == "{}"
+    # the proxy itself is not a recorded call: kubectl was started past the shim
+    assert not any(c.get("argv", [""])[1:2] == ["proxy"] for c in calls)
