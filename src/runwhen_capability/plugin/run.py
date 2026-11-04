@@ -614,6 +614,7 @@ def execute(
     scope_dir: Path,
     extra_env: Mapping[str, str] | None = None,
     allow_env: Collection[str] = (),
+    non_secret_env: Collection[str] = (),
     inherit_home: bool = False,
     redact: Sequence[str] = (),
     artifact_uploader: ArtifactUploader | None = None,
@@ -626,7 +627,10 @@ def execute(
     all a `failed` (or `partial`) envelope. `extra_env` is added to the child's
     environment (it may not name a reserved or host-only variable: ValueError, except the
     PLATFORM_MINTED_FILE_ENV names the caller lists in `allow_env`), and its values are
-    redacted from what comes back. `inherit_home` runs the child with the
+    redacted from what comes back, except those of the names in `non_secret_env` (contracts-v5
+    `materialize.nonSecret`): a value in that list is only left out of the redaction by its
+    name, so it is still redacted when the same string is in `redact` or another `extra_env`
+    value. `inherit_home` runs the child with the
     caller's own HOME instead of a private one, for `rwtask run` on a developer's
     machine, where `~/.kube` and `~/.aws` are the credential; never set it for a runner. It
     also makes relative credential paths in the caller's environment (KUBECONFIG, ...:
@@ -711,7 +715,10 @@ def execute(
         except ValueError as exc:
             return failed([_error("invalid_input", f"the memory limit: {exc}")])
 
-    redactor = Redactor([v for v in (*caller_env.values(), *redact) if v])
+    open_names = set(non_secret_env)
+    redactor = Redactor(
+        [v for v in (*(v for k, v in caller_env.items() if k not in open_names), *redact) if v]
+    )
     files_dir = scope_dir / _PLUGIN_DIR
     rw_sdk_dir = scope_dir / ".rw-sdk"
     try:

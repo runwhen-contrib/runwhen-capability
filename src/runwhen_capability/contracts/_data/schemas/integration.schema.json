@@ -85,10 +85,36 @@
                     "additionalProperties": false
                   }
                 ]
+              },
+              "nonSecret": {
+                "type": "array",
+                "items": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+                },
+                "minItems": 1,
+                "uniqueItems": true,
+                "description": "names from `env` whose values are not secret, so the executor does not redact them from task output (contracts-v5). Every other materialized value is secret, and a `file` always is. Only with `env` as a list of names; every name must be one of them (E_NON_SECRET_UNKNOWN)."
               }
             },
             "additionalProperties": false,
-            "minProperties": 1
+            "minProperties": 1,
+            "dependentSchemas": {
+              "nonSecret": {
+                "required": [
+                  "env"
+                ],
+                "properties": {
+                  "env": {
+                    "type": "array"
+                  }
+                },
+                "not": {
+                  "required": [
+                    "file"
+                  ]
+                }
+              }
+            }
           }
         },
         "required": [

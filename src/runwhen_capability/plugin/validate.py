@@ -55,6 +55,9 @@ Semantic (errors unless noted)
   `pattern` or `patternProperties` key RE2 cannot compile (lookaround, backreferences):
   the host evaluates these with RE2 so a pattern cannot hang it (S13). E_SCHEMA_REF -- such
   a schema has a `$ref` that does not point inside the schema (it would never be fetched).
+- E_NON_SECRET_UNKNOWN -- a credential type's `materialize.nonSecret` names a variable
+  that its `materialize.env` list does not (contracts-v5; the schema already requires
+  `env` to be that list).
 - E_SKILL_BODY_TOO_LONG -- a SKILL.md body is over 500 lines.
 - W_SCRIPT_READS_TESTS (warning) -- a .py or .sh file under a skill's scripts/ or lib/
   mentions a `tests/` path; a skill's tests/ are not packaged, so a script must not read
@@ -106,6 +109,7 @@ E_SCHEMA_PATTERN = "E_SCHEMA_PATTERN"
 E_SCHEMA_REF = "E_SCHEMA_REF"
 E_TASK_NAME_DUPLICATE = "E_TASK_NAME_DUPLICATE"
 E_REQUIRES_RANGE = "E_REQUIRES_RANGE"
+E_NON_SECRET_UNKNOWN = "E_NON_SECRET_UNKNOWN"
 W_DEPENDENCY_UNUSED = "W_DEPENDENCY_UNUSED"
 W_SCRIPT_READS_TESTS = "W_SCRIPT_READS_TESTS"
 
@@ -331,6 +335,7 @@ class _Validator:
         self.check_type_chains()
         self.check_facets()
         self.check_auth_scripts()
+        self.check_non_secret()
         self.load_permission_validator()
         self.check_entry_points()
 
@@ -430,6 +435,22 @@ class _Validator:
                     _pointer("authMethods", name, "script"),
                     f"auth script {ref!r} is not a file under integration/",
                 )
+
+    def check_non_secret(self) -> None:
+        file = self.key_file("credentialTypes")
+        for name, ctype in _mapping(self.integration.get("credentialTypes")).items():
+            materialize = _mapping(_mapping(ctype).get("materialize"))
+            env, non_secret = materialize.get("env"), materialize.get("nonSecret")
+            if not isinstance(env, list) or not isinstance(non_secret, list):
+                continue  # not the list form: the schema reports it
+            for i, var in enumerate(non_secret):
+                if var not in env:
+                    self.add(
+                        E_NON_SECRET_UNKNOWN,
+                        file,
+                        _pointer("credentialTypes", name, "materialize", "nonSecret", i),
+                        f"nonSecret {var!r} is not in the credential type's materialize.env",
+                    )
 
     def check_json_object(self, file: str, where: str, path: str) -> None:
         """`path` must be a JSON object; it is a plugin-authored schema, so its patterns

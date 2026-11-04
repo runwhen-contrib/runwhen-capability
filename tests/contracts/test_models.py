@@ -32,6 +32,12 @@ ROUND_TRIP_KNOWN: dict[str, str] = {}
 # Invalid fixtures the model accepts although the schema rejects them: fixture
 # -> the keyword datamodel-code-generator does not turn into a model constraint.
 MODEL_LOOSER_THAN_SCHEMA: dict[str, str] = {
+    "auth-plan/invalid/non-secret-with-file.yaml": (
+        "materialize `dependentSchemas` (nonSecret needs env; a file excludes env and nonSecret)"
+    ),
+    "auth-plan/invalid/non-secret-without-env.yaml": (
+        "materialize `dependentSchemas` (nonSecret needs env; a file excludes env and nonSecret)"
+    ),
     "auth-plan/materialized/invalid/reference-with-files.yaml": (
         "materializedCredential `dependentSchemas` (reference excludes files and env)"
     ),
@@ -45,6 +51,15 @@ MODEL_LOOSER_THAN_SCHEMA: dict[str, str] = {
     ),
     "connection/invalid/root-and-selector.yaml": (
         "root-level oneOf of `required` + `not: {required}` (exactly one of root/selector)"
+    ),
+    "integration/invalid/non-secret-with-file.yaml": (
+        "materialize `dependentSchemas` (nonSecret needs an env list and excludes a file)"
+    ),
+    "integration/invalid/non-secret-with-from-task-vars.yaml": (
+        "materialize `dependentSchemas` (nonSecret needs an env list and excludes a file)"
+    ),
+    "integration/invalid/non-secret-without-env.yaml": (
+        "materialize `dependentSchemas` (nonSecret needs an env list and excludes a file)"
     ),
     "integration/invalid/native-and-script.yaml": (
         "authMethods oneOf of bare `required` branches (exactly one of native/script)"

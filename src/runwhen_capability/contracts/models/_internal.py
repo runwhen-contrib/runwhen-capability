@@ -83,6 +83,11 @@ class Materialize(BaseModel):
     )
     file: File | None = None
     env: list[common.EnvVarName] | None = Field(None, min_length=1)
+    nonSecret: list[common.EnvVarName] | None = Field(
+        None,
+        description="names from `env` whose values are not secret, so the executor does not redact them from task output (contracts-v5). Copied from the credential type's `materialize`; every other materialized value is secret, and a `file` always is.",
+        min_length=1,
+    )
 
 
 class AuthPlan(BaseModel):
