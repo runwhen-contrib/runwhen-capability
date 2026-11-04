@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -103,14 +104,21 @@ def record(rwtask, task, name="basic"):
 
 
 def without_kubectl(monkeypatch):
-    """PATH minus every directory that holds a kubectl."""
-    kept = [
-        d
-        for d in os.environ["PATH"].split(os.pathsep)
-        if d and not os.path.exists(os.path.join(d, "kubectl"))
-    ]
+    """PATH with no kubectl on it. A directory that holds one is replaced by a mirror of its
+    other entries, not dropped: on GitHub's runners kubectl shares /usr/bin with bash and jq."""
+    kept = []
+    for d in os.environ["PATH"].split(os.pathsep):
+        if not d or not os.path.exists(os.path.join(d, "kubectl")):
+            kept.append(d)
+            continue
+        mirror = Path(tempfile.mkdtemp(prefix="rw-no-kubectl-"))
+        for entry in os.scandir(d):
+            if entry.name != "kubectl":
+                (mirror / entry.name).symlink_to(entry.path)
+        kept.append(str(mirror))
     monkeypatch.setenv("PATH", os.pathsep.join(kept))
     assert shutil.which("kubectl") is None
+    assert shutil.which("bash") is not None
 
 
 def expect_outputs(path):
