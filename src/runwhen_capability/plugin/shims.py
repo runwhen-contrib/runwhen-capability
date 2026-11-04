@@ -29,6 +29,15 @@ recorded, it writes `E_FIXTURE_MISMATCH: expected <argv> got <argv>` to stderr, 
 the mismatch to `$RW_SHIM_MISMATCH` for the host, consumes nothing and exits 97. After
 the run the host reads `mismatches()` and `unconsumed()` (calls recorded but never made).
 
+A scenario's calls are not only CLI calls: `ctx.k8s_proxy_get` / `rw_k8s_proxy_get`
+(k8s_proxy.py) are calls of their own, `{type: k8s-proxy-get, request, response | error}`.
+They share this session's files: under `RW_SHIM_MODE=record` the helper appends its line to
+`$RW_SHIM_LOG` after the real call (so the log keeps the order of mixed calls); under
+`replay` it takes the next index from `$RW_SHIM_STATE` the same way a shim does, requires a
+`k8s-proxy-get` with an equal request (else `E_FIXTURE_MISMATCH`, exit 97, an entry in
+`$RW_SHIM_MISMATCH` whose `expected` is a description instead of an argv), and starts no
+proxy. A shim that finds a proxy call where it expected its own is the same mismatch.
+
 Calls are sequential in v1: the counter is taken under a file lock, but which of two
 concurrent calls gets which recorded answer is not defined. A tool invoked by absolute
 path, or by a task that replaces PATH or runs with `inherit_env=False`, is not shimmed;
@@ -158,6 +167,20 @@ def record(argv, stdin):
     finish(rc, out, err)
 
 
+def describe(call):
+    # a recorded call that is not a CLI call: k8s-proxy-get (runwhen_capability.k8s_proxy)
+    request = call.get("request") or {}
+    return "%s %s %s/%s/%s:%s %s" % (
+        call.get("type"),
+        request.get("scheme") or "http",
+        request.get("namespace"),
+        request.get("kind"),
+        request.get("name"),
+        request.get("port"),
+        request.get("path"),
+    )
+
+
 def replay(argv, stdin):
     with open(os.environ["RW_SHIM_CALLS"], encoding="utf-8") as handle:
         calls = json.load(handle)
@@ -170,6 +193,8 @@ def replay(argv, stdin):
         problem = None
         if expected is None:
             problem = "expected no further call got " + shlex.join(argv)
+        elif expected.get("type") is not None:
+            problem = "expected %s got %s" % (describe(expected), shlex.join(argv))
         elif expected["argv"] != argv:
             problem = "expected %s got %s" % (shlex.join(expected["argv"]), shlex.join(argv))
         elif expected.get("stdin") is not None and expected["stdin"] != stdin_text:
@@ -187,7 +212,9 @@ def replay(argv, stdin):
             "RW_SHIM_MISMATCH",
             {
                 "index": index,
-                "expected": expected["argv"] if expected else None,
+                "expected": (expected["argv"] if "argv" in expected else describe(expected))
+                if expected
+                else None,
                 "got": argv,
                 "message": problem,
             },

@@ -21,6 +21,19 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 #   rw_output_append <output> <json>   the same as rw_append
 #   rw_output_set <output> <json>      the same as rw_set
 #   rw_error <code> <message> [scope]  record a structured error and carry on
+#   rw_k8s_proxy_get <namespace> <pods|services> <name> <port> <path> [--scheme https]
+#                     [--timeout N]   print one JSON line {status, headers, body, truncated,
+#                     location} for a GET through the Kubernetes API server's proxy that never
+#                     follows a redirect
+#
+# rw_k8s_proxy_get does what `kubectl get --raw /api/v1/namespaces/<ns>/services/<name>:<port>/
+# proxy/<path>` does -- without its flaw: kubectl follows a backend's redirect to another host
+# and sends the runner's bearer token there (S17). The backend's own status and body come back
+# as data (a 404 is not an error); `location` is set only for a redirect that stays on the same
+# pod/service/port, as a path you can pass back, and any other redirect is dropped (`location`
+# null, header `x-rw-redirect-dropped` names where it pointed).
+# On failure it records the error itself (as rw_error does, so do not call rw_error again for
+# it), prints a line to stderr and returns non-zero; under `set -e` that ends the task.
 #
 # $RW_OUT is a directory, fresh for this task, that the task may write to freely;
 # nothing in it is read by the host.
@@ -148,6 +161,17 @@ rw_error() {
     [[ -n $hint ]] && line+=$(printf ',"hint":%s' "$(_rw_json_string "$hint")")
     # One write of one line: appends from concurrent processes do not interleave.
     printf '%s}\n' "$line" >> "$RW_ERRORS_FILE"
+}
+
+rw_k8s_proxy_get() {
+    if (( $# < 5 )); then
+        printf 'rw_k8s_proxy_get: usage: rw_k8s_proxy_get <namespace> <pods|services> <name> ' >&2
+        printf '<port> <path> [--scheme http|https] [--timeout seconds]\n' >&2
+        return 2
+    fi
+    # RW_PYTHON is the interpreter that runs the task host (the host sets it); -P/-s as for
+    # a Python task, so nothing in the working directory can shadow the SDK.
+    "${RW_PYTHON:-python3}" -P -s -m runwhen_capability.k8s_proxy get "$@"
 }
 
 rw_skip() {

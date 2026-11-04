@@ -7,6 +7,52 @@ with the wheel and sdist attached to the GitHub Release.
 
 ### Added
 
+- `ctx.k8s_proxy_get` / `rw_k8s_proxy_get` (S17), refined:
+  - It now runs `kubectl proxy --unix-socket=<0700 temp dir>/p.sock` (readiness: the "Starting to
+    serve on <socket>" line kubectl 1.3x prints, else the socket file after 0.5 s; the directory is
+    under the temporary directory or /tmp when that path is too long, and removed in `finally`)
+    instead of a loopback TCP port, so nothing else on the machine can reach the proxy. The client
+    is an `http.client.HTTPConnection` over AF_UNIX with the same never-follow redirect handler.
+  - `location` of a kept redirect is the backend-relative path plus query: the API server rewrites
+    a backend's path-absolute Location into `/api/v1/namespaces/<ns>/<kind>/<[https:]name:port>/proxy/...`
+    and the helper strips that prefix, so the value can be passed back as `path` (`headers["location"]`
+    keeps the raw value). A path into a different pod, service or port is a cross-target redirect:
+    `location` None, `x-rw-redirect-dropped: <ns>/<kind>/<target>`.
+  - API-server `Status` bodies (`kind: Status`, `apiVersion: v1`, error status) are mapped:
+    401/403 `permission_denied`, 404 with `reason: NotFound` `not_found`, 503 / `ServiceUnavailable` /
+    "no endpoints available" / "error trying to reach service" `unreachable`. Everything else, notably
+    a backend's own plain-JSON 503 (Vault sealed), is returned as data.
+  - `runwhen_capability.testing.stub_commands(tc, k8s_proxy_get=[{request, response | error}, ...])`
+    stubs `ctx.k8s_proxy_get` for a skill's Python unit test, matched in order against the declared
+    requests as a replay matches them (`tc.k8s_proxy_requests`, `tc.k8s_proxy_unconsumed()`).
+- `rwtask test` records and replays `k8s-proxy-get` calls (`ctx.k8s_proxy_get`, `rw_k8s_proxy_get`) as
+  calls of their own. A scenario's `calls` items are now either `{argv, rc?, stdout?, stderr?, stdin?}`
+  or `{type: k8s-proxy-get, request: {namespace, kind, name, port, path, scheme?}, response: {status,
+  headers?, body?, truncated?, location?} | error: {code, message, scope?, hint?}}` (`plugin/fixtures.py`
+  schema, dump and load; `scheme` and the response fields default). With `RW_SHIM_MODE=record` the
+  helper appends its line to `$RW_SHIM_LOG` after the real call, in order with the shimmed CLI
+  calls (the `kubectl proxy` it starts is never a recorded call: the shim directory is skipped when it
+  looks for kubectl), and a call that failed is recorded as an `error` and raised again on replay.
+  With `RW_SHIM_MODE=replay` no proxy is started: the next recorded call must be a `k8s-proxy-get` with an
+  equal request, else `E_FIXTURE_MISMATCH` (exit 97 from the bash helper, an entry in the mismatch
+  file, as for a shim) and its response is returned. The shim session's consumed count and leftovers
+  cover both kinds of call, and a shim meeting a recorded proxy call reports it as a mismatch.
+- `ctx.k8s_proxy_get(namespace, kind, name, port, path, *, scheme="http", timeout=30)` and bash
+  `rw_k8s_proxy_get <namespace> <pods|services> <name> <port> <path> [--scheme https] [--timeout N]`
+  (`runwhen_capability/k8s_proxy.py`, security finding S17): a GET through the Kubernetes API
+  server's pod/service proxy that never follows a redirect. `kubectl get --raw .../proxy/...`
+  follows a backend's 301/302/307 and re-sends the runner's bearer token to an absolute
+  `Location` on another host. The helper runs `kubectl proxy --port=0 --address=127.0.0.1` in its
+  own process group for the call (stopped with SIGTERM, then SIGKILL after 2 s), reads through it
+  with a no-redirect client that sends no credential, and returns `{status, headers, body,
+  truncated, location}`: the backend's status and body (also for 4xx/5xx), `location` only for a
+  relative target or one into the same proxy path, otherwise `null` with an
+  `x-rw-redirect-dropped: <host>` header. Errors carry D64 codes (`dependency`, `unreachable`,
+  `timeout`, `invalid_input`, `permission_denied` for the API server's own 401/403 `Status`).
+  The bash helper runs `$RW_PYTHON -m runwhen_capability.k8s_proxy get ...` (the host now sets
+  `RW_PYTHON` for bash tasks), prints one JSON line and, on failure, records the error in
+  `$RW_ERRORS_FILE` and exits non-zero. It is in `RW_SH_HELPERS`, so `rwtask validate` knows it,
+  and the unknown-helper check now reads helper names with digits (`rw_k8s_...`).
 - `rwtask serve` runs script auth plans before the task script (lane C's CON-5, GKE auth): for each
   lease `credentials[]` entry whose `authPlan.method` is a `script`, `plugin/auth_script.py` reads
   the plan's archive (fetched through the relay by hash when not cached: `RelayClient.open_code(sha256)`

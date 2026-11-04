@@ -42,7 +42,7 @@ import json
 import os
 import shutil
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,6 +52,15 @@ from .context import Context
 from .contracts import check as check_contract
 from .envelope import derive_envelope, errors_from_jsonl
 from .errors import SkipTask
+from .k8s_proxy import (
+    CALL_TYPE as _PROXY_CALL_TYPE,
+)
+from .k8s_proxy import (
+    answer_from_call,
+    describe_request,
+    normalize_call,
+    same_request,
+)
 from .reftime import current_now, now_env
 from .rwerrors import RwError
 
@@ -111,6 +120,14 @@ class TestContext:
         self._owns_root = owns_root
         self._stubs: dict[tuple[str, ...], tuple[int, str, str]] | None = None
         self._calls: list[tuple[str, ...]] = []
+        self._proxy_stubs: list[dict] | None = None
+        self._proxy_used = 0
+        #: the `ctx.k8s_proxy_get` requests made against a proxy stub, as the scenario spells them
+        self.k8s_proxy_requests: list[dict] = []
+
+    def k8s_proxy_unconsumed(self) -> int:
+        """How many declared `k8s_proxy_get` calls the script never made."""
+        return len(self._proxy_stubs or []) - self._proxy_used
 
     def __enter__(self) -> TestContext:
         return self
@@ -225,25 +242,111 @@ def make_context(
     )
 
 
+_PROXY_REQUEST_KEYS = ("namespace", "kind", "name", "port", "path")
+
+
+def _check_proxy_stub(item: Any) -> dict:
+    """A declared `k8s_proxy_get` call, normalised; TypeError when it is malformed."""
+    if not isinstance(item, Mapping):
+        raise TypeError(f"a k8s_proxy_get stub must be a mapping, got {item!r}")
+    request = item.get("request")
+    if not isinstance(request, Mapping) or any(k not in request for k in _PROXY_REQUEST_KEYS):
+        raise TypeError(
+            f"a k8s_proxy_get stub needs a request with {', '.join(_PROXY_REQUEST_KEYS)}: {item!r}"
+        )
+    if ("response" in item) == ("error" in item):
+        raise TypeError(f"a k8s_proxy_get stub has a response or an error, not both: {item!r}")
+    if "response" in item and (
+        not isinstance(item["response"], Mapping) or "status" not in item["response"]
+    ):
+        raise TypeError(f"a k8s_proxy_get response needs a status: {item!r}")
+    if "error" in item:
+        error = item["error"]
+        if not isinstance(error, Mapping) or "message" not in error:
+            raise TypeError(f"a k8s_proxy_get error needs a code and a message: {item!r}")
+        from .rwerrors import check_error_code
+
+        try:
+            check_error_code(error.get("code"))
+        except ValueError as exc:
+            raise TypeError(str(exc)) from None
+    if item.get("type", _PROXY_CALL_TYPE) != _PROXY_CALL_TYPE:
+        raise TypeError(f"not a k8s-proxy-get call: {item!r}")
+    return normalize_call({k: (dict(v) if isinstance(v, Mapping) else v) for k, v in item.items()})
+
+
 def stub_commands(
-    test_ctx: TestContext, stubs: Mapping[tuple[str, ...], tuple[int, str, str]]
+    test_ctx: TestContext,
+    stubs: Mapping[tuple[str, ...], tuple[int, str, str]] | None = None,
+    *,
+    k8s_proxy_get: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[tuple[str, ...]]:
     """Makes `test_ctx.ctx.run` answer from `stubs` -- `{argv tuple: (returncode, stdout,
     stderr)}` -- without spawning anything. The result is what a real run would do with
     that exit: a CompletedProcess, or RwCommandError (classified from the stderr) when
     `check` is true (the default under v13). An argv with no stub is an AssertionError
     naming it. Calling it again adds to the stubs. Returns the live list of argv tuples
-    that `ctx.run` was called with."""
+    that `ctx.run` was called with.
+
+    `k8s_proxy_get` declares the calls of `ctx.k8s_proxy_get`, which then starts no proxy:
+    `[{"request": {namespace, kind, name, port, path, scheme?}, "response": {status, headers?,
+    body?, truncated?, location?}} or "error": {code, message, scope?, hint?}, ...]`, the
+    shape of a recorded `type: k8s-proxy-get` call in a scenario (its `type` key may be
+    present). They are matched as a replay matches them: in order, each call must equal the
+    next declared request (the port as text, `scheme` defaulting to http), else an
+    AssertionError names both; so does a call after the last one. The answer is the
+    response dict, or the error raised as an `RwError`. `test_ctx.k8s_proxy_requests` lists
+    the requests made and `test_ctx.k8s_proxy_unconsumed()` the declared calls left over.
+    More declared calls are added after the earlier ones."""
+    stubs = stubs or {}
     for argv, result in stubs.items():
         if not isinstance(argv, tuple) or not all(isinstance(a, str) for a in argv):
             raise TypeError(f"a stub key must be a tuple of strings, got {argv!r}")
         if not isinstance(result, tuple) or len(result) != 3:
             raise TypeError(f"stub for {argv!r} must be (returncode, stdout, stderr)")
+    proxy_calls = None
+    if k8s_proxy_get is not None:
+        proxy_calls = [_check_proxy_stub(item) for item in k8s_proxy_get]
+    ctx = test_ctx.ctx
+    if proxy_calls is not None:
+        first = test_ctx._proxy_stubs is None
+        test_ctx._proxy_stubs = [*(test_ctx._proxy_stubs or []), *proxy_calls]
+        if first:
+
+            def proxy_get(
+                namespace, kind, name, port, path, *, scheme="http", timeout=30
+            ) -> dict[str, Any]:
+                request = {
+                    "namespace": namespace,
+                    "kind": kind,
+                    "name": name,
+                    "port": port,
+                    "path": path,
+                    "scheme": scheme,
+                }
+                test_ctx.k8s_proxy_requests.append(request)
+                index = test_ctx._proxy_used
+                declared = test_ctx._proxy_stubs
+                if index >= len(declared):
+                    raise AssertionError(
+                        "ctx.k8s_proxy_get: expected no further call "
+                        f"got {describe_request(request)}"
+                    )
+                if not same_request(declared[index]["request"], request):
+                    expected = describe_request(declared[index]["request"])
+                    raise AssertionError(
+                        f"ctx.k8s_proxy_get: expected {expected} got {describe_request(request)}"
+                    )
+                test_ctx._proxy_used += 1
+                return answer_from_call(declared[index])
+
+            ctx.k8s_proxy_get = proxy_get  # instance attribute: this one context only
+    if not stubs and proxy_calls is not None:
+        return test_ctx._calls
     if test_ctx._stubs is not None:
         test_ctx._stubs.update(stubs)
         return test_ctx._calls
     test_ctx._stubs = dict(stubs)
-    ctx = test_ctx.ctx
 
     def run(
         argv: list[str],

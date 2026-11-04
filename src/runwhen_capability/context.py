@@ -366,6 +366,38 @@ class Context:
         except ValueError as exc:
             raise ValueError(f"{NOW_ENV}: {exc}") from None
 
+    def k8s_proxy_get(
+        self,
+        namespace: str,
+        kind: str,
+        name: str,
+        port: int | str,
+        path: str,
+        *,
+        scheme: str = "http",
+        timeout: float = 30,
+    ) -> dict[str, Any]:
+        """GET `path` from a pod's or service's HTTP port through the Kubernetes API server's
+        proxy (`kind` is "pods" or "services"; `scheme` "http" or "https"), and NEVER follow a
+        redirect. Use it instead of `kubectl get --raw .../proxy/...`, which follows a backend's
+        301/302/307 to another host with the runner's bearer token (S17).
+
+        Returns `{status, headers, body, truncated, location}`: the backend's own status and
+        body (a 404 or a plain 503 from the backend is data, not an error), headers lowercased,
+        the body as text cut at 4 MiB (`truncated`), and `location` the redirect target only
+        when it stays on the same pod/service/port, as a backend-relative path plus query that
+        can be passed back as `path`. Any other target is dropped: `location` is None, the
+        `location` header is removed and `x-rw-redirect-dropped` names where it pointed. Raises
+        RwError: `permission_denied` (the API server itself answers 401/403), `not_found` (no
+        such pod or service), `unreachable` (the proxy cannot reach the backend), `timeout`,
+        `dependency` (no kubectl), `invalid_input`. KUBECONFIG is the
+        task's environment; `rwtask test` records and replays the call (`k8s-proxy-get`)."""
+        # Imported here: `python3 -m runwhen_capability.k8s_proxy` (bash's helper) must not find
+        # the module already imported by the package, or runpy warns on stderr.
+        from .k8s_proxy import task_get
+
+        return task_get(namespace, kind, name, port, path, scheme=scheme, timeout=timeout)  # type: ignore[arg-type]
+
     def run(
         self,
         argv: list[str],

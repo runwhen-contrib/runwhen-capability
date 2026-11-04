@@ -9,12 +9,17 @@ A scenario is one YAML file, `skills/<skill>/tests/<task>/<scenario>.yaml`:
     dryRun: true                          # optional: RW_DRY_RUN=1; the task must declare dryRun
     now: "2026-11-04T09:14:02.123Z"       # optional: the run's reference time (RW_NOW, ctx.now());
                                           # --record writes it; absent: a fresh time
-    calls:                                # the CLI calls the task makes, in order
-      - argv: [kubectl, get, pods]        # argv[0] is the tool's basename
+    calls:                                # the calls the task makes, in order
+      - argv: [kubectl, get, pods]        # a CLI call; argv[0] is the tool's basename
         stdin: "..."                      # optional; asserted only when present
         rc: 0                             # default 0
         stdout: "..."                     # default ""
         stderr: "..."                     # default ""
+      - type: k8s-proxy-get               # ctx.k8s_proxy_get / rw_k8s_proxy_get (k8s_proxy.py)
+        request: {namespace: vault, kind: services, name: vault, port: 8200,
+                  path: /v1/sys/health, scheme: http}      # scheme defaults to http
+        response: {status: 200, headers: {}, body: "...", truncated: false, location: null}
+        # or, for a call that failed:  error: {code: unreachable, message: "...", scope: ...}
     expect:
       status: ok | partial | failed | skipped
       errorCodes: [permission_denied]     # optional; the envelope's codes as a set
@@ -39,6 +44,8 @@ import jsonschema
 import yaml
 
 from ..contracts import load_yaml
+from ..k8s_proxy import CALL_TYPE as PROXY_CALL_TYPE
+from ..k8s_proxy import normalize_call as normalize_proxy_call
 from ..reftime import format_now, parse_now
 from ..rwerrors import ERROR_CODES
 
@@ -47,6 +54,73 @@ STATUSES = ("ok", "partial", "failed", "skipped")
 _NOW_PATTERN = r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$"
 
 _STRING_MAP = {"type": "object", "additionalProperties": {"type": "string"}}
+
+_CLI_CALL: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["argv"],
+    "properties": {
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "stdin": {"type": "string"},
+        "rc": {"type": "integer"},
+        "stdout": {"type": "string"},
+        "stderr": {"type": "string"},
+    },
+}
+
+_PROXY_CALL: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["type", "request"],
+    "properties": {
+        "type": {"const": PROXY_CALL_TYPE},
+        "request": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["namespace", "kind", "name", "port", "path"],
+            "properties": {
+                "namespace": {"type": "string"},
+                "kind": {"enum": ["pods", "services"]},
+                "name": {"type": "string"},
+                "port": {"type": ["integer", "string"]},
+                "path": {"type": "string"},
+                "scheme": {"enum": ["http", "https"]},
+            },
+        },
+        "response": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["status"],
+            "properties": {
+                "status": {"type": "integer"},
+                "headers": _STRING_MAP,
+                "body": {"type": "string"},
+                "truncated": {"type": "boolean"},
+                "location": {"type": ["string", "null"]},
+            },
+        },
+        "error": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["code", "message"],
+            "properties": {
+                "code": {"enum": list(ERROR_CODES)},
+                "message": {"type": "string"},
+                "scope": {"type": "string"},
+                "hint": {"type": "string"},
+            },
+        },
+    },
+}
+
+#: A call is a proxy call when it names a `type`; otherwise it is a CLI call (the original
+#: shape), so a mistake in either reports against its own schema.
+_CALL: dict[str, Any] = {
+    "type": "object",
+    "if": {"required": ["type"], "properties": {"type": {"const": PROXY_CALL_TYPE}}},
+    "then": _PROXY_CALL,
+    "else": _CLI_CALL,
+}
 
 SCENARIO_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -61,21 +135,7 @@ SCENARIO_SCHEMA: dict[str, Any] = {
         "identity": _STRING_MAP,
         "dryRun": {"type": "boolean"},
         "now": {"type": "string", "pattern": _NOW_PATTERN},
-        "calls": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["argv"],
-                "properties": {
-                    "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
-                    "stdin": {"type": "string"},
-                    "rc": {"type": "integer"},
-                    "stdout": {"type": "string"},
-                    "stderr": {"type": "string"},
-                },
-            },
-        },
+        "calls": {"type": "array", "items": _CALL},
         "expect": {
             "type": "object",
             "additionalProperties": False,
@@ -166,17 +226,14 @@ def load_scenario(path: Path) -> Scenario:
         else:
             problems.append(f"{where or '(scenario)'}: {error.message}"[:300])
     if not problems:
-        problems = _expectation_problems(doc["expect"])
+        problems = _call_problems(doc.get("calls") or []) + _expectation_problems(doc["expect"])
     if problems:
         raise FixtureError(path, problems)
     try:
         now = parse_now(doc["now"]) if "now" in doc else None
     except ValueError as exc:  # matches the pattern but is no date: 2026-13-45T...
         raise FixtureError(path, [f"now: {exc}"]) from None
-    calls = [
-        {"argv": list(c["argv"]), "rc": 0, "stdout": "", "stderr": "", **_without_argv(c)}
-        for c in doc.get("calls") or []
-    ]
+    calls = [_normal_call(c) for c in doc.get("calls") or []]
     return Scenario(
         name=path.stem,
         path=path,
@@ -258,8 +315,33 @@ def _expectation_problems(expect: dict) -> list[str]:
     return problems
 
 
-def _without_argv(call: dict) -> dict:
-    return {k: v for k, v in call.items() if k != "argv"}
+def _call_problems(calls: list[dict]) -> list[str]:
+    """What the schema cannot say about proxy calls: exactly one of response and error."""
+    problems = []
+    for i, call in enumerate(calls):
+        if call.get("type") != PROXY_CALL_TYPE:
+            continue
+        if "response" in call and "error" in call:
+            problems.append(
+                f"calls[{i}]: a {PROXY_CALL_TYPE} call has a response or an error (not both)"
+            )
+        elif "response" not in call and "error" not in call:
+            problems.append(f"calls[{i}]: a {PROXY_CALL_TYPE} call needs a response or an error")
+    return problems
+
+
+def _normal_call(call: dict) -> dict:
+    """A call with its defaults filled: a CLI call's rc/stdout/stderr, a proxy call's scheme
+    and response fields."""
+    if call.get("type") == PROXY_CALL_TYPE:
+        return normalize_proxy_call(call)
+    return {
+        "argv": list(call["argv"]),
+        "rc": 0,
+        "stdout": "",
+        "stderr": "",
+        **{k: v for k, v in call.items() if k != "argv"},
+    }
 
 
 def scenario_files(tests_dir: Path) -> list[Path]:
