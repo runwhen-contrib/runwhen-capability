@@ -588,6 +588,7 @@ RW_SH_HELPERS = (
     "rw_output_set",
     "rw_error",
     "rw_k8s_proxy_get",
+    "rw_k8s_proxy_request",
 )
 
 # An rw_* word in command position: _COMMAND_START, plus a backtick

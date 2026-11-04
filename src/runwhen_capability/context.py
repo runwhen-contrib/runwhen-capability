@@ -374,6 +374,7 @@ class Context:
         port: int | str,
         path: str,
         *,
+        headers: Mapping[str, str] | None = None,
         scheme: str = "http",
         timeout: float = 30,
     ) -> dict[str, Any]:
@@ -381,6 +382,11 @@ class Context:
         proxy (`kind` is "pods" or "services"; `scheme` "http" or "https"), and NEVER follow a
         redirect. Use it instead of `kubectl get --raw .../proxy/...`, which follows a backend's
         301/302/307 to another host with the runner's bearer token (S17).
+
+        `headers` sets request headers; only Accept, Content-Type, Content-MD5, If-Match,
+        If-None-Match and Range are allowed (any case), anything else is `invalid_input`.
+        `port` is a number or a port name (a service's: a DNS label up to 63 characters; a
+        pod's: at most 15 characters with a letter, no `--`).
 
         Returns `{status, headers, body, truncated, location}`: the backend's own status and
         body (a 404 or a plain 503 from the backend is data, not an error), headers lowercased,
@@ -396,7 +402,50 @@ class Context:
         # the module already imported by the package, or runpy warns on stderr.
         from .k8s_proxy import task_get
 
-        return task_get(namespace, kind, name, port, path, scheme=scheme, timeout=timeout)  # type: ignore[arg-type]
+        return task_get(  # type: ignore[arg-type]
+            namespace, kind, name, port, path, headers=headers, scheme=scheme, timeout=timeout
+        )
+
+    def k8s_proxy_request(
+        self,
+        method: str,
+        namespace: str,
+        kind: str,
+        name: str,
+        port: int | str,
+        path: str,
+        *,
+        body: bytes | str | None = None,
+        headers: Mapping[str, str] | None = None,
+        scheme: str = "http",
+        timeout: float = 30,
+    ) -> dict[str, Any]:
+        """`k8s_proxy_get` for any method: GET, HEAD, PUT, POST, DELETE or PATCH (anything else
+        is `invalid_input`), never following a redirect. Use it instead of `kubectl replace|
+        create|delete --raw .../proxy/...`, which leaks the runner's token the same way.
+
+        `body` is bytes or str (UTF-8), at most 4 MiB, and only PUT, POST, PATCH and DELETE may
+        carry one; without a `Content-Type` header it is sent as application/octet-stream.
+        `headers` are as for `k8s_proxy_get`. Returns the same dict and raises the same errors
+        (a HEAD answer has an empty body). `rwtask test` records and replays the call
+        (`k8s-proxy-request`).
+
+        This does not decide whether the task may write: a task that declares `readOnly: true`
+        and calls a write method is that plugin's declaration problem, for review and RBAC."""
+        from .k8s_proxy import task_request
+
+        return task_request(  # type: ignore[arg-type]
+            method,
+            namespace,
+            kind,
+            name,
+            port,
+            path,
+            body=body,
+            headers=headers,
+            scheme=scheme,
+            timeout=timeout,
+        )
 
     def run(
         self,

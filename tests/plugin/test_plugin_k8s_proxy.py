@@ -1,6 +1,7 @@
 """`rwtask test` records and replays `k8s-proxy-get` calls (ctx.k8s_proxy_get and bash's
-rw_k8s_proxy_get) between ordinary CLI calls. The plugin is a tmp copy of run-mini with two
-extra tasks; a fake kubectl (tests/k8s_proxy_fake.py) serves both `get ...` and `proxy`."""
+rw_k8s_proxy_get) and `k8s-proxy-request` calls (ctx.k8s_proxy_request, rw_k8s_proxy_request)
+between ordinary CLI calls. The plugin is a tmp copy of run-mini with four extra tasks; a fake
+kubectl (tests/k8s_proxy_fake.py) serves both `get ...` and `proxy`."""
 
 from __future__ import annotations
 
@@ -21,6 +22,8 @@ RUN_MINI = HERE / "fixtures" / "run-mini"
 DEPLOYMENT = "kubernetes/clusters/kind/namespaces/runwhen/deployments/runwhen-papi"
 HEALTH = "/api/v1/namespaces/runwhen/services/vault:8200/proxy/v1/sys/health"
 BODY = '{"sealed":false}'
+RING = "/api/v1/namespaces/runwhen/services/loki:3100/proxy/ring"
+RING_BODY = '{"shards":[]}'
 needs_jq = pytest.mark.skipif(shutil.which("jq") is None, reason="the bash task reads with jq")
 
 TASKS = """\
@@ -38,6 +41,53 @@ TASKS = """\
     readOnly: true
     outputs:
       probe: { schema: "{ status: integer, body: string }" }
+"""
+
+WRITE_TASKS = """\
+  - name: proxy-write-sh
+    title: Proxied GET, PUT, DELETE (bash)
+    description: rw_k8s_proxy_get with a header, then rw_k8s_proxy_request twice.
+    script: scripts/proxy_write.sh
+    readOnly: false
+    effects: ["Removes a ring member"]
+    destructive: true
+    outputs:
+      probe: { schema: "{ get: integer, put: integer, delete: integer, body: string }" }
+  - name: proxy-write-py
+    title: Proxied GET, PUT, DELETE (Python)
+    description: ctx.k8s_proxy_get with a header, then ctx.k8s_proxy_request twice.
+    script: scripts/proxy_write.py
+    readOnly: false
+    effects: ["Removes a ring member"]
+    destructive: true
+    outputs:
+      probe: { schema: "{ get: integer, put: integer, delete: integer, body: string }" }
+"""
+
+WRITE_SH = """\
+#!/usr/bin/env bash
+ns="$RW_RESOURCE_NAMESPACE"
+got=$(rw_k8s_proxy_get "$ns" services loki 3100 /ring --header 'Accept: application/json')
+put=$(rw_k8s_proxy_request PUT "$ns" services loki 3100 /ring/a \\
+    --data '{"state":"LEAVING"}' --header 'Content-Type: application/json')
+del=$(rw_k8s_proxy_request DELETE "$ns" services loki 3100 /ring/a)
+rw_output_set probe "$(jq -c -n --argjson g "$got" --argjson p "$put" --argjson d "$del" \\
+    '{get: $g.status, put: $p.status, delete: $d.status, body: $g.body}')"
+"""
+
+WRITE_PY = """\
+def main(ctx):
+    ns = ctx.resource.namespace
+    got = ctx.k8s_proxy_get(
+        ns, "services", "loki", 3100, "/ring", headers={"Accept": "application/json"}
+    )
+    put = ctx.k8s_proxy_request(
+        "PUT", ns, "services", "loki", 3100, "/ring/a",
+        body='{"state":"LEAVING"}', headers={"Content-Type": "application/json"},
+    )
+    gone = ctx.k8s_proxy_request("DELETE", ns, "services", "loki", 3100, "/ring/a")
+    return {"probe": {"get": got["status"], "put": put["status"], "delete": gone["status"],
+                      "body": got["body"]}}
 """
 
 SH = """\
@@ -66,6 +116,9 @@ def plugin(tmp_path):
     skill = dest / "skills" / "probe"
     with open(skill / "tasks.yaml", "a") as handle:
         handle.write(TASKS)
+        handle.write(WRITE_TASKS)
+    (skill / "scripts" / "proxy_write.sh").write_text(WRITE_SH)
+    (skill / "scripts" / "proxy_write.py").write_text(WRITE_PY)
     (skill / "scripts" / "proxy_mixed.sh").write_text(SH)
     (skill / "scripts" / "proxy_mixed.py").write_text(PY)
     return dest
@@ -76,7 +129,12 @@ def kubectl(tmp_path, monkeypatch):
     return install_fake_kubectl(
         tmp_path,
         monkeypatch,
-        routes={HEALTH: {"headers": {"X-A": "1"}, "body": BODY}},
+        routes={
+            HEALTH: {"headers": {"X-A": "1"}, "body": BODY},
+            RING: {"body": RING_BODY},
+            "PUT " + RING + "/a": {"status": 202},
+            "DELETE " + RING + "/a": {"status": 204},
+        },
         other_stdout='{"items": []}\n',
     )
 
@@ -98,8 +156,10 @@ def scenario_path(plugin, task, name="basic"):
 
 
 def record(rwtask, task, name="basic"):
+    # a task that writes is only recorded on request: recording really runs it
+    allow = ["--allow-write"] if task.startswith("proxy-write") else []
     return rwtask(
-        f"probe/{task}", "--record", "--resource", DEPLOYMENT, "--scenario", name, expect=0
+        f"probe/{task}", "--record", "--resource", DEPLOYMENT, "--scenario", name, *allow, expect=0
     )
 
 
@@ -274,3 +334,164 @@ def test_a_failed_proxy_call_in_a_bash_task_is_recorded_and_replays(
     without_kubectl(monkeypatch)
     _, out, _ = rwtask("probe/proxy-mixed-sh", expect=0)
     assert "PASS probe/proxy-mixed-sh/basic" in out
+
+
+# -- writes: k8s-proxy-request -----------------------------------------------------------------
+
+WRITE_TASK_NAMES = [
+    pytest.param("proxy-write-sh", marks=needs_jq),
+    "proxy-write-py",
+]
+
+
+def expect_write_outputs(path):
+    path.write_text(
+        path.read_text()
+        + f"  outputs:\n    probe: {{get: 200, put: 202, delete: 204, body: '{RING_BODY}'}}\n"
+    )
+
+
+@pytest.fixture
+def recorded_writes(rwtask, plugin, kubectl, monkeypatch):
+    def go(task):
+        record(rwtask, task)
+        expect_write_outputs(scenario_path(plugin, task))
+        without_kubectl(monkeypatch)
+        return scenario_path(plugin, task)
+
+    return go
+
+
+@pytest.mark.parametrize("task", WRITE_TASK_NAMES)
+def test_record_then_replay_get_put_delete_with_no_kubectl_on_path(
+    rwtask, plugin, kubectl, monkeypatch, task
+):
+    _, _, err = record(rwtask, task)
+    assert "recorded 3 calls" in err
+    # three real proxied requests, each with its own method and body, one proxy each
+    assert [r["method"] for r in kubectl.requests()] == ["GET", "PUT", "DELETE"]
+    assert kubectl.bodies() == [b"", b'{"state":"LEAVING"}', b""]
+    assert kubectl.requests()[0]["headers"]["Accept"] == "application/json"
+    assert kubectl.requests()[1]["headers"]["Content-Type"] == "application/json"
+    path = scenario_path(plugin, task)
+    doc = load_yaml(path.read_text())
+    got, put, gone = doc["calls"]
+    port = 3100 if task.endswith("py") else "3100"
+    base = {"namespace": "runwhen", "kind": "services", "name": "loki", "port": port}
+    assert got["type"] == "k8s-proxy-get"  # lane F's existing fixtures keep their type
+    assert got["request"] == {
+        **base,
+        "path": "/ring",
+        "scheme": "http",
+        "headers": {"accept": "application/json"},
+    }
+    assert put["type"] == "k8s-proxy-request"
+    assert put["request"] == {
+        "method": "PUT",
+        **base,
+        "path": "/ring/a",
+        "scheme": "http",
+        "headers": {"content-type": "application/json"},
+        "body": '{"state":"LEAVING"}',
+    }
+    assert gone["type"] == "k8s-proxy-request"
+    assert gone["request"] == {"method": "DELETE", **base, "path": "/ring/a", "scheme": "http"}
+    assert [c["response"]["status"] for c in doc["calls"]] == [200, 202, 204]
+    expect_write_outputs(path)
+
+    before = len(kubectl.commands())
+    without_kubectl(monkeypatch)
+    _, out, _ = rwtask(f"probe/{task}", expect=0)
+    assert f"PASS probe/{task}/basic" in out
+    assert len(kubectl.commands()) == before  # replay started no proxy
+
+
+def mutate(path, change):
+    doc = load_yaml(path.read_text())
+    change(doc["calls"])
+    path.write_text(yaml.safe_dump(doc))
+
+
+@pytest.mark.parametrize("task", WRITE_TASK_NAMES)
+@pytest.mark.parametrize(
+    ("change", "needle"),
+    [
+        (
+            lambda calls: calls[1]["request"].update(body='{"state":"ACTIVE"}'),
+            'body="{\\"state\\":\\"ACTIVE\\"}" got k8s-proxy-request PUT',
+        ),
+        (
+            lambda calls: calls[1]["request"].update(method="POST"),
+            "expected k8s-proxy-request POST http runwhen/services/loki:3100 /ring/a",
+        ),
+        (
+            lambda calls: calls[1]["request"].update(headers={"content-type": "text/plain"}),
+            'headers={"content-type": "text/plain"}',
+        ),
+        (
+            lambda calls: calls[1]["request"].pop("body"),
+            "got k8s-proxy-request PUT http runwhen/services/loki:3100 /ring/a headers=",
+        ),
+        (
+            lambda calls: calls[0]["request"].update(headers={"accept": "text/html"}),
+            'expected k8s-proxy-get http runwhen/services/loki:3100 /ring headers={"accept": '
+            '"text/html"} got k8s-proxy-get http runwhen/services/loki:3100 /ring headers=',
+        ),
+        (
+            lambda calls: calls[2]["request"].update(method="PATCH"),
+            "expected k8s-proxy-request PATCH http runwhen/services/loki:3100 /ring/a "
+            "got k8s-proxy-request DELETE http",
+        ),
+    ],
+)
+def test_a_changed_body_method_or_header_is_a_mismatch(
+    rwtask, recorded_writes, task, change, needle
+):
+    path = recorded_writes(task)
+    mutate(path, change)
+    code, out, _ = rwtask(f"probe/{task}")
+    assert code == 1
+    assert f"FAIL probe/{task}/basic" in out
+    assert "E_FIXTURE_MISMATCH" in out
+    assert needle in out
+
+
+@pytest.mark.parametrize("task", WRITE_TASK_NAMES)
+def test_a_recorded_get_replays_as_either_type(rwtask, recorded_writes, task):
+    path = recorded_writes(task)
+
+    def retype(calls):
+        calls[0]["type"] = "k8s-proxy-request"
+        calls[0]["request"] = {"method": "GET", **calls[0]["request"]}
+        calls[1]["request"]["headers"] = {"Content-Type": "application/json"}  # any case
+
+    mutate(path, retype)
+    _, out, _ = rwtask(f"probe/{task}", expect=0)
+    assert f"PASS probe/{task}/basic" in out
+
+
+OLD_SCENARIO = """\
+resource: DEPLOYMENT
+calls:
+  - argv: [kubectl, -n, runwhen, get, pods, -o, json]
+    stdout: '{"items": []}'
+  - type: k8s-proxy-get
+    request: {namespace: runwhen, kind: services, name: vault, port: 8200, path: /v1/sys/health}
+    response: {status: 200, headers: {x - a: '1'}, body: '{"sealed":false}'}
+  - argv: [kubectl, -n, runwhen, get, events, -o, json]
+    stdout: '{"items": []}'
+expect:
+  status: ok
+  outputs:
+    probe: {status: 200, body: '{"sealed":false}'}
+"""
+
+
+@pytest.mark.parametrize("task", TASK_NAMES)
+def test_a_fixture_written_before_methods_existed_still_replays(rwtask, plugin, monkeypatch, task):
+    path = scenario_path(plugin, task)
+    path.parent.mkdir(parents=True)
+    path.write_text(OLD_SCENARIO.replace("DEPLOYMENT", DEPLOYMENT))
+    without_kubectl(monkeypatch)
+    _, out, _ = rwtask(f"probe/{task}", expect=0)
+    assert f"PASS probe/{task}/basic" in out

@@ -385,3 +385,17 @@ def test_rw_output_append_and_set_write_the_same_events_as_the_originals(tmp_pat
     assert events[1] == {"op": "set", "name": "total", "value": 3}
     assert events[2]["op"] == "append"
     assert events[3]["op"] == "set"
+
+
+def test_the_k8s_proxy_helpers_are_defined_and_check_their_arguments(tmp_path):
+    done = _bash(
+        tmp_path,
+        "type -t rw_k8s_proxy_get rw_k8s_proxy_request\n"
+        'rw_k8s_proxy_request PUT ns services x || echo "request rc=$?"\n'
+        'rw_k8s_proxy_get ns services x || echo "get rc=$?"\n',
+        {},
+    )
+    assert done.stdout.split() == ["function", "function", "request", "rc=2", "get", "rc=2"]
+    assert "rw_k8s_proxy_request: usage:" in done.stderr
+    assert "--data-file" in done.stderr and "--header" in done.stderr
+    assert "rw_k8s_proxy_get: usage:" in done.stderr and "--header" in done.stderr

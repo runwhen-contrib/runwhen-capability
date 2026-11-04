@@ -134,14 +134,17 @@ What a script sees (the runner and `rwtask run` set the same names):
 | Reference time | `ctx.now()` (aware UTC `datetime`) | `$RW_NOW` (`2026-11-04T09:14:02.123Z`), `$RW_NOW_EPOCH` (integer seconds) |
 | Outputs | the returned dict; `ctx.error(code, msg, scope=, hint=, details=)`; `raise RwError(code, msg)` | `rw_output_append <name> <json>`; `rw_output_set <name> <json>`; `rw_error <code> <msg> [scope]`; files in `$RW_OUT` |
 | Files | `$RW_OUT` (scratch and artifact files), `$RW_LIB_DIR` | `$RW_OUT`, `$RW_LIB_DIR` |
-| HTTP through the API server's pod/service proxy | `ctx.k8s_proxy_get(namespace, "pods"\|"services", name, port, path, scheme="http", timeout=30)` returns `{status, headers, body, truncated, location}` | `rw_k8s_proxy_get <namespace> <pods\|services> <name> <port> <path> [--scheme https] [--timeout N]` prints that object as one JSON line |
+| HTTP through the API server's pod/service proxy | `ctx.k8s_proxy_get(namespace, "pods"\|"services", name, port, path, *, headers=None, scheme="http", timeout=30)` and `ctx.k8s_proxy_request(method, namespace, "pods"\|"services", name, port, path, *, body=None, headers=None, scheme="http", timeout=30)` return `{status, headers, body, truncated, location}` | `rw_k8s_proxy_get <namespace> <pods\|services> <name> <port> <path> [--header 'Name: value']... [--scheme https] [--timeout N]` and `rw_k8s_proxy_request <METHOD> <namespace> <pods\|services> <name> <port> <path> [--data STRING \| --data-file FILE] [--header 'Name: value']... [--scheme https] [--timeout N]` print that object as one JSON line |
 
-**Proxied HTTP GETs (`ctx.k8s_proxy_get`, `rw_k8s_proxy_get`).** Use these, never
-`kubectl get --raw /api/v1/namespaces/<ns>/{pods,services}/<name>:<port>/proxy/<path>`:
+**Proxied HTTP requests (`ctx.k8s_proxy_get`, `ctx.k8s_proxy_request`, `rw_k8s_proxy_get`,
+`rw_k8s_proxy_request`).** Use these, never
+`kubectl get|replace|create|delete --raw /api/v1/namespaces/<ns>/{pods,services}/<name>:<port>/proxy/<path>`:
 `kubectl get --raw` through the proxy follows a backend's 301/302/307, and when the `Location`
 is absolute and names another host client-go re-sends the runner's `Authorization: Bearer`
 token to it, so a probed pod or an SSO redirect can capture the credential (security finding
-S17). The helper runs `kubectl proxy --unix-socket=<private 0700 dir>/p.sock` for the call (no
+S17). The write verbs leak the same way (`kubectl replace|create|delete --raw` follow a 302,
+re-issued as a GET, and `delete` a 307 too), so a write to a pod or service goes through
+`ctx.k8s_proxy_request` / `rw_k8s_proxy_request` as well. The helper runs `kubectl proxy --unix-socket=<private 0700 dir>/p.sock` for the call (no
 TCP port is opened) and reads through it with a client that sends no credential and never
 follows a redirect. The answer is the backend's own `status`, lowercased `headers` and `body`
 (text; 4 MiB at most, `truncated` says it was cut), also for a 404 or 503, which are data.
@@ -152,10 +155,26 @@ helper strips that prefix), which can be passed straight back as `path`; `header
 keeps the raw value in that case. For any other target (an absolute URL for another host, or a
 path into a different pod, service or port) `location` is `null`, the `location` header is
 removed and `x-rw-redirect-dropped: <host or ns/kind/target>` is added, so a skill can report that
-the backend redirected elsewhere.
+the backend redirected elsewhere. A redirect is an answer for every method: nothing is re-sent.
+
+**Methods, bodies, headers, ports.** `method` is `GET`, `HEAD`, `PUT`, `POST`, `DELETE` or
+`PATCH` (upper case; anything else is `invalid_input`); a `HEAD` answer has an empty body. `body`
+is bytes or str (UTF-8), 4 MiB at most, and only `PUT`, `POST`, `PATCH` and `DELETE` may carry one;
+it is sent as `application/octet-stream` unless a `Content-Type` is given. In bash it is
+`--data STRING` or `--data-file FILE`, and `--header 'Name: value'` repeats. A caller may set
+only these request headers, in any case: `Accept` (default `*/*`), `Content-Type`,
+`Content-MD5`, `If-Match`, `If-None-Match`, `Range`. Any other header (`Authorization`, `Cookie`,
+`Host`, `Proxy-*`, `X-Forwarded-*`, `Impersonate-*`, `Connection`, ...) and any header name or
+value with a CR, LF, NUL or other control character, or a non-ASCII one, is `invalid_input`
+naming the header; our `User-Agent` is always sent. A service's port name is a DNS-1123 label
+(up to 63 characters, e.g. the chart's `http-artifactory`); a pod's is an IANA service name (at
+most 15 characters, a letter in it, no `--`); a number from 1 to 65535 works for both. The helper
+does **not** decide whether a task may write: a task that declares `readOnly: true` and calls
+a write method is the plugin's own declaration problem, for review and RBAC to catch, not the
+SDK.
 
 Errors are `RwError`s with a D64 code. `dependency`: no kubectl; `unreachable`; `timeout`;
-`invalid_input`. A response is the **API server's own** (not the backend's) when its body is a
+`invalid_input` (a bad method, header, body, port, path, ...). A response is the **API server's own** (not the backend's) when its body is a
 `Status` object (`"kind": "Status"`, `"apiVersion": "v1"`) with an error status code, and only
 then: 401/403 is `permission_denied`; 404 with `reason: NotFound` (no such pod or service) is
 `not_found`; 503, `reason: ServiceUnavailable`, or a message containing "no endpoints available"
@@ -163,9 +182,14 @@ or "error trying to reach service" (the proxy cannot reach the backend) is `unre
 other answer, including a backend's own plain 403/404/503 (Vault sealed's `{"errors": []}`) and
 any other `Status`, is returned as data. `kind` is `pods` or `services`, `port` a number or a
 port name, `path` relative to the backend's root (a `?query` is kept; `..` segments are
-refused). `KUBECONFIG` is the task's environment, as for `kubectl`. `rwtask test` records the
-call as `type: k8s-proxy-get` and replays it without starting a proxy; a Python unit test
-declares it with `stub_commands(tc, k8s_proxy_get=[{request, response | error}, ...])`.
+refused). `KUBECONFIG` is the task's environment, as for `kubectl`. `rwtask test` records a
+`k8s_proxy_get` / `rw_k8s_proxy_get` as `type: k8s-proxy-get` (headers in its request only when
+given) and any other call as `type: k8s-proxy-request` with `{method, ..., headers?, body? |
+bodyBase64?}` (header names lower-cased; the body as UTF-8 text, else base64), and replays
+them without starting a proxy, matching exactly on method, headers and body (a `k8s-proxy-get`
+and a GET `k8s-proxy-request` replay each other); a Python unit test declares them with
+`stub_commands(tc, k8s_proxy=[{request, response | error}, ...])` (`k8s_proxy_get=` is the same
+keyword).
 
 **`RW_TASK_CONTRACT=v13`** is how a script tells the V13 contract from a classic
 bundle's, and both the runner and `rwtask run` set it. Under it `ctx.run` raises
@@ -195,7 +219,8 @@ the helpers without sourcing anything.
 | `rw_error <code> <msg> [scope]` | record a structured error (`code` is one of the closed list under Result envelope) and carry on; a clean exit with errors is `partial`, the exit status alone decides `failed` |
 | `rw_skip [reason]` | end the task `skipped`, exit 0 |
 | `rw_artifact <name> <path>` | register a file as an artifact output (or write it to `$RW_OUT/<name>`) |
-| `rw_k8s_proxy_get <ns> <pods\|services> <name> <port> <path> [--scheme https] [--timeout N]` | GET through the API server's proxy, never following a redirect; prints `{status, headers, body, truncated, location}` as one JSON line; on failure records the error itself (as `rw_error` does) and exits non-zero |
+| `rw_k8s_proxy_get <ns> <pods\|services> <name> <port> <path> [--header 'Name: value']... [--scheme https] [--timeout N]` | GET through the API server's proxy, never following a redirect; prints `{status, headers, body, truncated, location}` as one JSON line; on failure records the error itself (as `rw_error` does) and exits non-zero |
+| `rw_k8s_proxy_request <METHOD> <ns> <pods\|services> <name> <port> <path> [--data STRING \| --data-file FILE] [--header 'Name: value']... [--scheme https] [--timeout N]` | the same for GET, HEAD, PUT, POST, DELETE and PATCH, with a body for the last three and DELETE |
 
 `$RW_OUT` is a directory fresh for this task, free to write to; the file named
 after an artifact output is what the platform stores. `$RW_LIB_DIR` is the
@@ -206,10 +231,11 @@ Stdout and stderr are logs and are never parsed for outputs.
 `stub_commands`) builds the same context and environment the runner does, so a
 Python script's unit test sees `ctx.resource`, `ctx.settings`, `ctx.run` and
 `ctx.error` with the V13 semantics and no cluster (`stub_commands` stubs `ctx.run` by argv and,
-with `k8s_proxy_get=[...]`, `ctx.k8s_proxy_get`). `rwtask test` replays
+with `k8s_proxy=[...]`, `ctx.k8s_proxy_get` and `ctx.k8s_proxy_request`). `rwtask test` replays
 recorded CLI calls through PATH shims, for bash and Python scripts alike; a
-`ctx.k8s_proxy_get` / `rw_k8s_proxy_get` call is recorded and replayed too, as a call of its own
-(`type: k8s-proxy-get` between the CLI calls, replayed without starting a proxy).
+`ctx.k8s_proxy_get` / `ctx.k8s_proxy_request` / `rw_k8s_proxy_get` / `rw_k8s_proxy_request` call is
+recorded and replayed too, as a call of its own (`type: k8s-proxy-get` or `k8s-proxy-request`
+between the CLI calls, replayed without starting a proxy).
 A skill's `tests/` (the recorded fixtures) is authoring only: `rwtask compile`, `rwtask pull` and the
 registry never package it (archive.md section 2), so a script must not read it at run time
 (`rwtask validate` warns `W_SCRIPT_READS_TESTS`).

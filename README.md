@@ -54,17 +54,30 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
 - `Context` is the task's only boundary: `ctx.credential(name)`, `ctx.run(argv)` (bounded output,
   timeouts, process-group kill), `ctx.artifacts`, `ctx.git`, `ctx.sarif`, `ctx.findings`,
   `ctx.repo_fs`, `ctx.workdir`, `ctx.log`.
-- To read a pod's or service's HTTP API through the Kubernetes API server's proxy, use
-  `ctx.k8s_proxy_get(namespace, "pods" | "services", name, port, path, scheme="http", timeout=30)`
-  (bash: `rw_k8s_proxy_get`), not `kubectl get --raw .../proxy/...`: kubectl follows a backend's
-  redirect to another host and sends the runner's bearer token there (S17). The helper returns
-  `{status, headers, body, truncated, location}`, never follows a redirect (a redirect to another
-  host comes back as the 3xx with `location: None` and an `x-rw-redirect-dropped` header; a kept
-  one has `location` as a backend-relative path you can pass back as `path`), and returns the
-  backend's own 4xx and 5xx as data, raising only for the API server's own refusals (401/403
-  `permission_denied`, missing pod or service `not_found`, backend unreachable `unreachable`).
-  `rwtask test` records and replays it; in a unit test declare it with
-  `stub_commands(tc, k8s_proxy_get=[{"request": {...}, "response": {...}}])`.
+- To call a pod's or service's HTTP API through the Kubernetes API server's proxy, use
+  `ctx.k8s_proxy_get(namespace, "pods" | "services", name, port, path, headers=None,
+  scheme="http", timeout=30)` or, for any method, `ctx.k8s_proxy_request(method, namespace, kind,
+  name, port, path, body=None, headers=None, scheme="http", timeout=30)` (bash:
+  `rw_k8s_proxy_get`, `rw_k8s_proxy_request <METHOD> ... [--data STRING | --data-file FILE]
+  [--header 'Name: value']...`), not `kubectl get|replace|create|delete --raw .../proxy/...`:
+  kubectl follows a backend's redirect to another host and sends the runner's bearer token there
+  (S17). The helpers return `{status, headers, body, truncated, location}`, never follow a
+  redirect, whatever the method (a redirect to another host comes back as the 3xx with
+  `location: None` and an `x-rw-redirect-dropped` header; a kept one has `location` as a
+  backend-relative path you can pass back as `path`), and return the backend's own 4xx and 5xx as
+  data, raising only for the API server's own refusals (401/403 `permission_denied`, missing pod
+  or service `not_found`, backend unreachable `unreachable`) and for bad input (`invalid_input`).
+  Methods are GET, HEAD, PUT, POST, DELETE and PATCH; a body (bytes or str, 4 MiB at most) goes
+  with PUT, POST, PATCH or DELETE. The only request headers you may set are Accept, Content-Type,
+  Content-MD5, If-Match, If-None-Match and Range (Loki's `/ring` answers JSON only to
+  `Accept: application/json`); anything else, Authorization and Cookie included, is refused. A
+  service's port name may be a DNS label of up to 63 characters (`http-artifactory`), a pod's
+  an IANA service name of up to 15. The helpers do not decide whether a task may write: a
+  `readOnly: true` task that calls a write method is a declaration problem for review and RBAC to
+  catch, not something the SDK stops. `rwtask test` records and replays the calls
+  (`k8s-proxy-get`, `k8s-proxy-request`); in a unit test declare them with
+  `stub_commands(tc, k8s_proxy=[{"request": {...}, "response": {...}}])` (`k8s_proxy_get=` is the
+  same keyword).
 - Each task ends `ok`, `failed` (it raised; `error` says why) or `skipped` (it raised
   `SkipTask(reason)`; `reason` says why). Either way the rest of the request still runs. Only
   tasks can skip: a setup that raises `SkipTask` has failed.

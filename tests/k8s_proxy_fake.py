@@ -4,12 +4,15 @@ config; any other kubectl command prints a canned answer. Everything it does is 
 log, one JSON line per event, so a test can see what was asked of it.
 
     fake = install_fake_kubectl(tmp_path, monkeypatch, routes={"<request path>": {...}})
-    fake.requests()    # [{"path", "headers", "host"}, ...] the proxy was asked for
+    fake.requests()    # [{"method", "path", "headers", "host", "body_b64"}, ...] it was asked for
+    fake.bodies()      # [bytes, ...] the request bodies, in the same order
     fake.commands()    # [argv, ...] every kubectl invocation after the program name
     fake.proxy_pid()   # the pid of the last fake proxy (for "it is gone afterwards")
 
 A route is `{"status": 200, "headers": {"X": "y"}, "body": "text"}` (or `body_b64`); a header
-value may use `{proxy}` for `127.0.0.1` (the Host the client sends). Like the real API server,
+value may use `{proxy}` for `127.0.0.1` (the Host the client sends). A routes key is the request
+path, or `"<METHOD> <path>"`, which wins for that method (so a path can answer GET and PUT
+differently); a HEAD request answers like GET with the body left out. Like the real API server,
 the fake rewrites a header `Location` that is a path (starts with `/` but not `/api/`) into the
 request's proxy path space. `silent` makes the proxy serve without printing its line. `mode` is
 `serve` (default), `hang` (never prints the "Starting to serve" line) or `fail` (prints
@@ -19,6 +22,7 @@ request's proxy path space. `silent` makes the proxy serve without printing its 
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -61,10 +65,18 @@ SCRIPT = textwrap.dedent(
         def log_message(self, *a):
             pass
 
-        def do_GET(self):
-            note({{"path": self.path, "headers": dict(self.headers.items()),
-                  "host": self.headers.get("Host")}})
-            route = cfg.get("api_status") or cfg.get("routes", {{}}).get(self.path)
+        def handle_any(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            data = self.rfile.read(length) if length else b""
+            note({{"method": self.command, "path": self.path,
+                  "headers": dict(self.headers.items()), "host": self.headers.get("Host"),
+                  "body_b64": base64.b64encode(data).decode()}})
+            routes = cfg.get("routes", {{}})
+            route = cfg.get("api_status") or routes.get(self.command + " " + self.path)
+            if route is None and self.command == "HEAD":
+                route = routes.get("GET " + self.path)
+            if route is None:
+                route = routes.get(self.path)
             if route is None:
                 route = {{"status": 404, "body": "no route " + self.path}}
             body = base64.b64decode(route["body_b64"]) if "body_b64" in route else \\
@@ -79,7 +91,10 @@ SCRIPT = textwrap.dedent(
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        do_GET = do_HEAD = do_PUT = do_POST = do_DELETE = do_PATCH = handle_any
 
 
     class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -115,6 +130,10 @@ class FakeKubectl:
 
     def requests(self) -> list[dict]:
         return [e for e in self._lines() if "path" in e]
+
+    def bodies(self) -> list[bytes]:
+        """The body of every request the proxy served, in order (b"" for none)."""
+        return [base64.b64decode(e["body_b64"]) for e in self.requests()]
 
     def serving(self) -> list[dict]:
         """`{socket, dir_mode}` for every fake proxy that started."""
