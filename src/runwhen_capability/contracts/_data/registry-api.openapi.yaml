@@ -298,7 +298,7 @@ paths:
         Only a source with a `write:` config accepts it (`E_WRITE_DISABLED`, 403, otherwise).
 
         `branch` must start with the source's `write.draftPrefix` and pass git's branch-name rules
-        (`E_INVALID_PLUGIN` otherwise). A branch that does not exist yet starts from `write.branch`;
+        (`E_BAD_REQUEST` otherwise). A branch that does not exist yet starts from `write.branch`;
         an existing one gets a new commit on top. A tree equal to the branch's tip commits nothing:
         the answer is 201 with `changed: false` and the tip's commit; a branch that did not exist
         yet is still created, at the base tip, so the branch always exists afterwards (nothing is
@@ -494,6 +494,7 @@ components:
             - E_UNAVAILABLE
             - E_BRANCH_MOVED          # the branch moved twice during a publish or draft
             - E_WRITE_DISABLED        # the source has no write: config
+            - E_BAD_REQUEST           # a request parameter or body that is malformed (not a plugin or snapshot problem) (any 4xx status)
         title: {type: string}
         status: {type: integer}
         detail: {type: string}

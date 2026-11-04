@@ -27,6 +27,11 @@ sending when that happens; requests/urllib3 tolerate the broken pipe a close
 can cause while a body is being sent and still read the response, so the
 caller sees the mapped exception below rather than a ConnectionError.
 
+Every request to one of these routes, and the result POST (serve.py), carries
+`X-RW-Dispatch: <dispatch>` when the runner's `tasks/next` answer had a (valid) `dispatch`
+attempt token -- `task_headers` is the one place that header is built. No token, no header
+(an older runner); a mismatch is the runner's 404.
+
 Every failure is an ArtifactError. An answer with a code maps to its subclass
 (`_raise_for`); a failure to talk to the relay at all -- a refused or broken
 connection, a timeout, a body cut short, a 201
@@ -69,6 +74,7 @@ from .errors import (
     ArtifactTooLargeError,
     ArtifactUndeclaredError,
 )
+from .models import parse_dispatch
 
 # requests/urllib3 timeout tuples are (connect, read), and an upload uses two
 # different limits for them:
@@ -105,6 +111,8 @@ _CONNECT_TIMEOUT = 10
 # than the runner's 2-minute stall timeout, for the same reason as
 # _SEND_TIMEOUT: a runner that merely pauses must not be cut off.
 _READ_TIMEOUT = 150
+
+DISPATCH_HEADER = "X-RW-Dispatch"
 
 _BY_CODE: dict[str, type[ArtifactError]] = {
     "E_ARTIFACT_TOO_LARGE": ArtifactTooLargeError,
@@ -232,6 +240,16 @@ class TokenSource:
         return fresh
 
 
+def task_headers(token: str, dispatch: str | None) -> dict[str, str]:
+    """The headers every per-task relay request carries: the bearer token, and the
+    attempt token (`X-RW-Dispatch`) when one is known. Build every request to a
+    `/v1/tasks/{requestId}/...` route from this, so a new route cannot forget it."""
+    headers = {"Authorization": f"Bearer {token}"}
+    if dispatch is not None:
+        headers[DISPATCH_HEADER] = dispatch
+    return headers
+
+
 @contextmanager
 def _transport_errors(what: str) -> Iterator[None]:
     """Re-raises a transport failure inside the block -- a requests or urllib3
@@ -297,7 +315,9 @@ class RelayClient:
     loop already uses. The bearer token is given as a `token_source` (what the
     serve loop does), a `token` string, or a `token_file` (read once, here; an
     unreadable file raises OSError) -- exactly one of them; pass `None` for a
-    `token_file` that is not used."""
+    `token_file` that is not used. `dispatch` is the attempt token of the request's
+    `tasks/next` answer (None for an older runner, or one that is not a decimal uint64):
+    when set it goes out as `X-RW-Dispatch` on every call."""
 
     def __init__(
         self,
@@ -308,6 +328,7 @@ class RelayClient:
         *,
         token: str | None = None,
         token_source: TokenSource | None = None,
+        dispatch: str | None = None,
     ) -> None:
         given = [x for x in (token_file, token, token_source) if x is not None]
         if not given:
@@ -323,6 +344,7 @@ class RelayClient:
             self._tokens = TokenSource(Path(token_file).read_text().strip())
         self.request_id = request_id
         self.session = session
+        self.dispatch = parse_dispatch(dispatch)
 
     def put_artifact(
         self, *, task: str, name: str, content_type: str, body: Iterable[bytes]
@@ -440,4 +462,4 @@ class RelayClient:
         return f"{self.base_url}/v1/tasks/{self.request_id}/{suffix}"
 
     def _auth(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._tokens.get()}"}
+        return task_headers(self._tokens.get(), self.dispatch)
