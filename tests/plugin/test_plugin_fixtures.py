@@ -708,6 +708,27 @@ def test_a_scenario_mixes_cli_calls_and_proxy_calls_with_defaults(tmp_path):
     assert fourth["argv"] == ["kubectl", "get", "events"]
 
 
+def test_an_old_scenario_loads_without_per_request_api_server_headers(tmp_path):
+    old = {
+        **PROXY_CALL,
+        "response": {
+            **PROXY_CALL["response"],
+            "headers": {
+                "audit-id": "abc",
+                "date": "Tue, 04 Nov 2026 10:00:00 GMT",
+                "x-kubernetes-pf-flowschema-uid": "f",
+                "x-kubernetes-pf-prioritylevel-uid": "p",
+                "content-type": "application/json",
+            },
+        },
+    }
+    text = dump_scenario(
+        resource=None, inputs={}, settings={}, identity={}, calls=[old], expect={"status": "ok"}
+    )
+    (call,) = load_scenario(write(tmp_path, text)).calls
+    assert call["response"]["headers"] == {"content-type": "application/json"}
+
+
 def test_proxy_calls_round_trip_through_dump_and_load(tmp_path):
     calls = [KUBECTL_CALL, PROXY_CALL]
     text = dump_scenario(

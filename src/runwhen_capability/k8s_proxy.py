@@ -36,6 +36,8 @@ another pod, service or port) `location` is None, the `location` header is remov
 (it is kept, raw, only for a kept redirect) and `x-rw-redirect-dropped: <host or
 ns/kind/target>` says where it pointed. The answer is the backend's own, status and body, also
 for a 4xx or 5xx, which is data, not an error.
+The API server's per-request headers (`audit-id`, `date`, `x-kubernetes-pf-*`) are dropped from
+`headers`, see `NOISE_HEADERS`.
 
 Errors (D64 codes): kubectl missing (`dependency`), a proxy that does not start (the code of its
 stderr, else `internal`) or a connection that fails (`unreachable`), a deadline (`timeout`), bad
@@ -142,6 +144,13 @@ _ALLOWED_BY_LOWER = {name.lower(): name for name in ALLOWED_HEADERS}
 
 #: The header that says a redirect's target was dropped, with that target's host.
 DROPPED_HEADER = "x-rw-redirect-dropped"
+
+#: Response headers the helper never returns: per-request API-server or transport noise that
+#: identifies the cluster's audit trail (`audit-id`) or changes on every call (`date`, the
+#: `x-kubernetes-pf-*` flow-control UIDs), so it would break fixture stability. Dropped from a
+#: live answer, a recording and a replay alike, so a task sees the same headers in all three.
+NOISE_HEADERS = frozenset({"audit-id", "date"})
+NOISE_HEADER_PREFIXES = ("x-kubernetes-pf-",)
 
 #: How long a terminated proxy gets before it is killed.
 _TERM_GRACE = 2.0
@@ -578,12 +587,23 @@ def _read_body(response, max_body: int, deadline: float) -> tuple[bytes, bool]:
     return data[:max_body], len(data) > max_body
 
 
+def strip_noise_headers(headers: Mapping[str, Any]) -> dict[str, Any]:
+    """`headers` without the per-request API-server headers (see `NOISE_HEADERS`); names match in
+    any case."""
+    return {
+        name: value
+        for name, value in headers.items()
+        if (lowered := str(name).lower()) not in NOISE_HEADERS
+        and not lowered.startswith(NOISE_HEADER_PREFIXES)
+    }
+
+
 def _headers(raw) -> dict[str, str]:
     out: dict[str, str] = {}
     for key, value in raw.items():
         key = key.lower()
         out[key] = f"{out[key]}, {value}" if key in out else value
-    return out
+    return strip_noise_headers(out)
 
 
 def _is_timeout(exc: BaseException) -> bool:
@@ -915,7 +935,8 @@ def request_problem(request: Mapping, call_type: str) -> str | None:
 def normalize_call(call: dict) -> dict:
     """A recorded proxy call with its defaults filled: the request's scheme and the response's
     headers, body, truncated and location. Its `type` stays (default: `k8s-proxy-request` when
-    the request names a method, else `k8s-proxy-get`)."""
+    the request names a method, else `k8s-proxy-get`). The per-request API-server headers an old
+    recording may hold are dropped from the response (`strip_noise_headers`)."""
     request = {"scheme": "http", **call["request"]}
     out: dict[str, Any] = {
         "type": call.get("type") or (REQUEST_CALL_TYPE if "method" in request else CALL_TYPE),
@@ -931,6 +952,8 @@ def normalize_call(call: dict) -> dict:
             "location": None,
             **call["response"],
         }
+        # an old recording may still hold them
+        out["response"]["headers"] = strip_noise_headers(out["response"]["headers"] or {})
     return out
 
 

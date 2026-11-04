@@ -347,6 +347,31 @@ def test_k8s_proxy_get_is_answered_from_declared_calls_in_order_without_a_proxy(
     assert env["outputs"] == {"statuses": [200, 503], "body": '{"sealed":false}'}
 
 
+def test_a_stubbed_response_drops_per_request_api_server_headers():
+    got = {}
+
+    def main(ctx):
+        got.update(ctx.k8s_proxy_get("web", "services", "vault", 8200, "/v1/sys/health"))
+        return {}
+
+    noisy = {
+        "audit-id": "abc",
+        "Date": "Tue, 04 Nov 2026 10:00:00 GMT",
+        "x-kubernetes-pf-flowschema-uid": "f",
+        "x-kubernetes-pf-prioritylevel-uid": "p",
+        "content-type": "text/plain",
+    }
+    with _tc() as tc:
+        stub_commands(
+            tc,
+            k8s_proxy_get=[
+                {"request": HEALTH_REQUEST, "response": {"status": 200, "headers": noisy}}
+            ],
+        )
+        run_main(main, tc)
+    assert got["headers"] == {"content-type": "text/plain"}
+
+
 def test_a_stubbed_call_returns_the_full_dict_with_defaults():
     got = {}
 

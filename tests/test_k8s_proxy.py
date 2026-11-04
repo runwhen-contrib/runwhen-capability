@@ -106,6 +106,47 @@ def test_a_200_returns_status_headers_and_body(tmp_path, monkeypatch):
     assert [r["path"] for r in fake.requests()] == [HEALTH]
 
 
+def test_per_request_api_server_headers_are_dropped_from_the_answer(tmp_path, monkeypatch):
+    # the fake's http.server also adds its own `Date` header to every answer
+    vault(
+        tmp_path,
+        monkeypatch,
+        routes={
+            HEALTH: {
+                "headers": {
+                    "Audit-Id": "7a1d1c0e-0000-4000-8000-000000000000",
+                    "Date": "Tue, 04 Nov 2026 10:00:00 GMT",
+                    "X-Kubernetes-Pf-Flowschema-Uid": "f-uid",
+                    "X-Kubernetes-Pf-Prioritylevel-Uid": "p-uid",
+                    "Content-Type": "application/json",
+                    "X-Backend": "kept",
+                },
+                "body": "{}",
+            }
+        },
+    )
+    got = get_health()
+    assert got.headers["content-type"] == "application/json"
+    assert got.headers["x-backend"] == "kept"
+    assert "audit-id" not in got.headers and "date" not in got.headers
+    assert not [name for name in got.headers if name.startswith("x-kubernetes-pf-")]
+    assert "audit-id" not in got.to_task_dict()["headers"]
+
+
+def test_strip_noise_headers_matches_names_in_any_case():
+    kept = k8s_proxy.strip_noise_headers(
+        {
+            "Audit-ID": "a",
+            "DATE": "d",
+            "X-Kubernetes-PF-Flowschema-UID": "f",
+            "x-kubernetes-pf-anything": "p",
+            "x-kubernetes-other": "kept",
+            "content-type": "text/plain",
+        }
+    )
+    assert kept == {"x-kubernetes-other": "kept", "content-type": "text/plain"}
+
+
 def test_kubectl_proxy_serves_on_a_private_unix_socket_with_a_host_filter(tmp_path, monkeypatch):
     fake = vault(tmp_path, monkeypatch)
     get_health()

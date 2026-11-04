@@ -43,6 +43,22 @@ TASKS = """\
       probe: { schema: "{ status: integer, body: string }" }
 """
 
+HEADERS_TASK = """\
+  - name: proxy-headers-py
+    title: Proxied GET, the header names the task sees
+    description: ctx.k8s_proxy_get, then the lowercased names of the headers.
+    script: scripts/proxy_headers.py
+    readOnly: true
+    outputs:
+      probe: { schema: "{ headers: string }" }
+"""
+
+HEADERS_PY = """\
+def main(ctx):
+    resp = ctx.k8s_proxy_get(ctx.resource.namespace, "services", "vault", 8200, "/v1/sys/health")
+    return {"probe": {"headers": ",".join(sorted(resp["headers"]))}}
+"""
+
 WRITE_TASKS = """\
   - name: proxy-write-sh
     title: Proxied GET, PUT, DELETE (bash)
@@ -117,6 +133,8 @@ def plugin(tmp_path):
     with open(skill / "tasks.yaml", "a") as handle:
         handle.write(TASKS)
         handle.write(WRITE_TASKS)
+        handle.write(HEADERS_TASK)
+    (skill / "scripts" / "proxy_headers.py").write_text(HEADERS_PY)
     (skill / "scripts" / "proxy_write.sh").write_text(WRITE_SH)
     (skill / "scripts" / "proxy_write.py").write_text(WRITE_PY)
     (skill / "scripts" / "proxy_mixed.sh").write_text(SH)
@@ -224,6 +242,43 @@ def test_record_then_replay_with_no_kubectl_on_path(rwtask, plugin, kubectl, mon
     _, out, _ = rwtask(f"probe/{task}", expect=0)
     assert f"PASS probe/{task}/basic" in out
     assert len(kubectl.commands()) == before  # replay ran nothing: no proxy, no kubectl
+
+
+NOISY_HEADERS = {
+    "Audit-Id": "7a1d1c0e-0000-4000-8000-000000000000",
+    "Date": "Tue, 04 Nov 2026 10:00:00 GMT",
+    "X-Kubernetes-Pf-Flowschema-Uid": "f-uid",
+    "X-Kubernetes-Pf-Prioritylevel-Uid": "p-uid",
+}
+
+
+@pytest.mark.parametrize("task", TASK_NAMES)
+def test_a_recording_has_no_per_request_api_server_headers(rwtask, plugin, kubectl, task):
+    kubectl.configure(routes={HEALTH: {"headers": {"X-A": "1", **NOISY_HEADERS}, "body": BODY}})
+    record(rwtask, task)
+    text = scenario_path(plugin, task).read_text()
+    assert "audit-id" not in text.lower() and "x-kubernetes-pf-" not in text.lower()
+    headers = load_yaml(text)["calls"][1]["response"]["headers"]
+    assert "date" not in headers
+    assert headers["x-a"] == "1"
+
+
+def test_an_old_scenario_with_audit_id_replays_without_it(rwtask, plugin, kubectl, monkeypatch):
+    kubectl.configure(routes={HEALTH: {"headers": {"X-A": "1"}, "body": BODY}})
+    task = "proxy-headers-py"
+    record(rwtask, task)
+    path = scenario_path(plugin, task)
+    doc = load_yaml(path.read_text())
+    headers = doc["calls"][0]["response"]["headers"]
+    assert "date" not in headers  # recorded by a helper that strips it
+    assert "x-a" in headers
+    doc["expect"]["outputs"] = {"probe": {"headers": ",".join(sorted(headers))}}
+    # as an old recording has them
+    headers.update({k.lower(): v for k, v in NOISY_HEADERS.items()})
+    path.write_text(yaml.safe_dump(doc))
+    without_kubectl(monkeypatch)
+    _, out, _ = rwtask(f"probe/{task}", expect=0)
+    assert f"PASS probe/{task}/basic" in out
 
 
 @pytest.fixture
