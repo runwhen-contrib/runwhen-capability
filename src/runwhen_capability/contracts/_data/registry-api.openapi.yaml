@@ -231,6 +231,110 @@ paths:
         "404": {$ref: "#/components/responses/Problem"}
         "409": {$ref: "#/components/responses/Problem"}
 
+  /v1/sources/{id}:publish:
+    post:
+      tags: [sources]
+      summary: Publish one plugin version to a git source (lane D M4 addendum)
+      description: |
+        Lane D M4 addendum to contracts-v1. The body is a plugin tree as a tar (gzip allowed). The
+        registry validates and compiles it as for an upload, commits it under the source's `path`
+        on `write.branch`, tags the commit with the source's `tagPattern`, pushes both atomically,
+        and ingests the tag exactly as a sync would. Only a source with a `write:` config accepts
+        it (`E_WRITE_DISABLED`, 403, otherwise). Nothing is pushed unless the tree is valid and
+        neither a name nor a version conflict is known.
+
+        The commit replaces the files under the plugin's directory with the tree. What the archive
+        leaves out (root `tests/`, `runwhen.lock`, `.runwhen/`, `skills/*/tests/`) is kept from the
+        branch when the tree carries none of it; a tree that carries any of it is authoritative for
+        the whole directory. A `:draft` commit follows the same rule.
+
+        201 when this call pushed the version; 200 when the tag already existed with the same
+        content (an idempotent retry). A tag that exists with other content is
+        `E_VERSION_CONFLICT`; a branch that moved twice during the call is `E_BRANCH_MOVED`; a
+        source busy for longer than the wait is `E_BUSY`. A git or credential failure is 502
+        `E_UNAVAILABLE`.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+        - name: message
+          in: query
+          required: false
+          description: Commit message. Default `<name> v<version>`. At most 4096 bytes, no NUL.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/x-tar: {schema: {type: string, format: binary}}
+          application/gzip: {schema: {type: string, format: binary}}
+      responses:
+        "200":
+          description: The tag already existed with the same content
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/IndexEntry"}
+        "201":
+          description: Committed, tagged, pushed and ingested
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/IndexEntry"}
+        "403": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "502": {$ref: "#/components/responses/Problem"}
+
+  /v1/sources/{id}:draft:
+    post:
+      tags: [sources]
+      summary: Commit a work-in-progress plugin tree to a draft branch (lane D M4 addendum)
+      description: |
+        Lane D M4 addendum to contracts-v1. Build mode saves its work here. The body is a plugin
+        tree as a tar (gzip allowed). The registry normalises it (unsafe paths and the size limits
+        are `E_INVALID_PLUGIN` / `E_ARCHIVE_TOO_LARGE`), reads the plugin name from `plugin.yaml`
+        for the directory (`path` with `{name}` replaced), and commits the tree there on `branch`.
+        A draft is **not** compiled or validated as a plugin: it may be unfinished. Its paths must
+        still be part of the plugin layout (`E_INVALID_PLUGIN` with `E_PATH_NOT_ALLOWED` details).
+        Nothing is tagged and nothing is ingested, so the index and its generation do not change.
+        Only a source with a `write:` config accepts it (`E_WRITE_DISABLED`, 403, otherwise).
+
+        `branch` must start with the source's `write.draftPrefix` and pass git's branch-name rules
+        (`E_BAD_REQUEST` otherwise). A branch that does not exist yet starts from `write.branch`;
+        an existing one gets a new commit on top. A tree equal to the branch's tip commits nothing:
+        the answer is 201 with `changed: false` and the tip's commit; a branch that did not exist
+        yet is still created, at the base tip, so the branch always exists afterwards (nothing is
+        committed). A single-plugin source only takes a tree for its own plugin. A branch that
+        moved twice during the call is `E_BRANCH_MOVED`; a source busy for longer than the wait is
+        `E_BUSY`. A git or credential failure is 502 `E_UNAVAILABLE`.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+        - name: branch
+          in: query
+          required: true
+          description: The draft branch, starting with the source's `write.draftPrefix`.
+          schema: {type: string}
+        - name: message
+          in: query
+          required: false
+          description: 'Commit message. Default `draft: <name>`. At most 4096 bytes, no NUL.'
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/x-tar: {schema: {type: string, format: binary}}
+          application/gzip: {schema: {type: string, format: binary}}
+      responses:
+        "201":
+          description: The draft branch holds the tree (`changed` says whether a commit was pushed)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DraftResult"}
+        "403": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "502": {$ref: "#/components/responses/Problem"}
+
   /v1/uploads:
     post:
       tags: [sources]
@@ -239,7 +343,9 @@ paths:
         The body is a plugin tree as a tar (gzip allowed). The registry normalises it per
         archive.md §3, reads `plugin.yaml` for name and version, validates and compiles it with the
         SDK, and ingests it under the `upload` source. Re-uploading identical content is a no-op
-        (200); different content for an existing version is `E_VERSION_CONFLICT`.
+        (200); different content for an existing version is `E_VERSION_CONFLICT`. Uploads,
+        publishes and drafts share a small number of processing slots; when none frees up within
+        a few seconds the answer is 409 `E_BUSY` and the caller retries.
       requestBody:
         required: true
         content:
@@ -264,6 +370,9 @@ paths:
     get:
       tags: [admin]
       summary: Export a snapshot for an air-gapped install (archive.md §6)
+      description: |
+        `runtimes`: git-published runtimes only. The registry's own config-file runtimes are
+        install-local chart config and are not exported.
       parameters:
         - name: plugin
           in: query
@@ -273,7 +382,7 @@ paths:
           explode: true
         - name: latestOnly
           in: query
-          description: Only the newest non-withdrawn version of each plugin.
+          description: Only the newest non-withdrawn release of each plugin, or its newest prerelease when it has no release (the index's `latest` rule).
           schema: {type: boolean, default: false}
         - name: release
           in: query
@@ -286,6 +395,8 @@ paths:
             X-Snapshot-Sha256: {description: sha256 of the body, schema: {type: string}}
           content:
             application/x-tar: {schema: {type: string, format: binary}}
+        "404": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
   /v1/import:
     post:
       tags: [admin]
@@ -307,6 +418,7 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/ImportResult"}
         "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
         "422": {$ref: "#/components/responses/Problem"}
 
 components:
@@ -375,9 +487,14 @@ components:
             - E_VERSION_CONFLICT      # same name+version, different bytes
             - E_NAME_CONFLICT         # the plugin name belongs to another source
             - E_HASH_MISMATCH
+            - E_INVALID_SNAPSHOT      # a snapshot's layout or manifest is malformed
             - E_ARCHIVE_TOO_LARGE
             - E_SYNC_IN_PROGRESS
+            - E_BUSY                  # another export/import (or source write) is running
             - E_UNAVAILABLE
+            - E_BRANCH_MOVED          # the branch moved twice during a publish or draft
+            - E_WRITE_DISABLED        # the source has no write: config
+            - E_BAD_REQUEST           # a request parameter or body that is malformed (not a plugin or snapshot problem) (any 4xx status)
         title: {type: string}
         status: {type: integer}
         detail: {type: string}
@@ -495,7 +612,7 @@ components:
       required: [id, kind, status]
       properties:
         id: {type: string}
-        kind: {type: string, enum: [public, git, upload]}
+        kind: {type: string, enum: [public, git, upload, snapshot]}
         repo: {type: [string, "null"]}
         tagPattern: {type: [string, "null"], description: 'Default "<name>/v<semver>" for multi-plugin repos, "v<semver>" for single-plugin repos'}
         credentialRef:
@@ -515,6 +632,21 @@ components:
               tag: {type: string}
               code: {type: string}
               detail: {type: string}
+    DraftResult:
+      type: object
+      required: [source, branch, commit, path, changed]
+      properties:
+        source: {type: string}
+        branch: {type: string}
+        commit:
+          type: string
+          description: The draft branch's tip after the call.
+        path:
+          type: string
+          description: The plugin's directory in the repository; "" is the repository root.
+        changed:
+          type: boolean
+          description: False when the tree equalled the tip and nothing was pushed.
     ImportResult:
       type: object
       required: [snapshotSha256, imported, skipped]

@@ -5,7 +5,7 @@ Relay HTTP contract (this is the wire the runner must implement to match):
     POST {relay}/v1/tasks/next
         body: {"poolId": "<poolId>"}
         -> 200 {"requestId", "request", "credentials": {name: value}, "scopeId", "deadlineMs",
-                "maxResultBytes"?, "outputs"?, "inputArtifacts"?}
+                "maxResultBytes"?, "outputs"?, "inputArtifacts"?, "dispatch"?}
            (the "request" field is a RequestEnvelope; see models.py)
         -> 204 when idle (the server may hold the connection up to ~30s)
 
@@ -13,12 +13,16 @@ Relay HTTP contract (this is the wire the runner must implement to match):
         body: {"status": "ok"|"failed"|"timeout", "result": {...}, "error": "..."}
            ("result" is a ResultEnvelope, present only on status "ok")
 
-Every relay call carries `Authorization: Bearer <token>`. The token comes from the
-executor token file -- --token-file, else the RW_EXECUTOR_TOKEN_FILE env var, else the
-legacy EXECUTOR_TOKEN_FILE, else DEFAULT_TOKEN_FILE -- which is read and then unlinked
-(S1 / SEC-2): task processes run as the same uid in the same pod, so a token that stays on
-disk is a token any task can `cat`. What happens next depends on whether the unlink worked,
-and is logged once:
+Every relay call carries `Authorization: Bearer <token>`. A request's result POST and its
+artifact and code routes (relay.py) also carry `X-RW-Dispatch: <dispatch>` when the 200
+body had `dispatch`, the runner's attempt token (a decimal uint64 string; absent from an
+older runner, and ignored if it is not valid) -- relay.task_headers builds them all.
+
+The token comes from the executor token file -- --token-file, else the
+RW_EXECUTOR_TOKEN_FILE env var, else the legacy EXECUTOR_TOKEN_FILE, else DEFAULT_TOKEN_FILE
+-- which is read and then unlinked (S1 / SEC-2): task processes run as the same uid in the
+same pod, so a token that stays on disk is a token any task can `cat`. What happens next
+depends on whether the unlink worked, and is logged once:
 
 - It worked (the runner's own tmpfs copy, which the runner never rotates in place; a
   restart is a new pod): the token lives in memory only and is never read again.
@@ -121,7 +125,7 @@ from .plugin.lease import (
     run_lease,
     wipe_stale_credentials,
 )
-from .relay import RelayClient, TokenNotPresent, TokenSource
+from .relay import RelayClient, TokenNotPresent, TokenSource, task_headers
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
@@ -370,6 +374,7 @@ def _post_result(
     body: bytes,
     tokens: TokenSource,
     log,
+    dispatch: str | None = None,
 ) -> None:
     """POSTs one PutResult; `body` is the JSON that `_encode_result` made. The token comes
     from `tokens.get()` immediately before posting: in the re-reading mode a request can
@@ -385,8 +390,11 @@ def _post_result(
     A transport failure or a non-2xx is logged and dropped -- the runner's
     lease expiry is what recovers the request -- but it is never treated as
     a delivered result: an unlogged 401/500 here is a result that vanished
-    with nothing to explain it."""
-    headers = {"Authorization": f"Bearer {tokens.get()}", "Content-Type": "application/json"}
+    with nothing to explain it.
+
+    `dispatch` is the request's attempt token (None if the runner sent none); it goes
+    out as `X-RW-Dispatch` (relay.task_headers)."""
+    headers = {**task_headers(tokens.get(), dispatch), "Content-Type": "application/json"}
 
     try:
         resp = session.post(
@@ -475,11 +483,19 @@ def _poll_once(
         return
 
     try:
-        task_request = TaskHostRequest.model_validate(resp.json())
+        raw_request = resp.json()
+        task_request = TaskHostRequest.model_validate(raw_request)
     except Exception as exc:  # noqa: BLE001 -- a malformed relay response must not crash the loop
         log.error("poll %s/v1/tasks/next: malformed response: %s", relay, exc)
         time.sleep(RETRY_DELAY)  # a relay stuck on malformed 200s must not be hot-looped
         return
+
+    if task_request.dispatch is not None:
+        log.debug("request %s: attempt token %s", task_request.requestId, task_request.dispatch)
+    elif isinstance(raw_request, dict) and raw_request.get("dispatch") is not None:
+        log.debug(
+            "request %s: ignoring a dispatch token that is not a uint64", task_request.requestId
+        )
 
     if not _is_safe_scope_id(task_request.scopeId):
         # Reported as a failed request rather than swallowed: the runner must
@@ -498,6 +514,7 @@ def _poll_once(
             ),
             tokens,
             log,
+            task_request.dispatch,
         )
         return
 
@@ -519,6 +536,7 @@ def _poll_once(
             _encode_result({"status": "failed", "error": BUNDLES_NOT_ALLOWED}, log),
             tokens,
             log,
+            task_request.dispatch,
         )
         return
 
@@ -534,14 +552,23 @@ def _poll_once(
             failed_envelope("invalid_input", PLUGIN_CODE_NOT_ALLOWED), task_request.request.doc
         )
         body = _encode_result({"status": "ok", "result": envelope}, log)
-        _post_result(session, relay, task_request.requestId, body, tokens, log)
+        _post_result(
+            session, relay, task_request.requestId, body, tokens, log, task_request.dispatch
+        )
         return
 
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
     # One client per request: it carries the request id the artifact routes
     # are scoped to, and the executor's token source.
-    relay_client = RelayClient(relay, None, task_request.requestId, session, token_source=tokens)
+    relay_client = RelayClient(
+        relay,
+        None,
+        task_request.requestId,
+        session,
+        token_source=tokens,
+        dispatch=task_request.dispatch,
+    )
     try:
         if is_lease:
             # A V13 lease: plugin code pinned by hash, the same hardened child runner
@@ -606,4 +633,4 @@ def _poll_once(
             )
 
     body = _encode_result(payload, log, task_request.maxResultBytes)
-    _post_result(session, relay, task_request.requestId, body, tokens, log)
+    _post_result(session, relay, task_request.requestId, body, tokens, log, task_request.dispatch)

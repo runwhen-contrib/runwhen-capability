@@ -270,7 +270,7 @@ def fetch(relay_server, tmp_path, monkeypatch):
     monkeypatch.setenv("RW_ARCHIVE_CACHE", str(tmp_path / "archives"))
     monkeypatch.setenv("RW_CREDENTIALS_DIR", str(tmp_path / "creds"))
 
-    def go(lease, *code: Response):
+    def go(lease, *code: Response, **extra):
         token.write_text("test-token")  # serve reads it once and unlinks it
         relay_server.script(
             "POST",
@@ -283,6 +283,7 @@ def fetch(relay_server, tmp_path, monkeypatch):
                     "credentials": {},
                     "scopeId": "scope-1",
                     "deadlineMs": 30000,
+                    **extra,
                 },
             ),
         )
@@ -1032,3 +1033,47 @@ def test_a_lease_with_room_in_its_memory_limit_runs_normally(poll):
     envelope = envelope_of(poll(lease))
     assert envelope["status"] == "ok", envelope["errors"]
     assert "provenance" in envelope
+
+
+# -- the runner's attempt token (X-RW-Dispatch) ---------------------------------------------------
+
+
+def _dispatch_headers(fetch, relay_server) -> list[str | None]:
+    """The X-RW-Dispatch of the code GET and the result POST, in that order."""
+    [code] = fetch.code_requests()
+    [result] = [r for r in relay_server.requests if r.path.endswith("/result")]
+    return [code.header("x-rw-dispatch"), result.header("x-rw-dispatch")]
+
+
+def test_the_dispatch_of_tasks_next_is_echoed_on_the_code_fetch_and_the_result(fetch, relay_server):
+    data = archive.build(entries())
+    body = fetch(archive_lease(data), code_response(data), dispatch="18446744073709551615")
+    assert envelope_of(body)["status"] == "ok"
+    assert _dispatch_headers(fetch, relay_server) == ["18446744073709551615"] * 2
+    # The poll itself is how the token is obtained: it carries none.
+    [poll] = [r for r in relay_server.requests if r.path == "/v1/tasks/next"]
+    assert poll.header("x-rw-dispatch") is None
+
+
+def test_no_dispatch_from_the_runner_means_no_header(fetch, relay_server):
+    data = archive.build(entries())
+    assert envelope_of(fetch(archive_lease(data), code_response(data)))["status"] == "ok"
+    assert _dispatch_headers(fetch, relay_server) == [None, None]
+
+
+@pytest.mark.parametrize("bad", ["abc", "-1", "", "18446744073709551616", 12, None, "1 "])
+def test_an_invalid_dispatch_is_ignored_and_the_task_still_runs(fetch, relay_server, bad):
+    data = archive.build(entries())
+    body = fetch(archive_lease(data), code_response(data), dispatch=bad)
+    assert envelope_of(body)["status"] == "ok"
+    assert _dispatch_headers(fetch, relay_server) == [None, None]
+
+
+def test_the_dispatch_is_echoed_on_a_result_the_executor_refuses_to_run(fetch, relay_server):
+    """A refused request (here a scopeId that is not a path segment) is still a result POST
+    for the attempt, so it carries the token too."""
+    data = archive.build(entries())
+    fetch(archive_lease(data), code_response(data), dispatch="77", scopeId="../x")
+    [result] = [r for r in relay_server.requests if r.path.endswith("/result")]
+    assert result.header("x-rw-dispatch") == "77"
+    assert fetch.code_requests() == []
