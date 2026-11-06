@@ -18,6 +18,47 @@ RW_SH = r"""# rw.sh -- sourced by a custom bundle bash task: source "$RW_SDK/rw.
 #   rw_skip [reason]          mark the task skipped and exit 0
 #   rw_artifact <name> <path> register the file at <path> as artifact <name>
 #   rw_artifact <name> -      copy stdin to $RW_ARTIFACTS_DIR/<name> and register that
+#   rw_output_append <output> <json>   the same as rw_append
+#   rw_output_set <output> <json>      the same as rw_set
+#   rw_error <code> <message> [scope]  record a structured error and carry on
+#   rw_k8s_proxy_get <namespace> <pods|services> <name> <port> <path>
+#                     [--header 'Name: value']... [--scheme https] [--timeout N]
+#                     print one JSON line {status, headers, body, truncated, location} for a GET
+#                     through the Kubernetes API server's proxy that never follows a redirect
+#   rw_k8s_proxy_request <METHOD> <namespace> <pods|services> <name> <port> <path>
+#                     [--data STRING | --data-file FILE] [--header 'Name: value']...
+#                     [--scheme https] [--timeout N]   the same for GET, HEAD, PUT, POST,
+#                     DELETE or PATCH, with a request body for the last four
+#
+# rw_k8s_proxy_get does what `kubectl get --raw /api/v1/namespaces/<ns>/services/<name>:<port>/
+# proxy/<path>` does -- without its flaw: kubectl follows a backend's redirect to another host
+# and sends the runner's bearer token there (S17); `kubectl replace|create|delete --raw` do the
+# same, and rw_k8s_proxy_request is their replacement. The backend's own status and body come
+# back as data (a 404 is not an error); `location` is set only for a redirect that stays on the
+# same pod/service/port, as a path you can pass back, and any other redirect is dropped
+# (`location` null, header `x-rw-redirect-dropped` names where it pointed). Only the headers
+# Accept, Content-Type, Content-MD5, If-Match, If-None-Match and Range may be set; any other is
+# invalid_input. The helpers do not decide whether a task may write: a readOnly task that
+# calls a write method is for review and RBAC to catch.
+# On failure they record the error themselves (as rw_error does, so do not call rw_error again
+# for it), print a line to stderr and return non-zero; under `set -e` that ends the task.
+#
+# $RW_OUT is a directory, fresh for this task, that the task may write to freely;
+# nothing in it is read by the host.
+#
+# $RW_NOW is the run's reference time (RFC 3339, UTC, milliseconds, e.g.
+# 2026-11-04T09:14:02.123Z) and $RW_NOW_EPOCH the same instant in integer seconds: use
+# them, not `date`, for anything that ends up in a command or an output, so that
+# `rwtask test` replays the argv it recorded. Use $SECONDS or `date +%s` only to
+# measure a duration. (Unset in a classic bundle.)
+#
+# rw_error records "the task could not look at something" (never a finding): <code> is
+# one of permission_denied, not_found, unreachable, timeout, rate_limited, storage,
+# invalid_input, dependency, internal (any other is recorded as internal, with a hint),
+# <message> is one line of text, [scope] says what it was looking at. It does not exit:
+# the exit code decides failed (non-zero) or not, and recorded errors make a clean
+# exit partial. It appends one JSON line to the file $RW_ERRORS_FILE, which the host
+# reads after the task exits.
 #
 # rw_append/rw_set/rw_skip/rw_artifact write one JSON line to the private file
 # descriptor the host opened for this task ($RW_OUTPUT_FD) -- never to
@@ -94,6 +135,62 @@ rw_set() {
     value=${value//$'\n'/ }
     printf '{"op":"set","name":%s,"value":%s}\n' "$(_rw_json_string "$name")" "$value" \
         >&"${RW_OUTPUT_FD}"
+}
+
+rw_output_append() { rw_append "$@"; }
+
+rw_output_set() { rw_set "$@"; }
+
+rw_error() {
+    local code="${1:-}" message="${2:-}" scope="${3:-}" hint="" c ok=""
+    if [[ -z $code || -z $message ]]; then
+        printf 'rw_error: usage: rw_error <code> <message> [scope]\n' >&2
+        return 2
+    fi
+    if [[ -z ${RW_ERRORS_FILE:-} ]]; then
+        printf 'rw_error: RW_ERRORS_FILE is not set\n' >&2
+        return 1
+    fi
+    for c in permission_denied not_found unreachable timeout rate_limited storage \
+        invalid_input dependency internal; do
+        [[ $code == "$c" ]] && ok=1
+    done
+    if [[ -z $ok ]]; then
+        printf 'rw_error: %s is not an error code; recorded as internal\n' "$code" >&2
+        hint="invalid error code '$code'; use one of permission_denied, not_found, unreachable, "
+        hint+="timeout, rate_limited, storage, invalid_input, dependency, internal"
+        code=internal
+    fi
+    message=${message//[[:cntrl:]]/ }
+    scope=${scope//[[:cntrl:]]/ }
+    local line
+    line=$(printf '{"code":"%s","message":%s' "$code" "$(_rw_json_string "$message")")
+    [[ -n $scope ]] && line+=$(printf ',"scope":%s' "$(_rw_json_string "$scope")")
+    [[ -n $hint ]] && line+=$(printf ',"hint":%s' "$(_rw_json_string "$hint")")
+    # One write of one line: appends from concurrent processes do not interleave.
+    printf '%s}\n' "$line" >> "$RW_ERRORS_FILE"
+}
+
+rw_k8s_proxy_get() {
+    if (( $# < 5 )); then
+        printf 'rw_k8s_proxy_get: usage: rw_k8s_proxy_get <namespace> <pods|services> <name> ' >&2
+        printf "<port> <path> [--header 'Name: value']... [--scheme http|https] " >&2
+        printf '[--timeout seconds]\n' >&2
+        return 2
+    fi
+    # RW_PYTHON is the interpreter that runs the task host (the host sets it); -P/-s as for
+    # a Python task, so nothing in the working directory can shadow the SDK.
+    "${RW_PYTHON:-python3}" -P -s -m runwhen_capability.k8s_proxy get "$@"
+}
+
+rw_k8s_proxy_request() {
+    if (( $# < 6 )); then
+        printf 'rw_k8s_proxy_request: usage: rw_k8s_proxy_request <METHOD> <namespace> ' >&2
+        printf '<pods|services> <name> <port> <path> [--data STRING | --data-file FILE] ' >&2
+        printf "[--header 'Name: value']... [--scheme http|https] [--timeout seconds]\n" >&2
+        return 2
+    fi
+    "${RW_PYTHON:-python3}" -P -s -m runwhen_capability.k8s_proxy request "$@"
 }
 
 rw_skip() {

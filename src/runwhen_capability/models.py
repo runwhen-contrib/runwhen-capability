@@ -15,6 +15,7 @@ output kind.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -352,28 +353,78 @@ class InputArtifactDecl(BaseModel):
     sha256: str = ""
 
 
+LEASE_API_VERSION = "runwhen.com/lease/v1"
+
+
+class V13LeaseRequest(BaseModel):
+    """A `request` that is a V13 lease (`apiVersion: runwhen.com/lease/v1`), kept as the
+    raw document: it is validated against the `lease` contract where it is run
+    (plugin/lease.py), so a bad one completes as a failed envelope instead of a
+    malformed poll. Built by TaskHostRequest's before-validator, never by the union (the
+    classic envelopes have defaults for everything and would swallow a lease)."""
+
+    doc: dict[str, Any]
+
+
+_UINT64_MAX = (1 << 64) - 1
+_DECIMAL = re.compile(r"[0-9]+")
+
+
+def parse_dispatch(value: Any) -> str | None:
+    """The runner's attempt token (`dispatch`): a decimal uint64, as a string. Anything
+    else -- absent, null, a number, "", "-1", "abc", a value over 2**64-1 -- is None: an
+    older runner does not send it, and a token this SDK cannot read must not fail the
+    task. It is echoed back as the `X-RW-Dispatch` header (relay.task_headers)."""
+    if not isinstance(value, str) or not _DECIMAL.fullmatch(value):
+        return None
+    return value if int(value) <= _UINT64_MAX else None
+
+
 class TaskHostRequest(BaseModel):
     """The 200 response body of `POST {relay}/v1/tasks/next`. `request` is a
     BundleRequestEnvelope when the body carries a `bundle` key, else the
     packaged-capability RequestEnvelope -- pydantic's smart-mode union picks
     the one that actually matches (BundleRequestEnvelope requires `bundle`,
-    which RequestEnvelope does not have).
+    which RequestEnvelope does not have) -- or a V13LeaseRequest when its
+    `apiVersion` is `runwhen.com/lease/v1`.
+
+    `materialized` (V13 leases only) is the runner's `materializedCredential` list:
+    secret material the executor writes to files and exports for the task. It is
+    parsed where it is used, so one that is malformed fails that request, not the poll.
 
     `maxResultBytes`, `outputs` and `inputArtifacts` are the artifact fields:
     the cap on the inline result (None, or 0 or less, = unset; no cap is
     applied here), and the lease's declared artifact/spill outputs and input
-    artifacts. An older runner omits all three."""
+    artifacts. An older runner omits all three.
+
+    `dispatch` is the runner's attempt token (a decimal uint64 string, see
+    `parse_dispatch`): echoed as `X-RW-Dispatch` on the result, artifact and code routes
+    for this request. None when an older runner omits it or it is not a valid token."""
 
     requestId: str
-    request: RequestEnvelope | BundleRequestEnvelope
+    request: RequestEnvelope | BundleRequestEnvelope | V13LeaseRequest
     credentials: dict[str, str] = Field(default_factory=dict)
     scopeId: str
     deadlineMs: int
     maxResultBytes: int | None = None
     outputs: list[OutputDecl] = Field(default_factory=list)
     inputArtifacts: list[InputArtifactDecl] = Field(default_factory=list)
+    materialized: list[Any] = Field(default_factory=list)
+    dispatch: str | None = None
 
-    @field_validator("outputs", "inputArtifacts", mode="before")
+    @field_validator("dispatch", mode="before")
+    @classmethod
+    def _dispatch_is_best_effort(cls, value: Any) -> str | None:
+        return parse_dispatch(value)
+
+    @field_validator("request", mode="before")
+    @classmethod
+    def _a_lease_is_kept_raw(cls, value: Any) -> Any:
+        if isinstance(value, dict) and value.get("apiVersion") == LEASE_API_VERSION:
+            return V13LeaseRequest(doc=value)
+        return value
+
+    @field_validator("outputs", "inputArtifacts", "materialized", mode="before")
     @classmethod
     def _null_is_empty(cls, value: Any) -> Any:
         """A JSON null reads as an empty list (a protobuf-derived encoder may

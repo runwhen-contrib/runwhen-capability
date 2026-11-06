@@ -6,21 +6,26 @@ file a task reads, no environment it inspects, no path it constructs.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .artifacts import ArtifactsClient
 from .errors import CredentialNotFoundError, OutputTooLargeError, SkipTask
 from .findings import FindingsClient
 from .git import GitClient
 from .models import InputArtifactDecl, OutputDecl
+from .reftime import NOW_ENV, parse_now
 from .repo_fs import RepoFsClient
+from .rwerrors import ERROR_CODES, RwCommandError, RwError, classify_command_error
 from .sarif import SARIF_BYTE_BUDGET, SarifClient
 
 if TYPE_CHECKING:
@@ -58,6 +63,79 @@ _RUN_READ_CHUNK = 65536
 # to; see `run()`'s docstring for why this is only a belt-and-braces bound,
 # not the primary fix for a grandchild holding a pipe open.
 _DRAIN_JOIN_TIMEOUT = 5
+
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _snake(name: str) -> str:
+    """camelCase -> snake_case, the spelling `ctx.settings` attributes use
+    (the same rule as custom.manifest.python_kwarg_name, which this module
+    does not import: a bundle's child process should not pay for it)."""
+    return _CAMEL_BOUNDARY.sub("_", name).lower()
+
+
+class AttrView(Mapping):
+    """A read-only view of a JSON object with attribute access
+    (`ctx.resource.namespace`, `ctx.settings.latency_threshold_ms`). Nested
+    objects are views too. A missing attribute is an AttributeError, a missing
+    key a KeyError. With `snake=True` only this object's own keys are snake_cased:
+    everything nested below them is user data and keeps its keys verbatim (a
+    setting `patterns: {connRefused: ...}` is read as `ctx.settings.patterns.connRefused`)."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: Mapping[str, Any], *, snake: bool = False) -> None:
+        object.__setattr__(
+            self,
+            "_data",
+            {(_snake(k) if snake else k): _wrap(v) for k, v in data.items()},
+        )
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __getattr__(self, name: str) -> Any:
+        # Only reached when normal lookup fails (not for `_data`, a slot).
+        try:
+            return self._data[name]
+        except KeyError:
+            raise AttributeError(f"no field {name!r}") from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("read-only")
+
+    def __repr__(self) -> str:
+        return f"AttrView({self._data!r})"
+
+
+def _wrap(value: Any) -> Any:
+    """Nested values: views over dicts (keys verbatim), lists walked."""
+    if isinstance(value, Mapping):
+        return AttrView(value)
+    if isinstance(value, list):
+        return [_wrap(item) for item in value]
+    return value
+
+
+def _json_object_env(name: str, *, snake: bool) -> AttrView | None:
+    """The JSON object in env var `name` as an AttrView; None when unset."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} is not valid JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ValueError(f"{name} must be a JSON object")
+    return AttrView(doc, snake=snake)
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -175,6 +253,19 @@ class Context:
         self.artifact_cache_dir = Path(artifact_cache_dir) if artifact_cache_dir else None
         self.deadline_at = deadline_at
 
+        # What the host (the runner, or `rwtask run`) says about this run, from the
+        # environment it set for the task process (CONTRACTS.md "What a script sees").
+        # Unlike credentials, none of it is secret.
+        self.resource: AttrView | None = _json_object_env("RW_RESOURCE_JSON", snake=False)
+        self.settings: AttrView = _json_object_env("RW_SETTINGS_JSON", snake=True) or AttrView({})
+        self.dry_run: bool = os.environ.get("RW_DRY_RUN") == "1"
+        self._reference_time: str | None = os.environ.get(NOW_ENV) or None
+        # "v13": the host runs this task under the V13 contract (D42), where ctx.run
+        # fails on a non-zero exit unless the task says otherwise.
+        self._v13_contract = os.environ.get("RW_TASK_CONTRACT") == "v13"
+        self._errors: list[dict[str, Any]] = []
+        self._errors_file = os.environ.get("RW_ERRORS_FILE") or None
+
         self.git = GitClient(self)
         self.sarif = SarifClient(self)
         self.findings = FindingsClient(self)
@@ -216,6 +307,146 @@ class Context:
         setup already is -- see SkipTask's docstring."""
         raise SkipTask(reason)
 
+    @property
+    def errors(self) -> list[dict[str, Any]]:
+        """The structured errors this task has recorded with `ctx.error`, in
+        order. A copy: appending to it records nothing."""
+        return json.loads(json.dumps(self._errors))
+
+    def error(
+        self,
+        code: str,
+        message: str,
+        *,
+        scope: str | None = None,
+        hint: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Records a structured error (D64: the task failed to look at
+        something -- never a finding) and carries on. `code` is one of
+        rwerrors.ERROR_CODES; any other is recorded as `internal`, with a hint
+        naming the bad code. The error is appended, as one JSON line, to the
+        side channel the host reads after the task exits (`$RW_ERRORS_FILE`),
+        so it counts even if the task then crashes. A task that wants to stop
+        raises `RwError` instead."""
+        if not isinstance(code, str) or code not in ERROR_CODES:
+            note = f"invalid error code {code!r}; use one of {', '.join(ERROR_CODES)}"
+            hint = f"{note}. {hint}" if hint else note
+            code = "internal"
+        entry = RwError(code, message, scope=scope, hint=hint, details=details).to_dict()
+        line = json.dumps(entry, default=str)
+        self._errors.append(json.loads(line))
+        if self._errors_file is None:
+            return
+        try:
+            fd = os.open(
+                self._errors_file,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                os.write(fd, (line + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            self.log.warning("could not write the error side channel: %s", exc)
+
+    def now(self) -> datetime:
+        """The task run's reference time, an aware UTC datetime: `RW_NOW`, which the
+        executor sets once when the run starts (CONTRACTS.md "What a script sees"). Use it
+        for anything that ends up in a command or an output, so that a replay
+        (`rwtask test`) reproduces the same argv and the same result; use
+        `time.monotonic()` for durations. Without `RW_NOW` (a classic bundle, a plain unit
+        test) it is the wall clock, read afresh on each call. ValueError when `RW_NOW` is
+        not a UTC RFC 3339 timestamp."""
+        if self._reference_time is None:
+            return datetime.now(UTC)
+        try:
+            return parse_now(self._reference_time)
+        except ValueError as exc:
+            raise ValueError(f"{NOW_ENV}: {exc}") from None
+
+    def k8s_proxy_get(
+        self,
+        namespace: str,
+        kind: str,
+        name: str,
+        port: int | str,
+        path: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        scheme: str = "http",
+        timeout: float = 30,
+    ) -> dict[str, Any]:
+        """GET `path` from a pod's or service's HTTP port through the Kubernetes API server's
+        proxy (`kind` is "pods" or "services"; `scheme` "http" or "https"), and NEVER follow a
+        redirect. Use it instead of `kubectl get --raw .../proxy/...`, which follows a backend's
+        301/302/307 to another host with the runner's bearer token (S17).
+
+        `headers` sets request headers; only Accept, Content-Type, Content-MD5, If-Match,
+        If-None-Match and Range are allowed (any case), anything else is `invalid_input`.
+        `port` is a number or a port name (a service's: a DNS label up to 63 characters; a
+        pod's: at most 15 characters with a letter, no `--`).
+
+        Returns `{status, headers, body, truncated, location}`: the backend's own status and
+        body (a 404 or a plain 503 from the backend is data, not an error), headers lowercased,
+        the body as text cut at 4 MiB (`truncated`), and `location` the redirect target only
+        when it stays on the same pod/service/port, as a backend-relative path plus query that
+        can be passed back as `path`. Any other target is dropped: `location` is None, the
+        `location` header is removed and `x-rw-redirect-dropped` names where it pointed. Raises
+        RwError: `permission_denied` (the API server itself answers 401/403), `not_found` (no
+        such pod or service), `unreachable` (the proxy cannot reach the backend), `timeout`,
+        `dependency` (no kubectl), `invalid_input`. KUBECONFIG is the
+        task's environment; `rwtask test` records and replays the call (`k8s-proxy-get`)."""
+        # Imported here: `python3 -m runwhen_capability.k8s_proxy` (bash's helper) must not find
+        # the module already imported by the package, or runpy warns on stderr.
+        from .k8s_proxy import task_get
+
+        return task_get(  # type: ignore[arg-type]
+            namespace, kind, name, port, path, headers=headers, scheme=scheme, timeout=timeout
+        )
+
+    def k8s_proxy_request(
+        self,
+        method: str,
+        namespace: str,
+        kind: str,
+        name: str,
+        port: int | str,
+        path: str,
+        *,
+        body: bytes | str | None = None,
+        headers: Mapping[str, str] | None = None,
+        scheme: str = "http",
+        timeout: float = 30,
+    ) -> dict[str, Any]:
+        """`k8s_proxy_get` for any method: GET, HEAD, PUT, POST, DELETE or PATCH (anything else
+        is `invalid_input`), never following a redirect. Use it instead of `kubectl replace|
+        create|delete --raw .../proxy/...`, which leaks the runner's token the same way.
+
+        `body` is bytes or str (UTF-8), at most 4 MiB, and only PUT, POST, PATCH and DELETE may
+        carry one; without a `Content-Type` header it is sent as application/octet-stream.
+        `headers` are as for `k8s_proxy_get`. Returns the same dict and raises the same errors
+        (a HEAD answer has an empty body). `rwtask test` records and replays the call
+        (`k8s-proxy-request`).
+
+        This does not decide whether the task may write: a task that declares `readOnly: true`
+        and calls a write method is that plugin's declaration problem, for review and RBAC."""
+        from .k8s_proxy import task_request
+
+        return task_request(  # type: ignore[arg-type]
+            method,
+            namespace,
+            kind,
+            name,
+            port,
+            path,
+            body=body,
+            headers=headers,
+            scheme=scheme,
+            timeout=timeout,
+        )
+
     def run(
         self,
         argv: list[str],
@@ -224,12 +455,22 @@ class Context:
         env: dict[str, str] | None = None,
         *,
         inherit_env: bool = True,
+        check: bool | None = None,
     ) -> subprocess.CompletedProcess:
         """Runs argv as a subprocess. stdout is captured (returned on
         `.stdout`); stderr is captured and forwarded line-by-line to
         ctx.log; the timeout (default DEFAULT_RUN_TIMEOUT) is enforced --
         a timeout raises subprocess.TimeoutExpired, which the task host
         treats like any other task exception.
+
+        A non-zero exit raises RwCommandError when `check` is true, whose
+        `code` is classify_command_error(argv, returncode, stderr) -- so an
+        uncaught `kubectl get` that was Forbidden ends the task as
+        `permission_denied`, not a generic failure -- and is returned
+        (`.returncode`) when it is false. `check=None` (the default) means true
+        under the V13 task contract (env `RW_TASK_CONTRACT=v13`, D42) and false
+        otherwise, so classic bundles and packaged capabilities behave exactly as
+        they always have; an explicit True or False always wins.
 
         `env` is MERGED OVER the parent environment, never a replacement:
         a tool needs PATH and the rest of its runtime, and a caller that
@@ -382,8 +623,32 @@ class Context:
         if stderr_state.get("over"):
             stderr += f"\n... stderr truncated at {_STDERR_BYTE_BUDGET} bytes"
 
+        return self._finish_run(argv, proc.returncode, stdout, stderr, check)
+
+    def _finish_run(
+        self,
+        argv: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        check: bool | None,
+    ) -> subprocess.CompletedProcess:
+        """What `run()` does with a finished command: forward its stderr to
+        ctx.log, raise RwCommandError on a failure when `check` (or, if None, the
+        task contract) says to, else return the CompletedProcess. Its own method so
+        `runwhen_capability.testing`'s command stubs behave exactly as a real run."""
+        prog = argv[0] if argv else "?"
         if stderr:
-            prog = argv[0] if argv else "?"
             for line in stderr.splitlines():
                 self.log.info("%s: %s", prog, line)
-        return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout, stderr=stderr)
+        if (self._v13_contract if check is None else check) and returncode != 0:
+            last = next((ln.strip() for ln in reversed(stderr.splitlines()) if ln.strip()), "")
+            message = f"{prog} exited {returncode}" + (f": {last[:500]}" if last else "")
+            raise RwCommandError(
+                classify_command_error(argv, returncode, stderr),
+                message,
+                argv=argv,
+                returncode=returncode,
+                stderr=stderr,
+            )
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)

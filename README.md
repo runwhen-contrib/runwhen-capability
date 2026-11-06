@@ -54,9 +54,67 @@ def lint(ctx: Context, tree: str, changed: list[str] | None = None):
 - `Context` is the task's only boundary: `ctx.credential(name)`, `ctx.run(argv)` (bounded output,
   timeouts, process-group kill), `ctx.artifacts`, `ctx.git`, `ctx.sarif`, `ctx.findings`,
   `ctx.repo_fs`, `ctx.workdir`, `ctx.log`.
+- To call a pod's or service's HTTP API through the Kubernetes API server's proxy, use
+  `ctx.k8s_proxy_get(namespace, "pods" | "services", name, port, path, headers=None,
+  scheme="http", timeout=30)` or, for any method, `ctx.k8s_proxy_request(method, namespace, kind,
+  name, port, path, body=None, headers=None, scheme="http", timeout=30)` (bash:
+  `rw_k8s_proxy_get`, `rw_k8s_proxy_request <METHOD> ... [--data STRING | --data-file FILE]
+  [--header 'Name: value']...`), not `kubectl get|replace|create|delete --raw .../proxy/...`:
+  kubectl follows a backend's redirect to another host and sends the runner's bearer token there
+  (S17). The helpers return `{status, headers, body, truncated, location}`, never follow a
+  redirect, whatever the method (a redirect to another host comes back as the 3xx with
+  `location: None` and an `x-rw-redirect-dropped` header; a kept one has `location` as a
+  backend-relative path you can pass back as `path`), and return the backend's own 4xx and 5xx as
+  data, raising only for the API server's own refusals (401/403 `permission_denied`, missing pod
+  or service `not_found`, backend unreachable `unreachable`) and for bad input (`invalid_input`).
+  Methods are GET, HEAD, PUT, POST, DELETE and PATCH; a body (bytes or str, 4 MiB at most) goes
+  with PUT, POST, PATCH or DELETE. The only request headers you may set are Accept, Content-Type,
+  Content-MD5, If-Match, If-None-Match and Range (Loki's `/ring` answers JSON only to
+  `Accept: application/json`); anything else, Authorization and Cookie included, is refused. A
+  service's port name may be a DNS label of up to 63 characters (`http-artifactory`), a pod's
+  an IANA service name of up to 15. The helpers do not decide whether a task may write: a
+  `readOnly: true` task that calls a write method is a declaration problem for review and RBAC to
+  catch, not something the SDK stops. `rwtask test` records and replays the calls
+  (`k8s-proxy-get`, `k8s-proxy-request`); in a unit test declare them with
+  `stub_commands(tc, k8s_proxy=[{"request": {...}, "response": {...}}])` (`k8s_proxy_get=` is the
+  same keyword).
 - Each task ends `ok`, `failed` (it raised; `error` says why) or `skipped` (it raised
   `SkipTask(reason)`; `reason` says why). Either way the rest of the request still runs. Only
   tasks can skip: a setup that raises `SkipTask` has failed.
+
+### Testing a skill
+
+`runwhen_capability.testing` runs a skill script's `main(ctx, **inputs)` against the real V13
+semantics (the environment the executor sets, `ctx.run` raising `RwCommandError`, the error side
+channel, the result envelope) with no runner and no cluster. Commands are stubbed by exact argv.
+
+```python
+from runwhen_capability.testing import make_context, run_main, stub_commands
+
+
+def test_pods():
+    resource = {
+        "path": "kubernetes/clusters/kind/namespaces/web",
+        "cluster": "kind",
+        "type": "kubernetes/namespace",
+        "name": "web",
+    }
+    with make_context(resource=resource, settings={"maxPods": 1}) as tc:
+        stub_commands(
+            tc,
+            {
+                ("kubectl", "get", "pods", "-n", "web", "-o", "json"): (0, '{"items": []}', ""),
+            },
+        )
+        env = run_main(main, tc, limit=5)  # main(ctx, limit=5), from scripts/pods.py
+        assert tc.errors == []  # ctx.error / RwError, as the executor reads them
+        assert tc.artifact("report") is None  # a file the script wrote under $RW_OUT
+    assert env["status"] == "ok"  # checked against `result-envelope`
+    assert env["outputs"] == {"pods": []}
+```
+
+An unstubbed command is an `AssertionError`. `ctx.skip(...)` gives a `skipped` envelope; any
+exception other than `RwError` propagates. See the module docstring for the details.
 
 ### Artifacts
 
@@ -167,11 +225,12 @@ Each code the runner can return has its own subclass, so a task can catch just o
 rwtask run <capability-dir> --request request.json [--credentials creds.json]
 rwtask run --local <bundle-dir> --task <name> [--inputs '<json>'] [--credentials creds.json]
 rwtask serve [--capability-dir DIR] [--allow-bundles]
-             # RELAY_URL, POOL_ID, EXECUTOR_TOKEN_FILE from the env
+             # RELAY_URL, POOL_ID, RW_EXECUTOR_TOKEN_FILE (legacy: EXECUTOR_TOKEN_FILE) from the env
 rwtask plan <dir> [--prune]
 rwtask apply <dir> -m <message> [--prune] [--adopt] [--yes]
 rwtask export <dir> [--name NAME ...] [--force]
 rwtask test <dir> [--task NAME]
+rwtask port <bundle-dir> --plugin NAME --into <skills-dir> [--inventory FILE] [--skill NAME] [--brief PATH] [--force]
 ```
 
 `rwtask run` is the same code path as `rwtask serve`, against the local filesystem: a capability
@@ -225,6 +284,11 @@ files -- inside the request itself, rather than baked into an image
 with a failed result and none of its code is written or run. A bundle is arbitrary code, so only
 an image built to run custom capabilities should turn this on; packaged-capability images leave
 it off.
+
+A bundle's `lib/` directory holds its shared code. A Python task imports it by module name
+(`from helpers import double` for `lib/helpers.py`): `lib/` is appended to `sys.path`, after the
+standard library and site-packages, so a `lib/json.py` never shadows `import json`. A bash task
+sources it through `$RW_LIB_DIR` (`source "$RW_LIB_DIR/common.sh"`).
 
 #### Artifact outputs
 
@@ -312,6 +376,30 @@ rwtask schemas --check   # CI: fail if any listed file is missing or differs fro
 
 Files under `schemas/` that are not listed are left alone, so an older published version can stay
 on disk after the listing moves on to a new one.
+
+### Porting a classic bundle
+
+`rwtask port` drafts a V13 skill skeleton from a classic rw-cli Robot bundle (it needs the `port`
+extra: `pip install 'runwhen-capability[port]'`):
+
+```
+rwtask port rw-cli-codecollection/codebundles/k8s-redis-healthcheck \
+    --plugin kubernetes --inventory porting/inventory/k8s-c.yaml \
+    --into plugins/kubernetes/skills
+```
+
+It writes `<into>/<skill>/SKILL.md` and `tasks.yaml` (both validate), and a porting brief to
+`<into>/../porting/briefs/<bundle>.md` (or `--brief`; never inside the skill directory). Existing
+files are not overwritten without `--force`. Warnings go to stderr.
+
+- Task names come from the classic titles with `${...}` variables removed. Target identity
+  (`NAMESPACE`, `CONTEXT`, `*_NAME` of a Kubernetes kind, ...) is dropped for `--plugin kubernetes`;
+  secrets are never inputs; the rest become `inputs`.
+- `readOnly`, `permissions` and the brief's asserts, reads, scope and false-pass notes come from
+  `--inventory`, a YAML list of per-bundle entries; without it `readOnly` follows the
+  `access:read-write` tag.
+- The scripts are not carried over. The brief names the classic scripts as reading material and
+  ends with the porting checklist; re-derive each script from the source system.
 
 ## Building a capability image
 

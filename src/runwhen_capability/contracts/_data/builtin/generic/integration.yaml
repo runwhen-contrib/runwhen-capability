@@ -1,0 +1,34 @@
+# The generic integration (D44, D55): the escape hatch for platforms without one.
+# Built into the platform, not shipped by any plugin; connections that use it pin
+# `generic@1.0.0` and are scoped by a resource selector instead of a root.
+apiVersion: runwhen.com/integration/v1
+platform: generic
+title: Generic
+description: Named environment variables, a bearer token or basic auth from a secret reference.
+credentialTypes:
+  generic/env:
+    title: Named environment variables
+    materialize: { env: { fromTaskVars: true } }   # the task names the variables (credentials[].vars)
+  generic/bearer:
+    title: Bearer token
+    materialize: { env: [RW_BEARER_TOKEN] }
+  generic/basic:
+    title: Basic auth
+    materialize: { env: [RW_BASIC_USER, RW_BASIC_PASSWORD] }
+authMethods:
+  env:
+    title: Variables from a secret
+    produces: generic/env
+    accepts: [k8s-secret, vault, file]
+    native: passthrough                            # credentialRef.keys maps each variable to a key
+  bearer:
+    title: Token from a secret
+    produces: generic/bearer
+    accepts: [k8s-secret, vault, file]
+    native: passthrough
+  basic:
+    title: User and password from a secret
+    produces: generic/basic
+    accepts: [k8s-secret, vault, file]
+    native: passthrough
+entryPoints: {}                                    # no discovery, no permission check: every rule is `unverified` (D29)

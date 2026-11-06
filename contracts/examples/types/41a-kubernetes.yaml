@@ -1,0 +1,12 @@
+# source: 41a-integration-spec.md "## types.yaml"
+types:
+  cluster:    { root: true, rootKey: server, plural: clusters }
+  namespace:  { parent: cluster,   plural: namespaces,  aliases: [ns],     native: { group: "", kind: Namespace } }
+  node:       { parent: cluster,   plural: nodes,       aliases: [no],     native: { group: "", kind: Node } }
+  deployment: { parent: namespace, plural: deployments, aliases: [deploy], native: { group: apps, kind: Deployment } }
+  pod:        { parent: namespace, plural: pods,        aliases: [po],     native: { group: "", kind: Pod }, ephemeral: true }
+  service:    { parent: namespace, plural: services,    aliases: [svc],    native: { group: "", kind: Service } }
+  # … the rest of today's 42 built-ins, one line each (generated once from chain.py)
+
+discovered:                                   # types discovery may add at run time (CRDs, aggregated APIs)
+  parentFor: { namespaced: namespace, clusterScoped: cluster }

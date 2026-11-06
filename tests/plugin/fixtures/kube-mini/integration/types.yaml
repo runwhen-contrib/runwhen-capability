@@ -1,0 +1,5 @@
+types:
+  cluster: { root: true, rootKey: server, canonicalKey: kubeSystemUid, plural: clusters }
+  namespace: { parent: cluster, plural: namespaces, aliases: [ns] }
+  deployment: { parent: namespace, plural: deployments, aliases: [deploy] }
+  pod: { parent: namespace, plural: pods, aliases: [po], ephemeral: true }

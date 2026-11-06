@@ -5,7 +5,7 @@ Relay HTTP contract (this is the wire the runner must implement to match):
     POST {relay}/v1/tasks/next
         body: {"poolId": "<poolId>"}
         -> 200 {"requestId", "request", "credentials": {name: value}, "scopeId", "deadlineMs",
-                "maxResultBytes"?, "outputs"?, "inputArtifacts"?}
+                "maxResultBytes"?, "outputs"?, "inputArtifacts"?, "dispatch"?}
            (the "request" field is a RequestEnvelope; see models.py)
         -> 204 when idle (the server may hold the connection up to ~30s)
 
@@ -13,21 +13,32 @@ Relay HTTP contract (this is the wire the runner must implement to match):
         body: {"status": "ok"|"failed"|"timeout", "result": {...}, "error": "..."}
            ("result" is a ResultEnvelope, present only on status "ok")
 
-Both relay calls carry `Authorization: Bearer <token>`, where <token> is read
-fresh from the executor token file rather than cached at startup -- reading
-is cheap and it lets a rotated or late-mounted token recover on its own
-instead of wedging the pod. The two calls read it at different points,
-though, not once per poll: GetTask reads it right before the poll, but
-PutResult reads it AGAIN right before posting the result, because a
-request can run for up to the manifest's requestTimeoutSeconds (often
-minutes) between those two points -- long enough for a token to rotate mid-request,
-which would otherwise mean the POST silently used the stale one and lost
-an already-computed result to a 401. If that second read is briefly
-unreadable, PutResult falls back to the token GetTask used rather than
-dropping the result (see _post_result). The token file path comes from
---token-file, else the EXECUTOR_TOKEN_FILE env var, else DEFAULT_TOKEN_FILE.
-A missing/unreadable token file at GetTask time is logged and the loop
-keeps polling -- it never falls back to an unauthenticated request.
+Every relay call carries `Authorization: Bearer <token>`. A request's result POST and its
+artifact and code routes (relay.py) also carry `X-RW-Dispatch: <dispatch>` when the 200
+body had `dispatch`, the runner's attempt token (a decimal uint64 string; absent from an
+older runner, and ignored if it is not valid) -- relay.task_headers builds them all.
+
+The token comes from the executor token file -- --token-file, else the
+RW_EXECUTOR_TOKEN_FILE env var, else the legacy EXECUTOR_TOKEN_FILE, else DEFAULT_TOKEN_FILE
+-- which is read and then unlinked (S1 / SEC-2): task processes run as the same uid in the
+same pod, so a token that stays on disk is a token any task can `cat`. What happens next
+depends on whether the unlink worked, and is logged once:
+
+- It worked (the runner's own tmpfs copy, which the runner never rotates in place; a
+  restart is a new pod): the token lives in memory only and is never read again.
+- It was refused (a read-only Secret volume, EACCES -- today's runner): the file cannot be
+  hidden anyway, and the kubelet refreshes a mounted Secret in place when it rotates, so
+  the file is re-read right before every relay call. If that re-read fails or finds the
+  file empty, the last token read is used, and logged, rather than dropping a result
+  already computed (see relay.TokenSource).
+
+The file need not be there at start-up (an image smoke test runs `rwtask serve` with no
+token; a pod may start before its mount does). A missing, unreadable or empty file is
+warned about once and serve loads its capability and carries on: each poll tries the file
+again and, while there is no token, is skipped (sleeping RETRY_DELAY) -- never sent
+unauthenticated. The first read that works applies the rule above, once. Before any of that
+the process makes itself non-dumpable (`_make_non_dumpable`), in every mode, so a task cannot
+read the in-memory copy out of /proc.
 
 A request may carry `maxResultBytes`. The result body is serialised (compact
 JSON) before it is posted, and an `ok` result whose body is larger than that
@@ -44,6 +55,21 @@ see bundle.py) is run only when this executor was started with
 `--allow-bundles` (or RW_ALLOW_BUNDLES=1); otherwise it is refused with a
 failed result. Packaged-capability images never set it.
 
+A `request` whose JSON has `apiVersion: runwhen.com/lease/v1` is a V13 lease (see
+plugin/lease.py). It needs the same opt-in as a bundle: hash verification proves the code
+is what the lease names, not that it is trustworthy, and papi sends workspace skills inline
+as arbitrary code. Without `--allow-bundles` (or RW_ALLOW_BUNDLES=1) it completes as a
+failed envelope with `invalid_input` (PLUGIN_CODE_NOT_ALLOWED) and nothing is written or
+run (the envelope carries the lease's provenance when the lease is valid). Otherwise it is
+validated against the `lease` contract and run through the same child runner as a bundle,
+in its own scope, which is always wiped. The poll response's
+`materialized[]` (secret files and variables the runner produced) is written under
+`$RW_CREDENTIALS_DIR`, exported to the task and deleted at its end; a lease credential whose
+auth plan is a script runs it first (plugin/auth_script.py). The result POSTed is
+`{"status": "ok", "result": <the bare D64 result envelope>}` -- not the classic
+`{version, setup, tasks}` -- including when the envelope's own status is `failed`;
+`status: failed` is only for a request this executor could not process at all.
+
 `scopeId` must be a single path segment (see _is_safe_scope_id): the loop
 creates and later deletes <workdir>/<scopeId>/, so anything else -- empty,
 absolute, containing "/" or ".." -- is refused as a failed request before
@@ -51,7 +77,8 @@ the filesystem is touched. So is ".rw-artifact-cache", the one directory of
 <workdir> that is not a scope: the cache of input artifacts that
 `ctx.artifacts.input_path` fills (see _artifact_cache.py). It sits beside the
 scopes, not in one, so that a stateless scope's wipe does not empty it, and
-every request is told where it is.
+every request is told where it is. And ".archives", the cache of plugin code
+archives a V13 lease fetches from the relay (plugin/lease.py).
 
 Per request: create <workdir>/<scopeId>/, chdir there, run setup then each
 task in request.tasks order (host.run_request), aggregate into the result
@@ -74,10 +101,12 @@ a crash.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import os
 import shutil
+import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -88,14 +117,29 @@ from .artifacts import ARTIFACT_CACHE_DIR
 from .bundle import run_bundle_request
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
-from .models import BundleRequestEnvelope, TaskHostRequest
-from .relay import RelayClient
+from .models import BundleRequestEnvelope, TaskHostRequest, V13LeaseRequest
+from .plugin.lease import (
+    ARCHIVE_CACHE_DIR,
+    attach_provenance,
+    failed_envelope,
+    run_lease,
+    wipe_stale_credentials,
+)
+from .relay import RelayClient, TokenNotPresent, TokenSource, task_headers
 
 POLL_TIMEOUT = 35  # seconds; a little over the relay's ~30s long-poll hold
 RESULT_TIMEOUT = 30  # seconds
 RETRY_DELAY = 5  # seconds, on a poll/post transport failure
 
 DEFAULT_TOKEN_FILE = "/var/run/executor/token"
+TOKEN_FILE_ENV = "RW_EXECUTOR_TOKEN_FILE"
+LEGACY_TOKEN_FILE_ENV = "EXECUTOR_TOKEN_FILE"
+
+_PR_SET_DUMPABLE = 4  # <linux/prctl.h>
+
+PLUGIN_CODE_NOT_ALLOWED = (
+    "this executor does not run plugin code (start with --allow-bundles, or RW_ALLOW_BUNDLES=1)"
+)
 
 BUNDLES_NOT_ALLOWED = (
     "this executor does not run bundle requests: it was started without --allow-bundles "
@@ -136,18 +180,18 @@ def serve(
     carries arbitrary code, and only an image built to run custom
     capabilities should ever execute one. With it off, a bundle request
     is refused with a failed result before anything touches the
-    filesystem."""
+    filesystem. A V13 lease (plugin code carried inline or by archive) needs the
+    same opt-in and is refused the same way, as a failed envelope."""
     log = log or logging.getLogger("runwhen_capability.serve")
+    # First, before the token can be in memory: see _make_non_dumpable.
+    _make_non_dumpable(log)
+    tokens = _load_executor_token(_resolve_token_file(token_file), log)
+
     session = session or requests.Session()
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     _wipe_stale_bundle_scopes(workdir, log)
-
-    token_file = (
-        Path(token_file)
-        if token_file
-        else Path(os.environ.get("EXECUTOR_TOKEN_FILE", DEFAULT_TOKEN_FILE))
-    )
+    wipe_stale_credentials()
 
     cap_dir = Path(capability_dir) if capability_dir else discover_capability_dir()
     capability = load_capability(cap_dir)
@@ -173,12 +217,67 @@ def serve(
             pool_id,
             workdir,
             capability,
-            token_file,
+            tokens,
             log,
             stateful_scopes,
             max_stateful_scopes,
             allow_bundles,
         )
+
+
+def _make_non_dumpable(log: logging.Logger | None = None) -> bool:
+    """Marks this process non-dumpable (`prctl(PR_SET_DUMPABLE, 0)`) and says whether it
+    worked. Linux only; elsewhere it does nothing.
+
+    Why: the executor token lives in this process's memory, and task children run as the
+    same uid. A dumpable process's /proc/<pid>/mem and /proc/<pid>/environ are readable by
+    every process of its uid (and it can be ptrace-attached by one), so a task could lift
+    the token out of the serve process. Non-dumpable makes those files root-owned and the
+    attach refuse, unless the reader has CAP_SYS_PTRACE -- which a task does not. Children
+    are not affected: the flag is reset to dumpable on every execve, which is fine, since
+    they hold no token (not in env, argv or an open fd). Called first in `serve`, before the
+    token is read, so there is no window in which it is in memory and the process is
+    dumpable. A failure is logged with its errno and serve carries on: it hardens, it is not
+    what the token's confidentiality rests on alone (the file is unlinked, the env stripped)."""
+    log = log or logging.getLogger("runwhen_capability.serve")
+    if not sys.platform.startswith("linux"):
+        log.debug("not making the process non-dumpable: not Linux (%s)", sys.platform)
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0)
+    except (OSError, AttributeError) as exc:
+        log.warning("could not make the process non-dumpable: %s", exc)
+        return False
+    if result != 0:
+        err = ctypes.get_errno()
+        log.warning(
+            "could not make the process non-dumpable: prctl(PR_SET_DUMPABLE, 0) failed, "
+            "errno %d (%s)",
+            err,
+            os.strerror(err),
+        )
+        return False
+    return True
+
+
+def _resolve_token_file(token_file: Path | None) -> Path:
+    """--token-file, else $RW_EXECUTOR_TOKEN_FILE, else the legacy $EXECUTOR_TOKEN_FILE,
+    else DEFAULT_TOKEN_FILE. An empty variable counts as unset."""
+    if token_file:
+        return Path(token_file)
+    return Path(
+        os.environ.get(TOKEN_FILE_ENV)
+        or os.environ.get(LEGACY_TOKEN_FILE_ENV)
+        or DEFAULT_TOKEN_FILE
+    )
+
+
+def _load_executor_token(path: Path, log) -> TokenSource:
+    """The `TokenSource` every relay call uses (see the module docstring and
+    relay.TokenSource): the token file is read and unlinked now if it is there, else the
+    source is pending and the poll loop waits for it. Never exits for a missing token."""
+    return TokenSource.from_file(path, log)
 
 
 def _wipe_stale_bundle_scopes(workdir: Path, log) -> None:
@@ -211,8 +310,12 @@ def _is_safe_scope_id(scope_id: str) -> bool:
 
     The name of the input-artifact cache, a directory of `workdir` too, is
     refused as well: a scope called that would be wiped after its request and
-    take every cached artifact with it."""
-    return scope_id not in ("", ".", "..", ARTIFACT_CACHE_DIR) and scope_id == Path(scope_id).name
+    take every cached artifact with it. So is the plugin archive cache
+    (`/work/.archives` by default, see plugin/lease.py)."""
+    return (
+        scope_id not in ("", ".", "..", ARTIFACT_CACHE_DIR, ARCHIVE_CACHE_DIR)
+        and scope_id == Path(scope_id).name
+    )
 
 
 def _encode_result(payload: dict, log, max_result_bytes: int | None = None) -> bytes:
@@ -269,21 +372,16 @@ def _post_result(
     relay: str,
     request_id: str,
     body: bytes,
-    token_file: Path,
-    fallback_token: str,
+    tokens: TokenSource,
     log,
+    dispatch: str | None = None,
 ) -> None:
-    """POSTs one PutResult; `body` is the JSON that `_encode_result` made.
-    Re-reads the bearer token from `token_file` immediately before posting,
-    rather than reusing the one the poll started with: a request can run up
-    to the manifest's requestTimeoutSeconds before this runs, so a
-    mid-request rotation would otherwise mean the POST carries a now-stale
-    token and gets a 401 -- silently losing a result that was already
-    computed, which defeats the whole reason the token is re-read per poll
-    rather than cached at startup (see the module docstring). If the token
-    file is briefly unreadable right at this moment, falls back to
-    `fallback_token` -- the token the poll already had -- and logs the
-    fallback, rather than dropping a result in hand over a transient read.
+    """POSTs one PutResult; `body` is the JSON that `_encode_result` made. The token comes
+    from `tokens.get()` immediately before posting: in the re-reading mode a request can
+    run up to the manifest's requestTimeoutSeconds before this runs, long enough for the
+    mounted Secret to rotate, and a stale token would lose a result already computed to a
+    401. If that re-read fails, `get()` falls back to the last token read, and says so. (A
+    request was polled, so the source is never pending here.)
 
     The timeout grows by a second per MiB of body: a result near the cap
     takes real time to upload, and the flat RESULT_TIMEOUT is sized for a
@@ -292,16 +390,11 @@ def _post_result(
     A transport failure or a non-2xx is logged and dropped -- the runner's
     lease expiry is what recovers the request -- but it is never treated as
     a delivered result: an unlogged 401/500 here is a result that vanished
-    with nothing to explain it."""
-    token = _read_token(token_file, log)
-    if token is None:
-        log.warning(
-            "could not re-read executor token before posting result for %s; "
-            "falling back to the token this poll started with",
-            request_id,
-        )
-        token = fallback_token
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    with nothing to explain it.
+
+    `dispatch` is the request's attempt token (None if the runner sent none); it goes
+    out as `X-RW-Dispatch` (relay.task_headers)."""
+    headers = {**task_headers(tokens.get(), dispatch), "Content-Type": "application/json"}
 
     try:
         resp = session.post(
@@ -320,14 +413,6 @@ def _post_result(
             request_id,
             resp.status_code,
         )
-
-
-def _read_token(token_file: Path, log) -> str | None:
-    try:
-        return token_file.read_text().strip()
-    except OSError as exc:
-        log.error("could not read executor token from %s: %s", token_file, exc)
-        return None
 
 
 def _retain_or_wipe_scope(
@@ -364,14 +449,16 @@ def _poll_once(
     pool_id: str,
     workdir: Path,
     capability,
-    token_file: Path,
+    tokens: TokenSource,
     log,
     stateful_scopes: OrderedDict[str, None],
     max_stateful_scopes: int,
     allow_bundles: bool = False,
 ) -> None:
-    token = _read_token(token_file, log)
-    if token is None:
+    try:
+        token = tokens.get()
+    except TokenNotPresent:
+        # No token yet: skip the poll (never poll unauthenticated) and try again shortly.
         time.sleep(RETRY_DELAY)
         return
     headers = {"Authorization": f"Bearer {token}"}
@@ -396,11 +483,19 @@ def _poll_once(
         return
 
     try:
-        task_request = TaskHostRequest.model_validate(resp.json())
+        raw_request = resp.json()
+        task_request = TaskHostRequest.model_validate(raw_request)
     except Exception as exc:  # noqa: BLE001 -- a malformed relay response must not crash the loop
         log.error("poll %s/v1/tasks/next: malformed response: %s", relay, exc)
         time.sleep(RETRY_DELAY)  # a relay stuck on malformed 200s must not be hot-looped
         return
+
+    if task_request.dispatch is not None:
+        log.debug("request %s: attempt token %s", task_request.requestId, task_request.dispatch)
+    elif isinstance(raw_request, dict) and raw_request.get("dispatch") is not None:
+        log.debug(
+            "request %s: ignoring a dispatch token that is not a uint64", task_request.requestId
+        )
 
     if not _is_safe_scope_id(task_request.scopeId):
         # Reported as a failed request rather than swallowed: the runner must
@@ -417,12 +512,13 @@ def _poll_once(
             _encode_result(
                 {"status": "failed", "error": f"invalid scopeId {task_request.scopeId!r}"}, log
             ),
-            token_file,
-            token,
+            tokens,
             log,
+            task_request.dispatch,
         )
         return
 
+    is_lease = isinstance(task_request.request, V13LeaseRequest)
     is_bundle = isinstance(task_request.request, BundleRequestEnvelope)
     if is_bundle and not allow_bundles:
         # Refused, not ignored: the runner must learn why nothing ran.
@@ -438,19 +534,58 @@ def _poll_once(
             relay,
             task_request.requestId,
             _encode_result({"status": "failed", "error": BUNDLES_NOT_ALLOWED}, log),
-            token_file,
-            token,
+            tokens,
             log,
+            task_request.dispatch,
+        )
+        return
+
+    if is_lease and not allow_bundles:
+        # Refused as an envelope, like every other lease that cannot run: the runner and
+        # papi learn why nothing ran. Nothing has been written, and no code looked at.
+        log.error(
+            "request %s: refusing a V13 lease -- this executor was not started with "
+            "--allow-bundles",
+            task_request.requestId,
+        )
+        envelope = attach_provenance(
+            failed_envelope("invalid_input", PLUGIN_CODE_NOT_ALLOWED), task_request.request.doc
+        )
+        body = _encode_result({"status": "ok", "result": envelope}, log)
+        _post_result(
+            session, relay, task_request.requestId, body, tokens, log, task_request.dispatch
         )
         return
 
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
     # One client per request: it carries the request id the artifact routes
-    # are scoped to, and re-reads the token file on every call.
-    relay_client = RelayClient(relay, token_file, task_request.requestId, session)
+    # are scoped to, and the executor's token source.
+    relay_client = RelayClient(
+        relay,
+        None,
+        task_request.requestId,
+        session,
+        token_source=tokens,
+        dispatch=task_request.dispatch,
+    )
     try:
-        if is_bundle:
+        if is_lease:
+            # A V13 lease: plugin code pinned by hash, the same hardened child runner
+            # as a bundle, and the bare result envelope as the result.
+            os.chmod(scope_dir, 0o700)
+            envelope = run_lease(
+                task_request.request.doc,
+                scope_dir=scope_dir,
+                credentials=task_request.credentials,
+                materialized=task_request.materialized,
+                relay=relay_client,
+                output_decls=task_request.outputs,
+                deadline_s=task_request.deadlineMs / 1000,
+                log=log.getChild(task_request.requestId),
+            )
+            payload = {"status": "ok", "result": envelope}
+        elif is_bundle:
             # A bundle's code travels with the request, not baked into this
             # pod's image -- see bundle.py's module docstring. Bundle mode
             # enforces deadlineMs as one budget shared by the request's setup
@@ -481,13 +616,14 @@ def _poll_once(
                 artifact_cache_dir=workdir / ARTIFACT_CACHE_DIR,
                 deadline_seconds=task_request.deadlineMs / 1000,
             )
-        payload = {"status": "ok", "result": result.model_dump(mode="json")}
+        if not is_lease:
+            payload = {"status": "ok", "result": result.model_dump(mode="json")}
     except Exception as exc:  # noqa: BLE001 -- one request must never take down the loop
         log.exception("request %s failed", task_request.requestId)
         payload = {"status": "failed", "error": str(exc)}
     finally:
-        if is_bundle:
-            # No execution.mode concept applies to a bundle request -- it
+        if is_bundle or is_lease:
+            # No execution.mode concept applies to a bundle or a lease -- it
             # never shares a scope with a later request, so it is always
             # wiped, exactly like a stateless packaged capability.
             shutil.rmtree(scope_dir, ignore_errors=True)
@@ -497,4 +633,4 @@ def _poll_once(
             )
 
     body = _encode_result(payload, log, task_request.maxResultBytes)
-    _post_result(session, relay, task_request.requestId, body, token_file, token, log)
+    _post_result(session, relay, task_request.requestId, body, tokens, log, task_request.dispatch)

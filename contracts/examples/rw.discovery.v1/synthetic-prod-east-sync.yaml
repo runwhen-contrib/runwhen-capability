@@ -1,0 +1,42 @@
+# source: synthetic (no wiki example); today's papi resource-syncs API (open -> items -> commit) under 41a-integration-spec.md "The discovery sync contract"
+apiVersion: rw.discovery.v1
+open:
+  source: k8s-base/discover
+  scopePath: kubernetes/clusters/prod-east
+  mode: full
+  taskRun: 9b2f6c1e-3d4a-4c8e-8f21-7a6d5e4c3b2a
+  configHash: "sha256:0d9f3c1b6a2e4f8d7c5b3a1e9f0d2c4b6a8e1f3d5c7b9a0e2f4d6c8b0a1e3f5d"
+  discoveredTypes:
+    - { name: certificate.cert-manager.io, parent: namespace, plural: certificates.cert-manager.io, native: { group: cert-manager.io, kind: Certificate } }
+batches:
+  - seq: 1
+    items:
+      - identity: { platform: kubernetes, chain: [{ type: cluster, name: prod-east }] }
+        displayName: prod-east
+        document: { server: "https://34.74.10.20", version: { gitVersion: v1.31.2 } }
+        rollups: { k8sCluster: { nodes: 6, ready: 6 } }
+      - identity: { platform: kubernetes, chain: [{ type: cluster, name: prod-east }, { type: namespace, name: payments }] }
+        labels: { team: payments }
+        document: { metadata: { name: payments } }
+      - identity:
+          platform: kubernetes
+          chain: [{ type: cluster, name: prod-east }, { type: namespace, name: payments }, { type: deployment, name: payments-api }]
+        providerUid: 5e1f0c2a-7b3d-4e9f-a1c2-3d4e5f6a7b8c
+        labels: { app.kubernetes.io/name: payments-api }
+        document: { metadata: { name: payments-api }, spec: { replicas: 3 } }
+        status: { readyReplicas: 3 }
+        rollups: { k8sPods: { total: 3, ready: 3, restarts: 0 } }
+commit:
+  partitions:
+    - { type: namespace, parentPath: kubernetes/clusters/prod-east, status: complete, count: 1 }
+    - { type: deployment, parentPath: kubernetes/clusters/prod-east/namespaces/payments, status: complete, count: 1 }
+    - { type: secret, parentPath: kubernetes/clusters/prod-east/namespaces/payments, status: excluded, reason: "secrets are never synced" }
+    - { type: deployment, parentPath: kubernetes/clusters/prod-east/namespaces/kube-system, status: forbidden, reason: "deployments is forbidden in namespace kube-system" }
+  summary:
+    root: { canonicalKey: { name: kubeSystemUid, value: "3f0c9a52-7d1e-4b86-a3c4-5e2f8b1d6a97" } }
+    counts: { cluster: 1, namespace: 1, deployment: 1 }
+    partitions: { complete: 2, failed: 0, forbidden: 1, excluded: 1 }
+    discoveredTypes: [certificate.cert-manager.io]
+    durationMs: 8412
+    errors:
+      - { code: permission_denied, message: "deployments.apps is forbidden in namespace kube-system", scope: kube-system }

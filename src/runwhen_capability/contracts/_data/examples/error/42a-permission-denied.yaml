@@ -1,0 +1,4 @@
+# source: 42a-skill-spec.md "### The result envelope (D64)"
+# fixture: the first item of `errors:`, dedented
+code: permission_denied
+message: "pods is forbidden in namespace kube-system"

@@ -1,0 +1,13 @@
+# source: 42a-skill-spec.md "### Write tasks (D62)"
+apiVersion: runwhen.com/tasks/v1   # fixture: wrapper
+tasks:   # fixture: wrapper; the block below is the verbatim list item
+- name: rollout-restart
+  title: Restart a rollout
+  description: Restarts every pod of the workload, one at a time; use after a bad config push
+  script: scripts/rollout_restart.py
+  readOnly: false
+  effects: ["Restarts every pod of the workload, one at a time"]
+  destructive: false
+  idempotent: true
+  dryRun: true
+  permissions: [{ apiGroups: [apps], resources: [deployments], verbs: [patch] }]

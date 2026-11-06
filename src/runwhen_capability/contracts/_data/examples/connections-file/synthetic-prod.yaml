@@ -1,0 +1,21 @@
+# source: synthetic (no wiki example); consistent with 50-connections-credentials.md and 42b-example-papi-skill.md (declared in config, D57)
+apiVersion: runwhen.com/connections/v1
+connections:
+  - name: prod-east
+    integration: kubernetes
+    authMethod: gke
+    credentialRef: { kind: vault, ref: secret/data/rw/gcp-prod-sa }
+    inputs: { project: acme-prod, location: us-east1, cluster: prod-east }
+    runner: runner-a
+    root: kubernetes/clusters/prod-east
+  - name: pgbouncer-papi
+    integration: generic
+    authMethod: env
+    credentialRef:
+      kind: k8s-secret
+      ref: runwhen/pgbouncer-credentials
+      keys: { PGUSER: user, PGPASSWORD: password }
+    runner: runner-a
+    selector:
+      paths: [kubernetes/clusters/prod-east/namespaces/runwhen/deployments/pgbouncer]
+    priority: 10
