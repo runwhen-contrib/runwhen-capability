@@ -1,0 +1,71 @@
+# source: synthetic (no wiki example); consistent with 42b-example-papi-skill.md (trimmed to one task); every path is plugin-root-relative
+apiVersion: runwhen.com/compiled-plugin/v1
+compiler: { name: rwtask, version: 0.5.0 }
+plugin:
+  name: runwhen-platform-ops
+  version: 0.1.0
+  description: Operate self-hosted RunWhen platform installs - papi, task workers, pgbouncer.
+  requires: { kubernetes: ^0.2 }
+integration: null
+skills:
+  - name: papi-health
+    frontmatter:
+      name: papi-health
+      description: >-
+        Health of a self-hosted RunWhen platform API (papi) beyond its probes: API latency
+        and task-worker activity.
+      runwhen:
+        role: health
+        appliesTo:
+          types: [kubernetes/deployment]
+          labels: { app.kubernetes.io/component: papi }
+        tags: [runwhen, papi, availability]
+    skillMdSha256: "sha256:03534bde68ddd3d53f0472f0a2bdf928243f954d9ed193413a3c8d7281a93b79"
+    files:
+      - skills/papi-health/SKILL.md
+      - skills/papi-health/scripts/api_probe.sh
+      - skills/papi-health/tasks.yaml
+    runtime: kubernetes@1
+    taskNames: [api-probe]
+tasks:
+  - ref: "runwhen-platform-ops:papi-health/api-probe"
+    skill: papi-health
+    name: api-probe
+    title: papi API probe
+    description: Calls papi /healthz and /livez through the Kubernetes API service proxy and measures latency.
+    script: skills/papi-health/scripts/api_probe.sh
+    runtime: kubernetes@1
+    role: health
+    appliesTo:
+      types: [kubernetes/deployment]
+      labels: { app.kubernetes.io/component: papi }
+    readOnly: true
+    idempotent: false
+    dryRun: false
+    credentials:
+      - type: kubernetes/kubeconfig
+    permissions:
+      - rule: { apiGroups: [""], resources: [services/proxy], verbs: [get] }
+        hash: "sha256:01c56230c4c05af7aeb279aac4b2121d2e6a6935728d3c8b410175687c242320"
+      - rule: { apiGroups: [""], resources: [events], verbs: [list] }
+        hash: "sha256:503faede99c9369a0f666c3e3fc9194db960dbdfc86cd4afabed369365997333"
+    settings:
+      latencyThresholdMs: { type: integer, default: 1500, description: A /healthz slower than this is flagged slow in the probe output }
+    inputs: {}
+    inputSchema: { type: object, properties: {}, additionalProperties: false }
+    outputs:
+      probe:
+        jsonSchema:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              status: { type: integer }
+              latencyMs: { type: integer }
+              slow: { type: boolean }
+    timeout: 60s
+    tags: [runwhen, papi, availability]
+    hash: "sha256:428527a49751468d049355c2c2cd2e1a1df717f2e8e6fcc9dcc49c1edc6c3e9f"
+rules: []
+knowledge: []

@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/auth-plan/v1.json",
+  "title": "AuthPlan",
+  "description": "Compiled by papi per run from the connection's pinned auth method (D67); executed before the task script: native methods by the runner, script methods by the SDK host as a pre-step.",
+  "type": "object",
+  "properties": {
+    "connection": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+    },
+    "integration": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/pinnedPlugin"
+    },
+    "authMethod": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+    },
+    "credentialType": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialTypeName"
+    },
+    "reference": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialRef"
+    },
+    "method": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "native": {
+              "enum": [
+                "passthrough",
+                "in-cluster-token"
+              ]
+            }
+          },
+          "required": [
+            "native"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "script": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/relPath"
+                },
+                "archive": {
+                  "$ref": "https://schemas.runwhen.com/lease/v1.json#/$defs/archive"
+                }
+              },
+              "required": [
+                "path",
+                "archive"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "script"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean",
+          "array"
+        ]
+      }
+    },
+    "materialize": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "object",
+          "properties": {
+            "env": {
+              "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+            },
+            "mode": {
+              "type": "string",
+              "pattern": "^0[0-7]{3}$"
+            }
+          },
+          "required": [
+            "env"
+          ],
+          "additionalProperties": false
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "nonSecret": {
+          "type": "array",
+          "items": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+          },
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "names from `env` whose values are not secret, so the executor does not redact them from task output (contracts-v5). Copied from the credential type's `materialize`; every other materialized value is secret, and a `file` always is."
+        }
+      },
+      "additionalProperties": false,
+      "minProperties": 1,
+      "maxProperties": 2,
+      "dependentSchemas": {
+        "nonSecret": {
+          "required": [
+            "env"
+          ]
+        },
+        "file": {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "env"
+                ]
+              },
+              {
+                "required": [
+                  "nonSecret"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "credentialType",
+    "reference",
+    "method",
+    "materialize"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "materializedCredential": {
+      "type": "object",
+      "properties": {
+        "credentialType": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialTypeName"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "env": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+              },
+              "mode": {
+                "type": "string",
+                "pattern": "^0[0-7]{3}$"
+              },
+              "content": {
+                "type": "string"
+              },
+              "encoding": {
+                "enum": [
+                  "utf-8",
+                  "base64"
+                ]
+              }
+            },
+            "required": [
+              "env",
+              "content"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "propertyNames": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/envVarName"
+          }
+        },
+        "reference": {
+          "type": "object",
+          "properties": {
+            "files": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 253,
+                    "pattern": "^[A-Za-z0-9._-]+$",
+                    "not": {
+                      "enum": [
+                        ".",
+                        ".."
+                      ]
+                    },
+                    "description": "the reference's secret key (a vault key, a file name), or `value` for one unnamed value; it becomes the file name under RW_AUTH_REF_DIR"
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "encoding": {
+                    "enum": [
+                      "utf-8",
+                      "base64"
+                    ]
+                  }
+                },
+                "required": [
+                  "key",
+                  "content"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1
+            }
+          },
+          "required": [
+            "files"
+          ],
+          "additionalProperties": false,
+          "description": "script auth plans only: the credential reference's material, which the executor writes to RW_AUTH_REF_DIR/<key> for the auth script (and keeps until the task ends). Not combined with `files` or `env`, which are a native plan's result."
+        }
+      },
+      "required": [
+        "credentialType"
+      ],
+      "additionalProperties": false,
+      "description": "runner -> executor (`/v1/tasks/next` `materialized[]`): the result of a native plan (`files`, `env`), or the reference material a script plan reads (`reference`). Secret; never logged, never leaves the pod.",
+      "dependentSchemas": {
+        "reference": {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "files"
+                ]
+              },
+              {
+                "required": [
+                  "env"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

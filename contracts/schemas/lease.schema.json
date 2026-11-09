@@ -1,0 +1,428 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/lease/v1.json",
+  "title": "Lease",
+  "description": "papi -> runner: one task run (D35, D46, D67).",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "const": "runwhen.com/lease/v1"
+    },
+    "leaseId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "taskRun": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "dryRun": {
+      "type": "boolean",
+      "description": "papi asks for a dry-run execution: the runner sets RW_DRY_RUN=1, and only when task.dryRun is true (otherwise the lease fails with invalid_input)."
+    },
+    "workspace": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "expiresAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "task": {
+      "type": "object",
+      "properties": {
+        "ref": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/fullTaskRef"
+        },
+        "plugin": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+        },
+        "version": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/semver"
+        },
+        "skill": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+        },
+        "name": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+        },
+        "hash": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/sha256"
+        },
+        "script": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/relPath"
+        },
+        "readOnly": {
+          "type": "boolean"
+        },
+        "dryRun": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ref",
+        "plugin",
+        "version",
+        "skill",
+        "name",
+        "hash",
+        "script",
+        "readOnly"
+      ],
+      "additionalProperties": false
+    },
+    "target": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resourcePath"
+        },
+        "type": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/qualifiedType"
+        },
+        "identity": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "minProperties": 1
+        },
+        "labels": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/labels"
+        }
+      },
+      "required": [
+        "path",
+        "type",
+        "identity"
+      ],
+      "additionalProperties": false
+    },
+    "inputs": {
+      "type": "object"
+    },
+    "settings": {
+      "type": "object"
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+        },
+        "major": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "digest": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/sha256"
+        }
+      },
+      "required": [
+        "name",
+        "major",
+        "image",
+        "digest"
+      ],
+      "additionalProperties": false
+    },
+    "code": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "archive": {
+              "$ref": "#/$defs/archive"
+            }
+          },
+          "required": [
+            "archive"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "inline": {
+              "type": "object",
+              "properties": {
+                "sha256": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/sha256"
+                },
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/relPath"
+                      },
+                      "content": {
+                        "type": "string"
+                      },
+                      "encoding": {
+                        "enum": [
+                          "utf-8",
+                          "base64"
+                        ]
+                      },
+                      "executable": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "content"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "minItems": 1
+                }
+              },
+              "required": [
+                "sha256",
+                "files"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "inline"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "credentials": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialTypeName"
+              },
+              "connection": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+              },
+              "authPlan": {
+                "$ref": "https://schemas.runwhen.com/auth-plan/v1.json"
+              }
+            },
+            "required": [
+              "type",
+              "connection",
+              "authPlan"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "runwhen/sync"
+              },
+              "minted": {
+                "type": "object",
+                "properties": {
+                  "ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "ttlSeconds": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "ref",
+                  "ttlSeconds"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "type",
+              "minted"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "timeout": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/duration"
+        },
+        "resources": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resources"
+        },
+        "maxResultBytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "timeout"
+      ],
+      "additionalProperties": false
+    },
+    "outputs": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "jsonSchema": {
+                "type": "object"
+              },
+              "schemaRef": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/relPath"
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            },
+            "required": [
+              "jsonSchema"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "contentType": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "maxSize": {
+                    "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/quantity"
+                  }
+                },
+                "required": [
+                  "contentType"
+                ],
+                "additionalProperties": false
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            },
+            "required": [
+              "artifact"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "rw.discovery.summary.v1",
+                  "rw.access.v1"
+                ]
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][A-Za-z0-9]*$"
+      }
+    },
+    "inputArtifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "input": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/camelName"
+          },
+          "artifact": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "contentType": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          }
+        },
+        "required": [
+          "input",
+          "artifact"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "apiVersion",
+    "leaseId",
+    "taskRun",
+    "task",
+    "inputs",
+    "settings",
+    "runtime",
+    "code",
+    "credentials",
+    "limits",
+    "outputs"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "archive": {
+      "type": "object",
+      "properties": {
+        "sha256": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/sha256"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      },
+      "required": [
+        "sha256",
+        "size"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/types/v1.json",
+  "title": "TypesFile",
+  "description": "integration/types.yaml: resource types as data (D69).",
+  "type": "object",
+  "properties": {
+    "types": {
+      "$ref": "#/$defs/typesMap"
+    },
+    "discovered": {
+      "$ref": "#/$defs/discovered"
+    }
+  },
+  "required": [
+    "types"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "typeDef": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "const": true
+        },
+        "rootKey": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          ]
+        },
+        "canonicalKey": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/camelName",
+          "description": "Root types only: the name of an identity-bearing value that the integration's discovery or permissionCheck task reports for the root (`root.canonicalKey` of rw.discovery.summary.v1 / rw.access.v1). Once reported, it supersedes `rootKey` for dedupe (kubernetes: `kubeSystemUid`)."
+        },
+        "parent": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
+        },
+        "plural": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+        },
+        "native": {
+          "type": "object"
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "uniqueItems": true
+        },
+        "ephemeral": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      },
+      "required": [
+        "plural"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "root",
+            "rootKey"
+          ],
+          "not": {
+            "required": [
+              "parent"
+            ]
+          }
+        },
+        {
+          "required": [
+            "parent"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "root"
+                ]
+              },
+              {
+                "required": [
+                  "rootKey"
+                ]
+              },
+              {
+                "required": [
+                  "canonicalKey"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "typesMap": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/typeDef"
+      },
+      "propertyNames": {
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+      },
+      "minProperties": 1
+    },
+    "discovered": {
+      "type": "object",
+      "properties": {
+        "parentFor": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+          },
+          "minProperties": 1
+        }
+      },
+      "required": [
+        "parentFor"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

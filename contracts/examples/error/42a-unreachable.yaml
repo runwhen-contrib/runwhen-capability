@@ -1,0 +1,5 @@
+# source: 42a-skill-spec.md "### The result envelope (D64)"
+# fixture: the second item of `errors:`, dedented
+code: unreachable
+message: "metrics-server: dial tcp 10.0.0.12:443: i/o timeout"
+scope: metrics-server

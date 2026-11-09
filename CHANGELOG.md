@@ -3,6 +3,272 @@
 This project follows [Semantic Versioning](https://semver.org/). Releases are git tags `v<version>`
 with the wheel and sdist attached to the GitHub Release.
 
+## Unreleased
+
+### Added
+
+- **contracts-v7** (CONTRACTS.md "Changes in contracts-v7"): V7-1 registry problem code
+  `E_BAD_REQUEST` (`contracts/registry-api.openapi.yaml` copied from plugin-registry#13 @7211d78);
+  V7-2 documents the runner's `dispatch` attempt token and the `X-RW-Dispatch` echo (S20).
+- **The runner's attempt token (`X-RW-Dispatch`) is echoed on result, artifact and code requests
+  (lane C, runner#112)** (`runwhen_capability/relay.py`, `serve.py`, `models.py`): the `POST
+  /v1/tasks/next` answer may carry `dispatch`, a decimal uint64 string naming this attempt
+  (`TaskHostRequest.dispatch`, via `models.parse_dispatch`). It is kept for the request's whole
+  life and sent as `X-RW-Dispatch: <dispatch>` on `POST .../result`, `PUT .../artifacts/{name}`,
+  `GET .../artifacts/in/{input}` and `GET .../code` (plain, and `?sha256=` for another plugin's or
+  an auth script's archive); `relay.task_headers` builds the headers of every one of them, so a new
+  route cannot forget it. An absent or invalid `dispatch` (an older runner; `abc`, `-1`, empty, over
+  2**64-1) is None: no header is sent and the task is not failed. The value is only ever logged at
+  debug.
+- **contracts-v6: registry API addendum (lane D, M4)** (`contracts/registry-api.openapi.yaml`): `POST
+  /v1/sources/{id}:publish` and `:draft`, problem codes `E_BUSY`, `E_INVALID_SNAPSHOT`,
+  `E_BRANCH_MOVED`, `E_WRITE_DISABLED`, `Source.kind: snapshot`, and the snapshot/import semantics,
+  copied from plugin-registry#6 @482f0d6. Additive; no JSON Schema changed. See CONTRACTS.md
+  "Changes in contracts-v6".
+- **`ctx.k8s_proxy_request` / `rw_k8s_proxy_request`, request headers and longer port names (S17,
+  lane F's last three extensions)** (`runwhen_capability/k8s_proxy.py`):
+  - `proxy_request(method, namespace, kind, name, port, path, *, body=None, headers=None,
+    scheme="http", timeout=30, max_body=...)` for GET, HEAD, PUT, POST, DELETE and PATCH (anything
+    else is `invalid_input`); `proxy_get` is its GET wrapper. A body is bytes or str (UTF-8), at most
+    4 MiB, and only PUT, POST, PATCH and DELETE may carry one; without a `Content-Type` it goes out
+    as `application/octet-stream`. A redirect is an answer for every method (urllib's handler is
+    overridden for all of them; a `Location` urllib cannot parse is now dropped like any other
+    instead of failing the call). `kubectl proxy`'s `--reject-methods` default is `^$`, so no flag
+    changes; the default `--reject-paths` stays. Task API: `ctx.k8s_proxy_request(method, ...)`
+    returns the same dict as `k8s_proxy_get`. bash: `rw_k8s_proxy_request <METHOD> <ns>
+    <pods|services> <name> <port> <path> [--data STRING | --data-file FILE] [--header 'Name: value']...
+    [--scheme https] [--timeout N]`, the same JSON line and error behaviour; it is in
+    `RW_SH_HELPERS`, the diagnostics text and the static checks.
+  - `headers=` on `ctx.k8s_proxy_get` / `ctx.k8s_proxy_request` and a repeatable `--header` on both
+    bash helpers. Allowed, in any case: Accept (default `*/*`), Content-Type, Content-MD5, If-Match,
+    If-None-Match, Range. Anything else (Authorization, Cookie, Host, Proxy-*, X-Forwarded-*,
+    Impersonate-*, Connection, ...) is `invalid_input` naming the header, as is a CR, LF, NUL or
+    other control character, or a non-ASCII one, in a name or value, or a name given twice. Our
+    User-Agent stays.
+  - Port names: a service's port name is a DNS-1123 label of up to 63 characters (the Artifactory
+    chart's `http-artifactory`, 16, was refused as a pod-style name); a pod's is an IANA service
+    name (at most 15 characters, a letter, no `--`; it was `[a-z0-9-]{1,15}`); 1-65535 as before.
+  - Fixtures: `k8s_proxy_get` still records `type: k8s-proxy-get`, with `headers` in its request only
+    when given, so existing scenarios stay valid. Any other call is `type: k8s-proxy-request` with
+    `request: {method, namespace, kind, name, port, path, scheme, headers?, body? | bodyBase64?}`
+    (header names lower-cased; `body` is UTF-8 text, `bodyBase64` for bytes that are not UTF-8 or
+    text a scenario file would not keep, such as control characters). Replay matches exactly on
+    method, headers, body and the rest, with the old rules for port and scheme; a recorded
+    `k8s-proxy-get` is a GET with no body, so either type replays a GET. Mismatch messages name the
+    method (`k8s-proxy-request PUT http ns/kind/name:port /path headers={...} body="..."`). The
+    scenario schema, its loading checks (`rwtask test` refuses a header off the allowlist or a body
+    on a GET in a fixture) and the shims' mismatch text follow.
+  - `testing.stub_commands(tc, k8s_proxy=[...])` declares the calls of both `ctx.k8s_proxy_get` and
+    `ctx.k8s_proxy_request` (items shaped like a recorded call; `method` defaults to GET), matched in
+    order on method, headers and body as a replay matches them. `k8s_proxy_get=` is the same keyword
+    under its first name and still works.
+  - The helpers do not decide whether a task may write: a `readOnly: true` task that calls a write
+    method is the plugin's declaration problem, for review and RBAC. Against a real API server
+    (kind, kubectl 1.36) `kubectl replace|create|delete --raw .../proxy/...` all follow a 302 and
+    re-send the bearer token (as a GET), and `delete --raw` follows a 307 as well; the helper contacts
+    nobody. CONTRACTS.md "What a script sees" and the README follow.
+- **contracts-v5 (tag pending), `materialize.nonSecret`** (lane F's postgres/aws/azure on a real runner):
+  the executor redacted every materialized env value, substring-matching any value of 8 or more
+  characters, so `PGDATABASE=postgres` turned every "postgres" in task output into `***REDACTED***`
+  and `AWS_REGION` / `AZURE_SUBSCRIPTION_ID` were mangled out of ARNs and canonical keys.
+  `integration.schema.json` `credentialTypes.*.materialize` gains an optional `nonSecret` (an array of
+  env names, `minItems` 1, `uniqueItems`), allowed only with `env` as a list (not `fromTaskVars`, not
+  `file`) and naming only names in that list: `rwtask validate` reports one that is not as
+  `E_NON_SECRET_UNKNOWN`. `auth-plan.schema.json` `materialize` allows `env` with `nonSecret`
+  (never `file` with it). `rwtask serve` leaves the listed names out of its redaction, for a native
+  plan (`materialized[].env`, with the names read from the lease's `credentials[].authPlan`) and a
+  script plan (`auth_script.run_script_plan` returns only the other values in `AuthResult.secrets`;
+  `plugin.run.execute` takes `non_secret_env`). A `file` is always secret, and a non-secret value that
+  is also a secret elsewhere in the lease stays redacted. Without the field nothing changes.
+  CONTRACTS.md "Changes in contracts-v5" (V5-1), the credential type and Auth plan prose, the
+  install line, examples (`integration/synthetic-postgres-non-secret.yaml`,
+  `auth-plan/synthetic-postgres-non-secret.yaml` and invalid cases), generated models and the
+  packaged copy follow. Affects B/C (papi copies `materialize` into plans, the runner passes the plan
+  through) and F (postgres, aws and azure mark their non-secret names).
+- `ctx.k8s_proxy_get` / `rw_k8s_proxy_get` (S17), refined:
+  - It now runs `kubectl proxy --unix-socket=<0700 temp dir>/p.sock` (readiness: the "Starting to
+    serve on <socket>" line kubectl 1.3x prints, else the socket file after 0.5 s; the directory is
+    under the temporary directory or /tmp when that path is too long, and removed in `finally`)
+    instead of a loopback TCP port, so nothing else on the machine can reach the proxy. The client
+    is an `http.client.HTTPConnection` over AF_UNIX with the same never-follow redirect handler.
+  - `location` of a kept redirect is the backend-relative path plus query: the API server rewrites
+    a backend's path-absolute Location into `/api/v1/namespaces/<ns>/<kind>/<[https:]name:port>/proxy/...`
+    and the helper strips that prefix, so the value can be passed back as `path` (`headers["location"]`
+    keeps the raw value). A path into a different pod, service or port is a cross-target redirect:
+    `location` None, `x-rw-redirect-dropped: <ns>/<kind>/<target>`.
+  - API-server `Status` bodies (`kind: Status`, `apiVersion: v1`, error status) are mapped:
+    401/403 `permission_denied`, 404 with `reason: NotFound` `not_found`, 503 / `ServiceUnavailable` /
+    "no endpoints available" / "error trying to reach service" `unreachable`. Everything else, notably
+    a backend's own plain-JSON 503 (Vault sealed), is returned as data.
+  - `runwhen_capability.testing.stub_commands(tc, k8s_proxy_get=[{request, response | error}, ...])`
+    stubs `ctx.k8s_proxy_get` for a skill's Python unit test, matched in order against the declared
+    requests as a replay matches them (`tc.k8s_proxy_requests`, `tc.k8s_proxy_unconsumed()`).
+- `rwtask test` records and replays `k8s-proxy-get` calls (`ctx.k8s_proxy_get`, `rw_k8s_proxy_get`) as
+  calls of their own. A scenario's `calls` items are now either `{argv, rc?, stdout?, stderr?, stdin?}`
+  or `{type: k8s-proxy-get, request: {namespace, kind, name, port, path, scheme?}, response: {status,
+  headers?, body?, truncated?, location?} | error: {code, message, scope?, hint?}}` (`plugin/fixtures.py`
+  schema, dump and load; `scheme` and the response fields default). With `RW_SHIM_MODE=record` the
+  helper appends its line to `$RW_SHIM_LOG` after the real call, in order with the shimmed CLI
+  calls (the `kubectl proxy` it starts is never a recorded call: the shim directory is skipped when it
+  looks for kubectl), and a call that failed is recorded as an `error` and raised again on replay.
+  With `RW_SHIM_MODE=replay` no proxy is started: the next recorded call must be a `k8s-proxy-get` with an
+  equal request, else `E_FIXTURE_MISMATCH` (exit 97 from the bash helper, an entry in the mismatch
+  file, as for a shim) and its response is returned. The shim session's consumed count and leftovers
+  cover both kinds of call, and a shim meeting a recorded proxy call reports it as a mismatch.
+- `ctx.k8s_proxy_get(namespace, kind, name, port, path, *, scheme="http", timeout=30)` and bash
+  `rw_k8s_proxy_get <namespace> <pods|services> <name> <port> <path> [--scheme https] [--timeout N]`
+  (`runwhen_capability/k8s_proxy.py`, security finding S17): a GET through the Kubernetes API
+  server's pod/service proxy that never follows a redirect. `kubectl get --raw .../proxy/...`
+  follows a backend's 301/302/307 and re-sends the runner's bearer token to an absolute
+  `Location` on another host. The helper runs `kubectl proxy --port=0 --address=127.0.0.1` in its
+  own process group for the call (stopped with SIGTERM, then SIGKILL after 2 s), reads through it
+  with a no-redirect client that sends no credential, and returns `{status, headers, body,
+  truncated, location}`: the backend's status and body (also for 4xx/5xx), `location` only for a
+  relative target or one into the same proxy path, otherwise `null` with an
+  `x-rw-redirect-dropped: <host>` header. Errors carry D64 codes (`dependency`, `unreachable`,
+  `timeout`, `invalid_input`, `permission_denied` for the API server's own 401/403 `Status`).
+  The bash helper runs `$RW_PYTHON -m runwhen_capability.k8s_proxy get ...` (the host now sets
+  `RW_PYTHON` for bash tasks), prints one JSON line and, on failure, records the error in
+  `$RW_ERRORS_FILE` and exits non-zero. It is in `RW_SH_HELPERS`, so `rwtask validate` knows it,
+  and the unknown-helper check now reads helper names with digits (`rw_k8s_...`).
+- `rwtask serve` runs script auth plans before the task script (lane C's CON-5, GKE auth): for each
+  lease `credentials[]` entry whose `authPlan.method` is a `script`, `plugin/auth_script.py` reads
+  the plan's archive (fetched through the relay by hash when not cached: `RelayClient.open_code(sha256)`
+  asks `GET /v1/tasks/{id}/code?sha256=sha256:<hex>`, same size/hash checks; proposed to the runner),
+  writes `materialized[].reference` to `$RW_AUTH_REF_DIR/<key>`, and runs `integration/<path>`
+  (`.py` under `python3`, `.sh` under `bash -euo pipefail`; working directory = the plugin root) with
+  `RW_AUTH_INPUT_<NAME>`, `RW_AUTH_OUT_FILE` (file types) or `RW_AUTH_OUT_ENV` (env types: `NAME=value`
+  lines, names limited to the plan's `materialize.env`) and `RW_AUTH_OUT_ERROR` (one `{code, message}`
+  line, code from the D64 set), under the child runner's discipline (host-only and RW_* variables
+  stripped, private HOME, own process group, a timeout of min(60s, the request's remaining deadline)).
+  The produced file (mode `materialize.file.mode`) or variables are exported to the task and redacted
+  with the reference material; stdout/stderr are never task output. A missing reference for a
+  k8s-secret, vault or file reference is `invalid_input`; a script failure is the script's own code
+  or `internal`/`timeout`, scope `auth`, and the task script never runs. Everything is deleted when the
+  task ends. `RW_AUTH_*` never reaches the task.
+- contracts-v4 (tag pending): `auth-plan.schema.json#/$defs/materializedCredential` gains an optional
+  `reference: {files: [{key, content, encoding?}]}`, the reference material a script auth plan's
+  script reads from `$RW_AUTH_REF_DIR/<key>`; an entry with `reference` has no `files` or `env`.
+  CONTRACTS.md "Auth plan" and "Changes in contracts-v4" (V4-1) say so; generated models and the
+  packaged copy follow. `tests/contracts` fixtures may now be one `$defs` entry of their schema
+  (`examples/auth-plan/materialized/`).
+- A skill's `skills/<skill>/tests/**` (recorded fixtures) is dev-only and never packaged (lane F),
+  exactly like the root `tests/`, `runwhen.lock` and `.runwhen/`. `load_entries` / `load_dir`
+  (so `rwtask compile` and `rwtask validate`) and `rwtask pull`'s git path drop it silently: not in
+  the archive, `files` or `compiled.skills[].files`, so the archive sha256 stays one identity across
+  builders (the registry must apply the same rule). `skills/<skill>/tests` stays an allowed
+  authoring path, and `rwtask test` still reads fixtures from the plugin directory. This also
+  applies to a workspace skill directory loaded with `load_skill_dir`. New warning
+  `W_SCRIPT_READS_TESTS` when a `.py`/`.sh` file under a skill's `scripts/` or `lib/` mentions a
+  `tests/` path. archive.md sections 2 and 3a, CONTRACTS.md "Plugin format" and the contracts-v3
+  changes (V3-1) say so.
+- The platform-minted `runwhen/sync` credential reaches a task as the JSON file at
+  `$RW_SYNC_CREDENTIAL` (lanes B, C): a lease's `materialized[]` entry
+  `{credentialType: runwhen/sync, files: [{env: RW_SYNC_CREDENTIAL, ...}]}` is accepted. That one
+  name is allowed only as a file of a `runwhen/sync` entry (`plugin.run.PLATFORM_MINTED_FILE_ENV`;
+  `check_extra_env(..., allow=)`, `execute(..., allow_env=)`); as an `env{}` key, under another
+  credential type, in caller `extra_env`, and every other RW_* name stay refused. Its token is
+  redacted on its own as well as with the file. `rwtask run` and `rwtask test --record` pass the
+  caller's own `$RW_SYNC_CREDENTIAL` (made absolute) to a task that declares `runwhen/sync`;
+  a replay does not.
+- `rwtask serve` fetches a V13 lease's plugin code archive from the runner relay when it is not in
+  the local cache (DLV-9; it used to fail with a `dependency` error). `RelayClient.open_code()`
+  streams `GET /v1/tasks/{requestId}/code`; the body must be exactly the lease's `code.archive.size`
+  bytes (never more than 64 MiB, enforced while reading), carry a matching `X-RW-Sha256` when sent,
+  and hash to the lease's sha256. Only verified bytes are cached, at `<cache>/<hex>.tar`, written to
+  a unique temporary file and renamed into place, so concurrent fetches of one archive in a pod both
+  succeed. A failed or mismatched fetch is a `dependency` envelope that names the archive (not the
+  relay URL or token); with no relay (`rwtask run`) a missing archive stays a `dependency` error.
+  A cached archive that fails its hash is dropped and fetched once more (with no relay it stays an
+  `internal` error); a lease size over 64 MiB is refused before the relay is asked; a sha256 that is
+  not `sha256:<64 lower-case hex>` is `invalid_input` and never reaches a cache path; `*.tmp` files
+  of dead fetches older than an hour are removed. `.archives`, the cache directory, is refused as a
+  `scopeId`. `load_code` and `runspec_from_lease` take an optional `relay`.
+- A reference time for every V13 task run (lane F): the executor (`plugin/run.py` `execute`, so
+  `rwtask run`, `rwtask test` and the lease executor) sets `RW_NOW` (RFC 3339 UTC, milliseconds,
+  `Z`) and `RW_NOW_EPOCH` (integer seconds) once at the start of the run, or from the new
+  `RunSpec.now`; `ctx.now()` returns it as an aware UTC datetime (the wall clock without
+  `RW_NOW`). `rwtask test --record` writes it as the scenario's optional `now:` and replay runs
+  the task at that time, so an argv that carries the time (`kubectl.kubernetes.io/restartedAt`,
+  `reconcile.fluxcd.io/requestedAt`) replays exactly; a scenario without `now` replays with a
+  fresh time, as before. `runwhen_capability.testing.make_context(..., now=)` sets it likewise.
+  `RW_NOW`/`RW_NOW_EPOCH` are reserved and standard bash environment for the validator.
+- `rwtask pull [--plugin-dir DIR] [--from git+URL|DIR | --registry URL] [--frozen] [name[@range] ...]`
+  (AUT-1) resolves a plugin's `requires`/`extends` (not `platform`) to exact versions and fills the
+  plugin cache (`<name>/<version>.compiled.json` + `.tar`, written atomically; a cached archive that
+  hashes differently is an error). Git sources use tags `<name>/v<semver>` with the plugin at
+  `plugins/<name>` (shallow, blob-filtered fetch; exec bits kept); a registry source verifies each
+  archive's sha256. The result is pinned in `runwhen.lock` (range, version, archive sha256,
+  source), which `--frozen` installs as is and fails on if missing or stale (CI), and `rwtask
+  validate|compile` now load the pinned versions from the cache when no `--with` names them (a
+  cached archive that differs from the lock exits 2). `pull` also writes self-contained editor
+  schemas to `.runwhen/schemas/` with a README for yaml-language-server. `runwhen.lock` is not part
+  of the plugin archive. Library: `plugin.pull`, `plugin.lock`, `plugin.editor`.
+- `rwtask validate|compile <dir> --with SPEC` (repeatable) validates a plugin against the plugins it
+  `requires`/`extends` (INT-2): SPEC is a plugin directory, a `*.compiled.json` or `name[@version]`
+  from `$RUNWHEN_PLUGIN_CACHE` (default `~/.cache/runwhen/plugins`). The required integration's
+  types, credential types and permission schema are then checked like the plugin's own (no more
+  `W_TYPE_UNCHECKED` for it), plus `E_REQUIRES_RANGE` (npm-style ranges, new `plugin.semver`) and
+  `W_DEPENDENCY_UNUSED`. Library: `plugin.load_dependency`, `validate_tree(..., dependencies=)`.
+- Every result envelope of a lease carries `provenance` (VER-6): the task ref, plugin, version and
+  task hash, the code's sha256, the runtime image and digest, `leaseId`, `taskRun`, and the first
+  credential's `connection`. It is on ok, failed and timed-out envelopes and on every refusal after
+  the lease validated (code hash mismatch, archive not in the cache, a dry run the task does not
+  support, plugin code switched off); a lease that fails its own contract gets none. `rwtask run`
+  stamps `{task, plugin, version, taskHash}` from the compiled task.
+- `runwhen_capability.testing`, for unit-testing a skill's scripts without a runner: `make_context(...)`
+  builds a real `Context` as the V13 executor does (and restores `os.environ` afterwards), with
+  `.errors`, `.artifact(name)` and `.envelope(outputs)` (checked against `result-envelope`);
+  `run_main(main, tc, **inputs)` calls a script's `main` as the entry point does and returns the
+  envelope; `stub_commands(tc, {argv: (rc, stdout, stderr)})` answers `ctx.run` without spawning.
+  Not exported from the package root.
+- `rwtask port <bundle-dir> --plugin <name> --into <skills-dir>` drafts a V13 `SKILL.md` and
+  `tasks.yaml`, plus a porting brief, from a classic rw-cli Robot bundle. It never copies classic
+  script bodies. Needs the new `port` extra (`robotframework>=7`).
+
+- A task's memory limit (CAP-7). A lease's `limits.resources.memory` (and a compiled task's
+  `resources.memory`, for `rwtask run`) is a Kubernetes quantity applied to the task's child as
+  `RLIMIT_DATA` on Linux (not `RLIMIT_AS`, which stops Go tools such as kubectl from starting); elsewhere it is not applied. A task that dies of it and reported no error of
+  its own fails `internal` with the hint "the task exceeded its memory limit (<quantity>)". `cpu` stays
+  advisory. `plugin.run.parse_quantity_bytes` reads the quantity.
+
+### Security
+
+- `rwtask serve` reads the executor token at start-up and unlinks the file (S1 / SEC-2): a task in
+  the same pod can no longer `cat` it. The path comes from `--token-file`, else
+  `RW_EXECUTOR_TOKEN_FILE`, else the legacy `EXECUTOR_TOKEN_FILE`, else
+  `/var/run/executor/token`. If the unlink worked the token lives in memory only. If it is refused
+  (a read-only Secret mount, as on today's runner) the file stays and is re-read before every relay
+  call, so a Secret rotated in place is still picked up (the last token read is the fallback when a
+  re-read fails). Which mode is active is logged once. The token file need not exist at start-up (an image
+  smoke test, a pod that starts before its mount): `serve` warns once ("executor token not present
+  yet at <path>; waiting for it"), loads its capability, skips polls (never unauthenticated) until
+  the file holds a token, then applies the rule above once. `serve` also makes itself non-dumpable
+  (`prctl(PR_SET_DUMPABLE, 0)`, Linux) in both modes so a task cannot read the token from
+  `/proc/<pid>/mem` or `environ`. `RW_EXECUTOR_TOKEN_FILE` is host-only like `EXECUTOR_TOKEN_FILE`.
+  `RelayClient` takes `token=`, `token_source=` (new `relay.TokenSource`) or a `token_file`, which it
+  reads once at construction.
+
+### Fixed
+
+- `k8s_proxy_get` / `k8s_proxy_request` (and the bash helpers) drop the per-request API-server
+  response headers `audit-id`, `date` and `x-kubernetes-pf-*` (flow-control UIDs) from `headers`:
+  they identify the cluster's audit trail and differ on every call, so `rwtask test --record` stored
+  them in `k8s-proxy-get` / `k8s-proxy-request` fixtures. They are dropped from the answer itself,
+  so a live run, a recording and a replay show a task the same headers; an older scenario that
+  still holds them replays without them, and so does a `stub_commands(k8s_proxy=...)` response.
+- `ctx.settings` snake_cases only the top-level setting names. It used to rewrite keys at every depth,
+  so an object-typed setting whose keys are user data (`patterns: {connRefused: ...}`) arrived with
+  its keys changed. Nested values now keep their keys verbatim (still readable as attributes where
+  the key is an identifier). Python task inputs were never affected: only the top-level input name
+  is converted.
+- A custom bundle's `lib/` is now usable from its tasks, as the skill spec promises. A Python task
+  imports a module from it by name (`lib/` is appended to `sys.path`, after the standard library
+  and site-packages, so it can never shadow them); a bash task sources a file from it as
+  `source "$RW_LIB_DIR/<file>"`. `RW_LIB_DIR` is set for both languages, is reserved like every
+  `RW_*` name (no input can override it), and `validate` no longer flags reading it as an
+  undeclared input.
+
 ## 0.4.0
 
 ### Added

@@ -1,0 +1,25 @@
+apiVersion: runwhen.com/tasks/v1
+runtime: kubernetes@1
+defaults: { credentials: kubernetes/kubeconfig }
+tasks:
+  - name: discover
+    title: Discover cluster resources
+    description: Enumerates resources in scope and syncs them to the platform.
+    script: scripts/discover.py
+    readOnly: true
+    credentials: [kubernetes/kubeconfig, runwhen/sync]
+    permissions:
+      - { nonResourceURLs: [/version], verbs: [get] }
+      - { apiGroups: [""], resources: [namespaces], verbs: [get, list] }
+    settings:
+      namespaces: { type: "string[]", default: [], description: Empty = all readable namespaces }
+    outputs:
+      summary: { kind: rw.discovery.summary.v1 }
+  - name: kubectl
+    title: kubectl (read-only)
+    description: Run a read-only kubectl command against this cluster.
+    script: scripts/kubectl.sh
+    readOnly: true
+    permissions: [{ apiGroups: ["*"], resources: ["*"], verbs: [get, list, watch] }]
+    inputs:
+      command: { type: string, description: "kubectl arguments, e.g. get pods -o wide" }

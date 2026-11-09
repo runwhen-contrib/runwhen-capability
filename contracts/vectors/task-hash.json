@@ -1,0 +1,230 @@
+{
+  "description": "task_hash(input.task, files): sha256 of the canonical JSON of {task: input.task minus 'hash', files: {path: sha256(data)}}, with the task serialized by the canonical-json rules (including floats). input.files is a list of {path, dataBase64}.",
+  "cases": [
+    {
+      "name": "task with no files",
+      "input": {
+        "task": {
+          "name": "restart-count",
+          "description": "List pods restarting in the last hour",
+          "script": "tasks/restart-count.sh",
+          "params": {
+            "namespace": "default",
+            "threshold": 5
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:2ac59367c100d927a1f828be3d07aa6e4787ed53dffc5e2ea39a2c092d77a1e8"
+    },
+    {
+      "name": "task with files",
+      "input": {
+        "task": {
+          "name": "restart-count",
+          "description": "List pods restarting in the last hour",
+          "script": "tasks/restart-count.sh",
+          "params": {
+            "namespace": "default",
+            "threshold": 5
+          }
+        },
+        "files": [
+          {
+            "path": "tasks/restart-count.sh",
+            "dataBase64": "a3ViZWN0bCBnZXQgcG9kcwo="
+          },
+          {
+            "path": "lib/util.sh",
+            "dataBase64": "IyBoZWxwZXJzCg=="
+          }
+        ]
+      },
+      "expected": "sha256:031a274faa29f7ceb1db22d63b81f8bbac93aac043e5de01c2711195c6ca7a00"
+    },
+    {
+      "name": "file order does not matter",
+      "input": {
+        "task": {
+          "name": "restart-count",
+          "description": "List pods restarting in the last hour",
+          "script": "tasks/restart-count.sh",
+          "params": {
+            "namespace": "default",
+            "threshold": 5
+          }
+        },
+        "files": [
+          {
+            "path": "lib/util.sh",
+            "dataBase64": "IyBoZWxwZXJzCg=="
+          },
+          {
+            "path": "tasks/restart-count.sh",
+            "dataBase64": "a3ViZWN0bCBnZXQgcG9kcwo="
+          }
+        ]
+      },
+      "expected": "sha256:031a274faa29f7ceb1db22d63b81f8bbac93aac043e5de01c2711195c6ca7a00"
+    },
+    {
+      "name": "existing hash key is ignored",
+      "input": {
+        "task": {
+          "name": "restart-count",
+          "description": "List pods restarting in the last hour",
+          "script": "tasks/restart-count.sh",
+          "params": {
+            "namespace": "default",
+            "threshold": 5
+          },
+          "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "files": [
+          {
+            "path": "tasks/restart-count.sh",
+            "dataBase64": "a3ViZWN0bCBnZXQgcG9kcwo="
+          }
+        ]
+      },
+      "expected": "sha256:dbc93dfd7922a9a6315d29c3eed397ee930f30fbb9c012880ff9a4a205a5ad9c"
+    },
+    {
+      "name": "task key order does not matter",
+      "input": {
+        "task": {
+          "params": {
+            "namespace": "default",
+            "threshold": 5
+          },
+          "script": "tasks/restart-count.sh",
+          "description": "List pods restarting in the last hour",
+          "name": "restart-count"
+        },
+        "files": [
+          {
+            "path": "tasks/restart-count.sh",
+            "dataBase64": "a3ViZWN0bCBnZXQgcG9kcwo="
+          }
+        ]
+      },
+      "expected": "sha256:dbc93dfd7922a9a6315d29c3eed397ee930f30fbb9c012880ff9a4a205a5ad9c"
+    },
+    {
+      "name": "empty file",
+      "input": {
+        "task": {
+          "name": "t"
+        },
+        "files": [
+          {
+            "path": "lib/__init__.py",
+            "dataBase64": ""
+          }
+        ]
+      },
+      "expected": "sha256:40b3b3f78406b28312a6e69da245864c279f8a2c31d725e532268afd7f55b253"
+    },
+    {
+      "name": "float defaults are canonicalized",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 0.5
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:060363e86a595ce81a1b213d43cef7958d9c3ab0b62bc82cb2dbbf6a3e3056cf"
+    },
+    {
+      "name": "integral float equals the integer",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 2.0
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:b0d5f9de631220d817cbc8302f54a6984b23990860c383b45ea580817c78a52e"
+    },
+    {
+      "name": "integer default",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 2
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:b0d5f9de631220d817cbc8302f54a6984b23990860c383b45ea580817c78a52e"
+    },
+    {
+      "name": "small float default",
+      "input": {
+        "task": {
+          "name": "t",
+          "inputs": {
+            "ratio": {
+              "type": "number",
+              "default": 2e-05
+            }
+          }
+        },
+        "files": []
+      },
+      "expected": "sha256:a7056e3ae668a21878c26536d55acfd7f8dee2e5af51ffd5d07992a713749325"
+    },
+    {
+      "name": "unicode in task and file",
+      "input": {
+        "task": {
+          "name": "naïve",
+          "description": "café"
+        },
+        "files": [
+          {
+            "path": "notes.md",
+            "dataBase64": "bmHDr3ZlCg=="
+          }
+        ]
+      },
+      "expected": "sha256:41f46e55eb8aa8895ed4b37f706b3aa53731b90c1572314abcacb0fdf3568a47"
+    },
+    {
+      "name": "changed file content changes the hash",
+      "input": {
+        "task": {
+          "name": "restart-count",
+          "description": "List pods restarting in the last hour",
+          "script": "tasks/restart-count.sh",
+          "params": {
+            "namespace": "default",
+            "threshold": 5
+          }
+        },
+        "files": [
+          {
+            "path": "tasks/restart-count.sh",
+            "dataBase64": "a3ViZWN0bCBnZXQgcG9kcyAtQQo="
+          }
+        ]
+      },
+      "expected": "sha256:9f6f820b74715a7ec0a107b9000c5f4d77ae89404c64cac577aa73a94741fa55"
+    }
+  ]
+}

@@ -330,6 +330,111 @@ def test_a_published_bundle_reading_a_legacy_mangled_env_name_still_runs(tmp_pat
     assert task.outputs["seen"] == "t=7 e=stg"
 
 
+def _lib_bundle(task_file: str, task_body: str, lib: dict[str, str], *, inputs: str = "") -> dict:
+    """A one-task bundle (`show`, output `seen: string`) plus the given lib/ files."""
+    manifest = (
+        "apiVersion: runwhen.com/custom-capability/v1\n"
+        "name: with-lib\n"
+        "appliesTo:\n"
+        "  - { platform: kubernetes, type: statefulset }\n"
+        "tasks:\n"
+        "  - name: show\n"
+        f"    file: {task_file}\n"
+        "    readOnly: true\n"
+        f"{inputs}"
+        "    outputs:\n"
+        '      seen: { schema: "string" }\n'
+    )
+    return {
+        "capability.yaml": manifest,
+        task_file: task_body,
+        **{f"lib/{name}": content for name, content in lib.items()},
+    }
+
+
+def _lib_dir_input(name: str) -> str:
+    return f"    inputs:\n      {name}: {{ type: string, default: /none, runtime: true }}\n"
+
+
+def test_a_python_task_imports_a_module_from_the_bundles_lib_dir(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.py",
+        "from helpers import double\n\ndef main(ctx):\n    return {'seen': str(double(21))}\n",
+        {"helpers.py": "def double(n):\n    return n * 2\n"},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "42"}
+
+
+def test_a_bash_task_sources_a_file_from_the_bundles_lib_dir(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nsource "$RW_LIB_DIR/common.sh"\nrw_set seen "\\"$(greet)\\""\n',
+        {"common.sh": "greet() { echo hello-from-lib; }\n"},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "hello-from-lib"}
+
+
+def test_a_lib_module_cannot_shadow_the_standard_library(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.py",
+        "import json\n\ndef main(ctx):\n    return {'seen': json.dumps([1])}\n",
+        {"json.py": "raise RuntimeError('lib/json.py shadowed the standard library')\n"},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "[1]"}
+
+
+def test_a_python_task_runs_in_a_bundle_without_a_lib_dir(tmp_path):
+    files = _lib_bundle("tasks/show.py", "def main(ctx):\n    return {'seen': 'ok'}\n", {})
+    assert not any(path.startswith("lib/") for path in files)
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+
+
+def test_a_bash_task_in_a_bundle_without_a_lib_dir_still_gets_the_variable(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nrw_set seen "\\"${RW_LIB_DIR##*/}\\""\n',
+        {},
+    )
+    [task] = _run(files, ["show"], tmp_path).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "lib"}
+
+
+@pytest.mark.parametrize("input_name", ["libDir", "LIB_DIR", "RW_LIB_DIR"])
+def test_an_input_cannot_change_rw_lib_dir_for_bash(tmp_path, input_name):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nsource "$RW_LIB_DIR/common.sh"\nrw_set seen "\\"$(greet)\\""\n',
+        {"common.sh": "greet() { echo real-lib; }\n"},
+        inputs=_lib_dir_input(input_name),
+    )
+    [task] = _run(files, ["show"], tmp_path, inputs={input_name: "/elsewhere"}).tasks
+    assert task.status == "ok", task
+    assert task.outputs == {"seen": "real-lib"}
+
+
+@pytest.mark.parametrize("input_name", ["libDir", "LIB_DIR"])
+def test_an_input_cannot_change_rw_lib_dir_for_python(tmp_path, input_name):
+    files = _lib_bundle(
+        "tasks/show.py",
+        "import os\n\n"
+        "def main(ctx, **inputs):\n"
+        "    return {'seen': os.environ.get('RW_LIB_DIR', '')}\n",
+        {"helpers.py": ""},
+        inputs=_lib_dir_input(input_name),
+    )
+    [task] = _run(files, ["show"], tmp_path, inputs={input_name: "/elsewhere"}).tasks
+    assert task.status == "ok", task
+    assert task.outputs["seen"].endswith("/bundle/lib")
+
+
 # -- artifact outputs: rw_artifact, the artifacts dir, host-side upload, spill ----------
 
 PUT_PREFIX = "/v1/tasks/req-1/artifacts/"
@@ -1303,3 +1408,163 @@ def _token(tmp_path: Path) -> Path:
     token_file = tmp_path / "token"
     token_file.write_text("tok-1")
     return token_file
+
+
+# -- CAP-5: structured errors through the side channel --------------------------------
+
+
+def _show(task_file: str, body: str) -> dict:
+    return _lib_bundle(task_file, body, {})
+
+
+def _only_task(files, tmp_path):
+    result = _run(files, ["show"], tmp_path)
+    [task] = result.tasks
+    return task
+
+
+def test_an_uncaught_rw_error_becomes_the_errors_code_not_a_generic_failure(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "from runwhen_capability import RwError\n"
+            "def main(ctx):\n"
+            "    raise RwError('not_found', 'no such deployment', scope='ns/web')\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "failed"
+    assert task.errors == ["not_found: no such deployment"]
+    assert task.error == "not_found: no such deployment"
+    assert not any("process exited" in e for e in task.errors)
+    assert "not_found" in task.logTail  # also on stderr, for a human reading the log
+
+
+def test_an_uncaught_rw_command_error_carries_the_classified_code(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "def main(ctx):\n"
+            "    ctx.run(['sh', '-c', 'echo \"Error from server (Forbidden): pods\" >&2; exit 1'],"
+            " check=True)\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "failed"
+    assert len(task.errors) == 1
+    assert task.errors[0].startswith("permission_denied: sh exited 1: ")
+
+
+def test_ctx_error_with_a_clean_exit_is_folded_into_errors_and_the_status_stays_ok(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "def main(ctx):\n"
+            "    ctx.error('timeout', 'node n1 did not answer', scope='n1')\n"
+            "    ctx.error('rate_limited', 'slow down')\n"
+            "    return {'seen': 'partial data'}\n",
+        ),
+        tmp_path,
+    )
+    # The classic wire shape: no `partial` status. The envelope derives it later.
+    assert task.status == "ok"
+    assert task.outputs == {"seen": "partial data"}
+    assert task.errors == ["timeout: node n1 did not answer", "rate_limited: slow down"]
+
+
+def test_ctx_error_then_a_crash_keeps_the_error_and_fails(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.py",
+            "def main(ctx):\n"
+            "    ctx.error('unreachable', 'db down')\n"
+            "    raise RuntimeError('boom')\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "failed"
+    assert task.errors == ["unreachable: db down"]
+    assert "RuntimeError: boom" in task.logTail
+
+
+def test_a_bash_rw_error_is_folded_and_the_exit_code_decides_the_status(tmp_path):
+    ok = _only_task(
+        _show("tasks/show.sh", 'source "$RW_SDK/rw.sh"\nrw_error not_found "no pod" ns/a\n'),
+        tmp_path / "ok",
+    )
+    assert ok.status == "ok"
+    assert ok.errors == ["not_found: no pod"]
+
+    failed = _only_task(
+        _show("tasks/show.sh", 'source "$RW_SDK/rw.sh"\nrw_error storage "disk full"\nexit 3\n'),
+        tmp_path / "failed",
+    )
+    assert failed.status == "failed"
+    assert failed.errors == ["storage: disk full"]
+
+
+def test_a_bash_rw_error_with_an_invalid_code_is_folded_as_internal(tmp_path):
+    task = _only_task(
+        _show("tasks/show.sh", 'source "$RW_SDK/rw.sh"\nrw_error E_NOPE "x"\nexit 1\n'),
+        tmp_path,
+    )
+    assert task.errors == ["internal: x"]
+
+
+def test_a_forged_side_channel_line_is_one_internal_error(tmp_path):
+    task = _only_task(
+        _show(
+            "tasks/show.sh",
+            'echo \'{"code": "bogus", "message": "m"}\' >> "$RW_ERRORS_FILE"\n'
+            "echo 'not json' >> \"$RW_ERRORS_FILE\"\n",
+        ),
+        tmp_path,
+    )
+    assert task.status == "ok"
+    assert len(task.errors) == 2
+    assert all(e.startswith("internal: ") for e in task.errors)
+
+
+def test_a_failed_task_with_no_structured_errors_keeps_the_generic_prefix(tmp_path):
+    task = _only_task(_show("tasks/show.sh", "exit 4\n"), tmp_path)
+    assert task.errors == ["process exited 4"]
+
+
+def test_the_side_channel_is_fresh_for_every_task(tmp_path):
+    files = _lib_bundle(
+        "tasks/show.sh",
+        'source "$RW_SDK/rw.sh"\nrw_error timeout "first"\n',
+        {},
+    )
+    files["capability.yaml"] += "  - name: second\n    file: tasks/second.sh\n    readOnly: true\n"
+    files["tasks/second.sh"] = "true\n"
+    result = _run(files, ["show", "second"], tmp_path)
+    first, second = result.tasks
+    assert first.errors == ["timeout: first"]
+    assert second.errors == []
+
+
+@pytest.mark.parametrize("language", ["py", "sh"])
+def test_rw_out_is_a_fresh_writable_directory_inside_the_scope(tmp_path, language):
+    if language == "py":
+        body = (
+            "import os\n"
+            "def main(ctx):\n"
+            "    d = os.environ['RW_OUT']\n"
+            "    before = sorted(os.listdir(d))\n"
+            "    open(os.path.join(d, 'x.txt'), 'w').write('hi')\n"
+            "    inside = d.startswith(os.environ['RW_WORKDIR'])\n"
+            "    return {'seen': repr((before, os.path.isdir(d), inside))}\n"
+        )
+    else:
+        body = (
+            'source "$RW_SDK/rw.sh"\n'
+            'printf hi > "$RW_OUT/x.txt"\n'
+            'rw_set seen "\\"$(ls "$RW_OUT")|$([[ $RW_OUT == "$RW_WORKDIR"/* ]] && echo in)\\""\n'
+        )
+    task = _only_task(_show(f"tasks/show.{language}", body), tmp_path)
+    assert task.status == "ok", task
+    if language == "py":
+        assert task.outputs["seen"] == "([], True, True)"
+    else:
+        assert task.outputs["seen"] == "x.txt|in"

@@ -1,0 +1,19 @@
+# source: 42b-example-papi-skill.md "## pgbouncer-health"
+# skills/pgbouncer-health/tasks.yaml
+apiVersion: runwhen.com/tasks/v1
+runtime: kubernetes@1
+defaults:
+  credentials:
+    - type: generic/env                  # D44: from a generic connection the admin scoped to this pgbouncer
+      vars: [PGUSER, PGPASSWORD]
+settings:
+  waitingClientsThreshold: { type: integer, default: 5, description: Clients waiting for a server connection }
+  host: { type: string, default: "", description: "host:port; empty = <name>.<namespace>.svc:5432" }
+tasks:
+  - name: pool-saturation
+    title: pgbouncer pool saturation
+    description: Runs SHOW POOLS. Waiting clients with every server connection busy means stuck transactions.
+    script: scripts/pool_saturation.py
+    readOnly: true
+    outputs:
+      pools:    { schema: ./schemas/pools.v1.json }

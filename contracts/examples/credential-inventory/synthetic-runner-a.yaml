@@ -1,0 +1,38 @@
+# source: synthetic (no wiki example); consistent with 50-connections-credentials.md (CON-2) and lane C's inventory design (hints are non-secret metadata only)
+apiVersion: runwhen.com/credential-inventory/v1
+runnerUuid: 6f1c2a9e-0b7d-4f43-9a51-2d8e4c7b1a30
+reportedAt: 2026-11-03T08:55:00Z
+entries:
+  - id: in-cluster-sa
+    kind: in-cluster-sa
+    ref: k8s:incluster
+    state: ok
+    hints:
+      inClusterSa: { serviceAccount: runner, namespace: runwhen-local, apiServer: "https://10.0.0.1:443" }
+  - id: runwhen-local-kubeconfig
+    kind: k8s-secret
+    ref: k8s:file@secret/runwhen-local-kubeconfig:kubeconfig
+    content: kubeconfig
+    keys: [kubeconfig]
+    version: "48213"
+    state: ok
+    hints:
+      kubeconfig:
+        contexts:
+          - { name: prod-east, cluster: gke_acme-prod_us-east1_prod-east, server: "https://34.74.10.20", authKind: "exec:gke-gcloud-auth-plugin" }
+          - { name: prod-west, cluster: gke_acme-prod_us-west1_prod-west, server: "https://35.233.40.50", namespace: payments, authKind: token }
+  - id: gcp-prod-sa
+    kind: k8s-secret
+    ref: k8s:file@secret/gcp-prod-sa:key.json
+    content: gcp-sa-key
+    keys: [key.json]
+    version: "1022"
+    state: ok
+    hints:
+      gcpSaKey: { clientEmail: runwhen-reader@acme-prod.iam.gserviceaccount.com, projectId: acme-prod }
+  - id: workload-identity
+    kind: cloud-identity
+    ref: gcp:workload-identity
+    state: ok
+    hints:
+      cloudIdentity: { provider: gcp, principal: runwhen-runner@acme-prod.iam.gserviceaccount.com }

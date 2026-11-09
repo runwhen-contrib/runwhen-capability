@@ -16,29 +16,45 @@ per-pod bearer token). Two routes, both scoped to one request:
         -> 200 the bytes, with Content-Length and X-RW-Sha256
         -> 404 when `input` is not one of the request's input artifacts
 
+    GET {relay}/v1/tasks/{requestId}/code
+        -> 200 the request's plugin code archive (a tar), with Content-Length and
+           X-RW-Sha256: sha256:<hex>
+        -> 404 when the request's lease carries no `code.archive`
+
 The runner answers a PUT early on purpose: 413 after reading only
 `maxBytes + 1` bytes, 503 before reading any. The client is usually still
 sending when that happens; requests/urllib3 tolerate the broken pipe a close
 can cause while a body is being sent and still read the response, so the
 caller sees the mapped exception below rather than a ConnectionError.
 
+Every request to one of these routes, and the result POST (serve.py), carries
+`X-RW-Dispatch: <dispatch>` when the runner's `tasks/next` answer had a (valid) `dispatch`
+attempt token -- `task_headers` is the one place that header is built. No token, no header
+(an older runner); a mismatch is the runner's 404.
+
 Every failure is an ArtifactError. An answer with a code maps to its subclass
 (`_raise_for`); a failure to talk to the relay at all -- a refused or broken
-connection, a timeout, a body cut short, an unreadable token file, a 201
+connection, a timeout, a body cut short, a 201
 whose body is not JSON -- is the base ArtifactError with the code
 E_ARTIFACT_TRANSPORT, raised from the original error. `_transport_errors` is
 the one place that conversion happens, for the calls and for every read of an
 input's body (`InputStream`), so a task that catches ArtifactError never
 sees a requests or urllib3 exception.
 
-The bearer token is read from the token file on every call (the same file
-`rwtask serve` polls with -- see serve.py), never cached: a request can run
-for minutes, long enough for the token to rotate under it.
+The bearer token comes from a `TokenSource`. `rwtask serve` reads the executor token
+file (when it is there: a pod may start before its token does) and unlinks it; the source
+then holds the string in memory only, with no file for a task in the same pod to copy. If
+the unlink is refused (a read-only Secret volume, today's runner), the source re-reads the
+file on every call instead, so a Secret the kubelet refreshes in place on rotation is
+picked up (see serve.py). A client built from a plain `token` string or a `token_file`
+(tests, `rwtask run`) holds a fixed token: the file is read once, at construction.
 """
 
 from __future__ import annotations
 
 import io
+import logging
+import os
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -58,6 +74,7 @@ from .errors import (
     ArtifactTooLargeError,
     ArtifactUndeclaredError,
 )
+from .models import parse_dispatch
 
 # requests/urllib3 timeout tuples are (connect, read), and an upload uses two
 # different limits for them:
@@ -95,6 +112,8 @@ _CONNECT_TIMEOUT = 10
 # _SEND_TIMEOUT: a runner that merely pauses must not be cut off.
 _READ_TIMEOUT = 150
 
+DISPATCH_HEADER = "X-RW-Dispatch"
+
 _BY_CODE: dict[str, type[ArtifactError]] = {
     "E_ARTIFACT_TOO_LARGE": ArtifactTooLargeError,
     "E_ARTIFACT_UNDECLARED": ArtifactUndeclaredError,
@@ -127,10 +146,114 @@ TRANSPORT_ERROR = "E_ARTIFACT_TRANSPORT"
 _TRANSPORT_EXCEPTIONS = (requests.RequestException, urllib3.exceptions.HTTPError, OSError)
 
 
+class TokenNotPresent(OSError):
+    """`TokenSource.get()` on a source still waiting for its token file."""
+
+
+class TokenSource:
+    """The executor's bearer token: `get()` returns the one to send. Three states:
+
+    Pending (`from_file` found no usable file): the pod started before its token did (an
+    image smoke test, a late mount). Each `get()` tries the file again and raises
+    `TokenNotPresent` while it is missing, unreadable or empty -- the serve loop skips the
+    poll and sleeps. The first successful read applies the normal rule, once: try to unlink
+    the file; if that works the source becomes fixed, if it is refused it becomes
+    re-reading.
+
+    Fixed (`path=None`): `token` for the life of the process -- the file it came from is
+    gone. Re-reading: `token` is what the file held and `get()` re-reads `path` every time,
+    so a rotation in place is picked up. A re-read that fails or finds the file empty (a
+    refresh caught mid-way) logs a warning and returns the last token that was read, rather
+    than sending nothing or dropping a result in hand."""
+
+    def __init__(
+        self, token: str | None, path: Path | None = None, log: logging.Logger | None = None
+    ):
+        self._token = token
+        self._path = Path(path) if path is not None else None
+        self._log = log or logging.getLogger("runwhen_capability.relay")
+
+    @classmethod
+    def from_file(cls, path: Path, log: logging.Logger | None = None) -> TokenSource:
+        """The source for an executor token file, never raising: a file that is missing,
+        unreadable or empty gives a pending source (warned about once). Otherwise the file
+        is read and the unlink tried (see the class docstring), and the resulting mode is
+        logged once."""
+        source = cls(None, path, log)
+        if not source._adopt():
+            source._log.warning("executor token not present yet at %s; waiting for it", path)
+        return source
+
+    @property
+    def pending(self) -> bool:
+        return self._token is None
+
+    @property
+    def rereads_file(self) -> bool:
+        return self._path is not None and self._token is not None
+
+    def _adopt(self) -> bool:
+        """Pending only: reads the file and, if it holds a token, takes it and applies the
+        unlink rule. False when there is no token yet."""
+        try:
+            token = self._path.read_text().strip()
+        except OSError:
+            return False
+        if not token:
+            return False
+        self._token = token
+        try:
+            os.unlink(self._path)
+        except OSError:
+            self._log.info("executor token file left in place (read-only mount): %s", self._path)
+            self._log.info(
+                "executor token mode: re-reading %s on every relay call (rotation in place)",
+                self._path,
+            )
+        else:
+            self._log.info("executor token mode: held in memory only; the token file was removed")
+            self._path = None
+        return True
+
+    def get(self) -> str:
+        if self._token is None:
+            if not self._adopt():
+                raise TokenNotPresent(f"executor token not present at {self._path}")
+            return self._token
+        if self._path is None:
+            return self._token
+        try:
+            fresh = self._path.read_text().strip()
+        except OSError as exc:
+            self._log.warning(
+                "could not re-read executor token from %s: %s; using the last token read",
+                self._path,
+                exc,
+            )
+            return self._token
+        if not fresh:
+            self._log.warning(
+                "executor token file %s is empty; using the last token read", self._path
+            )
+            return self._token
+        self._token = fresh
+        return fresh
+
+
+def task_headers(token: str, dispatch: str | None) -> dict[str, str]:
+    """The headers every per-task relay request carries: the bearer token, and the
+    attempt token (`X-RW-Dispatch`) when one is known. Build every request to a
+    `/v1/tasks/{requestId}/...` route from this, so a new route cannot forget it."""
+    headers = {"Authorization": f"Bearer {token}"}
+    if dispatch is not None:
+        headers[DISPATCH_HEADER] = dispatch
+    return headers
+
+
 @contextmanager
 def _transport_errors(what: str) -> Iterator[None]:
     """Re-raises a transport failure inside the block -- a requests or urllib3
-    error, or an OSError (the token file, the socket) -- as
+    error, or an OSError (the socket) -- as
     ArtifactError(TRANSPORT_ERROR, "<what> failed: ..."), from the original.
     ArtifactErrors (the relay's coded answers) pass through untouched."""
     try:
@@ -188,20 +311,40 @@ class InputStream(io.RawIOBase):
 
 class RelayClient:
     """One request's view of the relay: `base_url` is the relay root,
-    `token_file` the executor token file, `request_id` the request being
-    served, `session` the HTTP session the serve loop already uses."""
+    `request_id` the request being served, `session` the HTTP session the serve
+    loop already uses. The bearer token is given as a `token_source` (what the
+    serve loop does), a `token` string, or a `token_file` (read once, here; an
+    unreadable file raises OSError) -- exactly one of them; pass `None` for a
+    `token_file` that is not used. `dispatch` is the attempt token of the request's
+    `tasks/next` answer (None for an older runner, or one that is not a decimal uint64):
+    when set it goes out as `X-RW-Dispatch` on every call."""
 
     def __init__(
         self,
         base_url: str,
-        token_file: Path,
+        token_file: Path | None,
         request_id: str,
         session: requests.Session,
+        *,
+        token: str | None = None,
+        token_source: TokenSource | None = None,
+        dispatch: str | None = None,
     ) -> None:
+        given = [x for x in (token_file, token, token_source) if x is not None]
+        if not given:
+            raise ValueError("a RelayClient needs a token, a token_file or a token_source")
+        if len(given) > 1:
+            raise ValueError("a RelayClient takes one of token, token_file, token_source")
         self.base_url = base_url.rstrip("/")
-        self.token_file = Path(token_file)
+        if token_source is not None:
+            self._tokens = token_source
+        elif token is not None:
+            self._tokens = TokenSource(token.strip())
+        else:
+            self._tokens = TokenSource(Path(token_file).read_text().strip())
         self.request_id = request_id
         self.session = session
+        self.dispatch = parse_dispatch(dispatch)
 
     def put_artifact(
         self, *, task: str, name: str, content_type: str, body: Iterable[bytes]
@@ -251,6 +394,26 @@ class RelayClient:
                     self._raise_for(resp)
         return InputStream(resp, input)
 
+    def open_code(self, sha256: str | None = None) -> InputStream:
+        """Opens the request's plugin code archive (`GET .../code`) for streaming,
+        as an InputStream the caller reads and must close. With `sha256`
+        (`sha256:<hex>`) it asks for that archive instead (`?sha256=`): another
+        plugin's archive the lease names, an auth script's. Failures are as in
+        `open_input`; a 404 (the lease has no `code.archive`, or no such archive) is
+        ArtifactUndeclaredError."""
+        with _transport_errors("downloading the code archive"):
+            resp = self.session.get(
+                self._url("code"),
+                params={"sha256": sha256} if sha256 else None,
+                headers=self._auth(),
+                stream=True,
+                timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT),
+            )
+            if resp.status_code != 200:
+                with resp:
+                    self._raise_for(resp)
+        return InputStream(resp, "code")
+
     @staticmethod
     def _raise_for(resp: requests.Response, *, upload: bool = False) -> NoReturn:
         """Maps a relay error response to the ArtifactError subclass for its
@@ -299,4 +462,4 @@ class RelayClient:
         return f"{self.base_url}/v1/tasks/{self.request_id}/{suffix}"
 
     def _auth(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.token_file.read_text().strip()}"}
+        return task_headers(self._tokens.get(), self.dispatch)

@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/facets/v1.json",
+  "title": "FacetsFile",
+  "description": "integration/facets.yaml: facet definitions with value schemas (D66, IN6).",
+  "type": "object",
+  "properties": {
+    "facets": {
+      "$ref": "#/$defs/facetList"
+    }
+  },
+  "required": [
+    "facets"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "facet": {
+      "type": "object",
+      "properties": {
+        "key": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/camelName"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "appliesTo": {
+          "type": "object",
+          "properties": {
+            "types": {
+              "type": "array",
+              "items": {
+                "oneOf": [
+                  {
+                    "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
+                  },
+                  {
+                    "const": "*"
+                  }
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "types"
+          ],
+          "additionalProperties": false
+        },
+        "populator": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "projection"
+                },
+                "expression": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4096
+                },
+                "expressionByType": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "propertyNames": {
+                    "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+                  }
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false,
+              "anyOf": [
+                {
+                  "required": [
+                    "expression"
+                  ]
+                },
+                {
+                  "required": [
+                    "expressionByType"
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "rollup"
+                },
+                "task": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/taskRef"
+                },
+                "output": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/camelName"
+                },
+                "sources": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
+                  },
+                  "uniqueItems": true
+                }
+              },
+              "required": [
+                "kind",
+                "task",
+                "output"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "agent"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "volatility": {
+          "enum": [
+            "config",
+            "state"
+          ]
+        },
+        "ttlSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "schema": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/relPath"
+        }
+      },
+      "required": [
+        "key",
+        "title",
+        "appliesTo",
+        "populator",
+        "volatility",
+        "schema"
+      ],
+      "additionalProperties": false
+    },
+    "facetList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/facet"
+      }
+    }
+  }
+}

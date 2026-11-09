@@ -1,0 +1,6 @@
+# expect: /errors should be non-empty
+status: failed
+startedAt: 2026-11-03T09:14:02Z
+finishedAt: 2026-11-03T09:14:09Z
+outputs: {}
+errors: []
