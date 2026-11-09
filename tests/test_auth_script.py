@@ -24,10 +24,12 @@ from auth_plugin import (
 )
 from relay_server import Response
 
+from runwhen_capability._redaction import Redactor
 from runwhen_capability.contracts import TreeEntry, archive, archive_sha256
 from runwhen_capability.contracts import validate as validate_contract
 from runwhen_capability.plugin import compile_tree, load_dir
-from runwhen_capability.plugin.lease import run_lease
+from runwhen_capability.plugin.auth_script import run_script_plan
+from runwhen_capability.plugin.lease import load_code, run_lease
 from runwhen_capability.relay import RelayClient
 from runwhen_capability.serve import serve
 
@@ -233,6 +235,60 @@ def test_a_script_plan_writes_the_kubeconfig_the_task_reads(harness, monkeypatch
         assert secret not in text
     harness.assert_clean()  # reference, output and the extracted archive are gone
     assert envelope["provenance"]["connection"] == "prod-east"
+
+
+def test_the_plugin_archive_is_unpacked_on_the_scratch_root_not_the_credentials_dir(
+    harness, tmp_path
+):
+    """`$RW_CREDENTIALS_DIR` is a small tmpfs sized for kubeconfigs; the plugin archive is
+    megabytes (the kubernetes plugin is ~570 files). Unpacking the archive there is an
+    ENOSPC -- exactly how `gke` auth failed in the executor, with `could not set up the auth
+    script: [Errno 28] No space left on device` -- so it goes on the task's writable workdir
+    and only the secret side (the reference files, the produced credential, HOME/TMPDIR)
+    stays in the credentials directory."""
+    info = harness.install()
+    files, executable = load_code({"archive": info}, harness.cache_dir, None, by_hash=True)
+    # the two roots a real executor has: the credentials tmpfs, and /work/<scopeId>
+    work_dir = tmp_path / "credentials" / "auth-0"
+    work_dir.parent.mkdir(parents=True, exist_ok=True)  # the per-task dir a real run already has
+    scratch_dir = tmp_path / "work" / "auth-0"
+
+    result = run_script_plan(
+        file_plan(archive_info=info),
+        files=files,
+        executable=executable,
+        reference=[("key.json", KEY_JSON.encode())],
+        work_dir=work_dir,
+        scratch_dir=scratch_dir,
+        timeout_s=30.0,
+        redactor=Redactor([]),
+    )
+
+    assert (scratch_dir / "plugin").is_dir(), "the archive was not unpacked on the scratch root"
+    assert not (work_dir / "plugin").exists(), "the archive was unpacked into the credentials dir"
+    assert (work_dir / "ref" / "key.json").is_file(), "the reference left the credentials dir"
+    assert (work_dir / "out").is_dir(), "the produced credential left the credentials dir"
+    assert result.env, "the plan still has to produce the credential the task reads"
+
+
+def test_without_a_scratch_root_the_archive_stays_beside_the_secrets(harness, tmp_path):
+    """The old behaviour is unchanged for a caller that names no scratch root."""
+    info = harness.install()
+    files, executable = load_code({"archive": info}, harness.cache_dir, None, by_hash=True)
+    work_dir = tmp_path / "credentials" / "auth-0"
+    work_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    run_script_plan(
+        file_plan(archive_info=info),
+        files=files,
+        executable=executable,
+        reference=[("key.json", KEY_JSON.encode())],
+        work_dir=work_dir,
+        timeout_s=30.0,
+        redactor=Redactor([]),
+    )
+
+    assert (work_dir / "plugin").is_dir()
 
 
 def test_the_materialize_mode_is_applied_to_the_produced_file(harness):
