@@ -306,12 +306,20 @@ def run_script_plan(
     timeout_s: float,
     redactor: Redactor,
     taken: Collection[str] = (),
+    scratch_dir: Path | None = None,
     log: logging.Logger | None = None,
 ) -> AuthResult:
     """Runs the script of `plan` (an auth plan whose method is a `script`; `files` and
     `executable` are its archive, read) under `work_dir`, which must not exist yet. `taken`
     is the variables the task already has: producing one of them is an error. Raises
-    AuthScriptError."""
+    AuthScriptError.
+
+    `work_dir` holds this plan's SECRET material -- the reference files, the credential the
+    script produces, its private HOME and TMPDIR -- and callers put it under
+    `$RW_CREDENTIALS_DIR`, a small tmpfs: a kubeconfig is KBs, and it never touches disk.
+    The plugin archive is not secret and is megabytes (the kubernetes plugin is ~570 files),
+    so it must NOT be unpacked there -- that is an ENOSPC on the credentials tmpfs. Pass
+    `scratch_dir`, on the task's writable workdir, and only the archive goes there."""
     log = log or _log
     rel = plan["method"]["script"]["path"]
     archive_path = script_archive_path(rel)
@@ -342,7 +350,13 @@ def run_script_plan(
 
     try:
         _private_dir(work_dir)
-        plugin_dir = work_dir / "plugin"
+        # The archive is code, not secret: unpack it on the scratch root when one is
+        # given, so a megabyte-scale plugin does not have to fit the credentials tmpfs.
+        if scratch_dir is None:
+            plugin_dir = work_dir / "plugin"
+        else:
+            scratch_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            plugin_dir = scratch_dir / "plugin"
         _materialize(plugin_dir, dict(files), executable)
         ref_dir = _private_dir(work_dir / "ref")
         out_dir = _private_dir(work_dir / "out")
