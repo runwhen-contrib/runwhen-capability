@@ -5,6 +5,10 @@ with the wheel and sdist attached to the GitHub Release.
 
 ## Unreleased
 
+## 0.5.0 (2026-11-25)
+
+The V13 plugins SDK: everything on `v13/plugins` since 0.4.0 (plugins, skills, `rwtask run|test|compile|pull`, the lease/v1 executor and contracts-v1 to v7). It includes the S20 `X-RW-Dispatch` echo that the V13 cut-2 runner requires on result, artifact and code calls. An executor on 0.4.0 has its results refused by that runner. Entries below were listed under Unreleased.
+
 ### Added
 
 - **contracts-v7** (CONTRACTS.md "Changes in contracts-v7"): V7-1 registry problem code

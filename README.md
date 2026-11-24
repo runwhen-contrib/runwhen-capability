@@ -15,7 +15,7 @@ Capability repositories pin a release tag:
 ```toml
 # pyproject.toml
 dependencies = [
-    "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@v0.4.0",
+    "runwhen-capability @ git+https://github.com/runwhen-contrib/runwhen-capability@v0.5.0",
 ]
 ```
 
@@ -414,7 +414,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: runwhen-contrib/runwhen-capability/.github/workflows/capability-image.yml@v0.4.0
+    uses: runwhen-contrib/runwhen-capability/.github/workflows/capability-image.yml@v0.5.0
     with:
       capability: my-capability            # capabilities/my-capability/
       dockerfile: Dockerfile.my-capability
