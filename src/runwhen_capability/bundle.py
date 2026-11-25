@@ -78,7 +78,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +117,7 @@ from .custom.manifest import (
 )
 from .custom.schema_features import regex_keyword_paths
 from .custom.yaml_lines import safe_load
+from .envelope import errors_from_jsonl
 from .errors import ArtifactError, ArtifactsUnavailableError
 from .models import (
     BundleRequestEnvelope,
@@ -431,6 +432,7 @@ def _run_invocation(
             # this task's artifact. (The request's first check, which refuses a
             # directory that is not ours, is in _prepare_scope.)
             _reset_artifacts_dir(scope_dir)
+            _reset_task_channels(scope_dir)
             exit_code, stream, log_tail, timed_out = _execute(
                 files_dir=files_dir,
                 file_path=file_path,
@@ -511,7 +513,15 @@ def _run_invocation(
             }
 
         errors: list[str] = [missing_error] if missing_error else []
-        if exit_code != 0:
+        # The structured errors the task recorded (ctx.error, an uncaught RwError,
+        # rw_error), folded in as "<code>: <message>" so a classic consumer reads
+        # them like any other entry. They are notes, not failures: the exit code
+        # still decides the status. A task that failed with one has said why, so the
+        # generic "process exited N" (which an uncaught RwError's code replaces) is
+        # left out.
+        structured = errors_from_jsonl(scope_dir / _ERRORS_FILE)
+        errors.extend(f"{e['code']}: {e['message']}" for e in structured)
+        if exit_code != 0 and not structured:
             errors.append(f"process exited {exit_code}")
         if stream.overflowed:
             errors.append(
@@ -1225,6 +1235,32 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
+#: Sets RLIMIT_DATA, then becomes the real command. Run as `python -I -S -c <this> <bytes>
+#: <argv...>` so the limit is in force from the first instruction of the task's interpreter
+#: (or bash), and is inherited by whatever the task starts. -I -S: nothing in the scope or
+#: the site directories can shadow the three stdlib imports.
+_RLIMIT_DATA_LAUNCHER = (
+    "import os, resource, sys\n"
+    "limit = int(sys.argv[1])\n"
+    "resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))\n"
+    "os.execvp(sys.argv[2], sys.argv[2:])\n"
+)
+
+_memory_limit_noted = False
+
+
+def _with_memory_limit(argv: list[str], limit_bytes: int) -> list[str]:
+    return [sys.executable, "-I", "-S", "-c", _RLIMIT_DATA_LAUNCHER, str(limit_bytes), *argv]
+
+
+def _note_memory_limit_unsupported(log: logging.Logger) -> None:
+    """Once per process: the memory limit is not applied on this platform."""
+    global _memory_limit_noted  # noqa: PLW0603 -- a once-flag, not state anything reads
+    if not _memory_limit_noted:
+        _memory_limit_noted = True
+        log.debug("a task memory limit is only enforced on Linux; not applied on %s", sys.platform)
+
+
 def _execute(
     *,
     files_dir: Path,
@@ -1242,24 +1278,54 @@ def _execute(
     kubeconfig_path: str | None,
     tail_guard: int,
     log: logging.Logger,
+    extra_env: Mapping[str, str] | None = None,
+    lib_dir: Path | None = None,
+    home: Path | None = None,
+    path_prepend: Sequence[str] = (),
+    shim_env: Mapping[str, str] | None = None,
+    memory_limit_bytes: int | None = None,
 ) -> tuple[int, _EventStream, str, bool]:
     """Runs one setup/task file as a child process in its own process group,
     with `deadline_seconds` enforced by SIGKILL-ing the whole group. Returns
     (exit code, what was read off the output fd, combined stdout+stderr
     tail -- up to 2 * LOG_TAIL_BYTES, unredacted -- whether the deadline was
-    hit). Raises _LaunchError if the child could not be started at all."""
+    hit). Raises _LaunchError if the child could not be started at all.
+
+    The classic bundle path passes none of the keyword-only extras. The V13 path
+    (plugin/run.py) passes `extra_env` (variables added to the child's
+    environment after the host's own, so the caller owns what it puts there),
+    `lib_dir` (RW_LIB_DIR, where `files_dir/lib` is not the skill's lib/) and
+    `home` (a HOME other than the scope's private one: `rwtask run` on a developer's
+    machine, where the caller's own ~/.kube and ~/.aws are the credential),
+    `path_prepend` (directories put FIRST on the child's PATH: `rwtask test`'s shims) and
+    `shim_env` (the RW_SHIM_* variables those shims read: RW_* is otherwise never set from
+    outside, so plugin/run.py checks the names before passing them) and
+    `memory_limit_bytes` (CAP-7: the child's RLIMIT_DATA on Linux, applied by a small stdlib
+    launcher that execs the real argv, so nothing runs in a forked child of this threaded
+    process; skipped, with one debug line, where it is not enforced)."""
     base_env = {
         **_inherited_env(),
-        "HOME": str(scope_dir / _HOME_DIR),
+        **(extra_env or {}),
+        "HOME": str(home if home is not None else scope_dir / _HOME_DIR),
         "TMPDIR": str(scope_dir / _TMP_DIR),
         "RW_WORKDIR": str(scope_dir),
         # Not inherited (every RW_* is stripped): set here, for bash and Python alike.
         "RW_ARTIFACTS_DIR": str(scope_dir / _ARTIFACTS_DIR),
+        # The error side channel (a file the task appends JSON lines to: see
+        # envelope.errors_from_jsonl) and a directory the task may use freely.
+        "RW_ERRORS_FILE": str(scope_dir / _ERRORS_FILE),
+        "RW_OUT": str(scope_dir / _OUT_DIR),
         "RW_CAPABILITY": capability,
         "RW_OPERATION": operation,
+        # The bundle's lib/ (it may not exist): importable from Python tasks,
+        # sourceable from bash ones. RW_* is reserved, so no input can set it.
+        "RW_LIB_DIR": str(lib_dir if lib_dir is not None else files_dir / "lib"),
     }
     if kubeconfig_path:
         base_env["KUBECONFIG"] = kubeconfig_path
+    if path_prepend:
+        base_env["PATH"] = os.pathsep.join([*path_prepend, base_env.get("PATH", os.defpath)])
+    base_env.update(shim_env or {})
 
     if language == "bash":
         argv = ["bash", str(files_dir / file_path)]
@@ -1268,6 +1334,9 @@ def _execute(
             "RW_SDK": str(rw_sdk_dir),
             # command_not_found_handle (E_COMMAND_NOT_FOUND), read before the task runs.
             "BASH_ENV": str(rw_sdk_dir / "bash_env.sh"),
+            # The interpreter that has this SDK, for rw.sh's `rw_k8s_proxy_get`
+            # (`python3 -m runwhen_capability.k8s_proxy`), whatever python3 is on PATH.
+            "RW_PYTHON": sys.executable,
         }
         for name, value in resolved_inputs.items():
             text = value if isinstance(value, str) else json.dumps(value)
@@ -1297,6 +1366,12 @@ def _execute(
             "RW_CREDENTIALS_FILE": str(credentials_file),
             "RW_ALLOW_ANONYMOUS": "1" if allow_anonymous else "0",
         }
+
+    if memory_limit_bytes is not None:
+        if sys.platform.startswith("linux"):
+            argv = _with_memory_limit(argv, memory_limit_bytes)
+        else:
+            _note_memory_limit_unsupported(log)
 
     read_fd, write_fd = os.pipe()
     env["RW_OUTPUT_FD"] = str(write_fd)
@@ -1383,8 +1458,11 @@ def _execute(
 
 
 # Host-side variables a task has no business seeing: where the relay is, which
-# pool this executor serves, and where its bearer token is mounted.
-_HOST_ONLY_ENV = frozenset({"EXECUTOR_TOKEN_FILE", "RELAY_URL", "POOL_ID"})
+# pool this executor serves, and where its bearer token is mounted
+# (RW_EXECUTOR_TOKEN_FILE is the runner's new spelling; EXECUTOR_TOKEN_FILE the legacy one).
+_HOST_ONLY_ENV = frozenset(
+    {"RW_EXECUTOR_TOKEN_FILE", "EXECUTOR_TOKEN_FILE", "RELAY_URL", "POOL_ID"}
+)
 
 
 def _inherited_env() -> dict[str, str]:
@@ -1402,6 +1480,8 @@ def _inherited_env() -> dict[str, str]:
 _HOME_DIR = ".rw-home"
 _TMP_DIR = ".rw-tmp"
 _ARTIFACTS_DIR = "artifacts"
+_OUT_DIR = ".rw-out"
+_ERRORS_FILE = ".rw-errors.jsonl"
 
 
 def _prepare_scope(scope_dir: Path) -> None:
@@ -1444,6 +1524,16 @@ def _reset_artifacts_dir(scope_dir: Path) -> None:
     whatever is there now is this request's own (a task may have replaced it)."""
     _fresh_dir(scope_dir / _ARTIFACTS_DIR)
     _write_private_file(scope_dir / _ARTIFACTS_DIR, _ARTIFACTS_MARKER, "")
+
+
+def _reset_task_channels(scope_dir: Path) -> None:
+    """Fresh for the next task: an empty `$RW_OUT`, and an empty error side
+    channel (`$RW_ERRORS_FILE`) -- what an earlier task wrote there is never this
+    task's."""
+    _fresh_dir(scope_dir / _OUT_DIR)
+    errors_file = scope_dir / _ERRORS_FILE
+    errors_file.unlink(missing_ok=True)
+    _write_private_file(scope_dir, _ERRORS_FILE, "")
 
 
 def _fresh_dir(path: Path, marker: str | None = None, what: str = "a bundle directory") -> None:

@@ -1,0 +1,10 @@
+# source: 50-connections-credentials.md "## Auth methods and the connection record (D67)"
+# fixture: the value under the top-level `connection:` key, dedented
+name: prod-east
+integration: kubernetes@1.4.0        # pins which authMethod definition applies; upgrades re-validate
+authMethod: gke
+credentialRef: { kind: vault, ref: secret/data/rw/gcp-prod-sa }   # a reference, never the material
+inputs: { project: acme-prod, location: us-east1, cluster: prod-east }
+runner: runner-a
+root: kubernetes/clusters/prod-east
+verified: { rules: { "sha256:ad702491246efc27d1d0d16dd4483e5c94ee633092217653db0ee5c7d15cd607": granted, "sha256:8ce2067f7f9ff60445ab9a651bcf5af79d9b48bc83e99a2147fd7a7c0914edc5": { verdict: partial, scope: [payments] } }, at: 2026-11-03T09:00:00Z, status: ok }   # D68   # fixture: two <hash …> keys, the `…` entry and `at: …` filled

@@ -1,0 +1,8 @@
+# source: 41a-integration-spec.md "## types.yaml"
+# redis plugin: the whole integration
+platform: redis
+types:
+  instance: { root: true, rootKey: [host, port], plural: instances }
+credentialTypes: { redis/url: { materialize: { env: [REDIS_URL] } } }
+authMethods: { password: { produces: redis/url, accepts: [k8s-secret, vault], native: passthrough } }
+entryPoints: {}                               # no discovery, no CLI: the connection's root is the only resource

@@ -1,0 +1,18 @@
+# source: 41a-integration-spec.md "## facets.yaml and schemas/"
+facets:
+  - key: k8sPods
+    title: Pods
+    description: Pod readiness, restarts and last exit reasons for the workload's pods.
+    appliesTo: { types: [deployment, statefulset, daemonset] }
+    populator: { kind: rollup, task: k8s-base/discover, output: podRollups }   # computed by the discovery task
+    volatility: state
+    schema: ./schemas/k8sPods.v1.json
+  - key: k8sSummary
+    title: Summary
+    appliesTo: { types: ["*"] }
+    populator:
+      kind: projection                                                          # JMESPath over the stored document
+      expression: "{age: metadata.creationTimestamp}"
+      expressionByType: { deployment: "{ready: …}", service: "{type: spec.type, ports: spec.ports[].port}" }
+    volatility: config
+    schema: ./schemas/k8sSummary.v1.json

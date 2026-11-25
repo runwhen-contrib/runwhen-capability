@@ -1,0 +1,60 @@
+# expect: /plugin/version does not match
+# fixture: the workspace plugin only has a 0.0.0-rev.<n> version
+apiVersion: runwhen.com/compiled-plugin/v1
+compiler: { name: rwtask, version: 0.5.0 }
+plugin:
+  name: workspace
+  version: 1.0.0
+  description: Workspace skill nightly-export-check
+integration: null
+skills:
+  - name: nightly-export-check
+    frontmatter:
+      name: nightly-export-check
+      description: Check that last night's export job wrote a fresh file to the shared volume.
+      runwhen:
+        role: cli
+        tags: [exports]
+    skillMdSha256: "sha256:ec5753b6ec9e0b43ad418418de5a938c0955b3f8e58ecfdeb7995e0217d7ff9e"
+    files:
+      - skills/nightly-export-check/SKILL.md
+      - skills/nightly-export-check/scripts/export_fresh.sh
+      - skills/nightly-export-check/tasks.yaml
+    runtime: generic@1
+    taskNames: [export-fresh]
+tasks:
+  - ref: "workspace:nightly-export-check/export-fresh"
+    skill: nightly-export-check
+    name: export-fresh
+    title: Export file is fresh
+    description: Reports the age of the newest file in the export directory.
+    script: skills/nightly-export-check/scripts/export_fresh.sh
+    runtime: generic@1
+    role: cli
+    readOnly: true
+    idempotent: false
+    dryRun: false
+    credentials: []
+    permissions: []
+    settings: {}
+    inputs:
+      directory: { type: string, default: /data/exports, description: Directory to inspect, required: false }
+    inputSchema:
+      $schema: https://json-schema.org/draft/2020-12/schema
+      type: object
+      additionalProperties: false
+      properties:
+        directory: { type: string, description: Directory to inspect, default: /data/exports }
+      required: []
+    outputs:
+      newest:
+        jsonSchema:
+          type: object
+          properties:
+            file: { type: string }
+            ageMinutes: { type: integer }
+          required: [file, ageMinutes]
+    tags: [exports]
+    hash: "sha256:dddc542092eac1d6d9d5f3dc29cf81d384953591101cd3ca23be44d6c3e3f8bf"
+rules: []
+knowledge: []

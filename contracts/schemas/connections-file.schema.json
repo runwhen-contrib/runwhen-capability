@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/connections-file/v1.json",
+  "title": "ConnectionsFile",
+  "description": "connections.yaml in a private plugin, or chart values: declared connections papi reconciles on startup (CON-10).",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "const": "runwhen.com/connections/v1"
+    },
+    "connections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+          },
+          "integration": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+          },
+          "authMethod": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+          },
+          "credentialRef": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/credentialRef"
+          },
+          "inputs": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "string",
+                "number",
+                "boolean",
+                "array"
+              ]
+            }
+          },
+          "runner": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "root": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resourcePath"
+          },
+          "selector": {
+            "type": "object",
+            "properties": {
+              "types": {
+                "type": "array",
+                "items": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/qualifiedType"
+                },
+                "minItems": 1,
+                "uniqueItems": true
+              },
+              "labels": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/labels"
+              },
+              "paths": {
+                "type": "array",
+                "items": {
+                  "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resourcePath"
+                },
+                "minItems": 1,
+                "uniqueItems": true
+              }
+            },
+            "additionalProperties": false,
+            "anyOf": [
+              {
+                "required": [
+                  "types"
+                ]
+              },
+              {
+                "required": [
+                  "paths"
+                ]
+              }
+            ]
+          },
+          "priority": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "integration",
+          "authMethod",
+          "credentialRef",
+          "runner"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1
+    }
+  },
+  "required": [
+    "connections"
+  ],
+  "additionalProperties": false
+}

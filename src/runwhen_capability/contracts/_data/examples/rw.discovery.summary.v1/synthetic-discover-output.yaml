@@ -1,0 +1,6 @@
+# source: synthetic; the `summary` output of 41a-integration-spec.md "The base skill" discover task (kind rw.discovery.summary.v1)
+counts: { cluster: 1, namespace: 14, deployment: 52, pod: 167 }
+partitions: { complete: 40, failed: 0, forbidden: 2, excluded: 1 }
+durationMs: 12034
+errors:
+  - { code: permission_denied, message: "pods is forbidden in namespace kube-system", scope: kube-system }

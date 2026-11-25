@@ -1,0 +1,37 @@
+# source: 42b-example-papi-skill.md "## papi-health"
+# skills/papi-health/tasks.yaml
+apiVersion: runwhen.com/tasks/v1
+runtime: kubernetes@1
+defaults:
+  credentials: kubernetes/kubeconfig     # the connection that discovered this Deployment supplies it
+  timeout: 60s
+settings:
+  latencyThresholdMs: { type: integer, default: 1500, description: A /healthz slower than this is flagged slow in the probe output }
+tasks:
+  - name: api-probe
+    title: papi API probe
+    description: >-
+      Calls papi /healthz and /livez through the Kubernetes API service proxy, measures
+      latency, and attaches recent warning events when either fails. These routes don't
+      check the database.
+    script: scripts/api_probe.sh
+    readOnly: true
+    permissions:
+      - { apiGroups: [""], resources: [services/proxy], verbs: [get] }
+      - { apiGroups: [""], resources: [events], verbs: [list] }
+    outputs:
+      probe:    { schema: "{ path: string, status: integer, latencyMs: integer, slow: boolean }[]" }
+
+  - name: worker-activity
+    title: Task worker activity
+    description: >-
+      Checks whether this release's taskiq worker finished any task in the window. The
+      worker has no probes, so a hung worker still shows Running and Ready.
+    script: scripts/worker_activity.sh
+    readOnly: true
+    permissions:
+      - { apiGroups: [""], resources: [pods, pods/log], verbs: [get, list] }
+    inputs:
+      since: { type: duration, default: 15m, description: Look-back window }
+    outputs:
+      activity: { schema: "{ pod: string, tasksCompleted: integer, lastTaskAt: datetime? }[]" }

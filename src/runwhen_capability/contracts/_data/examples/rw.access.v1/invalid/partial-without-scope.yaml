@@ -1,0 +1,5 @@
+# expect: /rules/0 'scope' is a required property
+rules:
+  - hash: "sha256:35a8b4c916aef9580e414dd3f1341e25d8ac68576bfdaf333b49c69941c4bbcf"
+    rule: { apiGroups: [""], resources: [pods], verbs: [get, list] }
+    verdict: partial

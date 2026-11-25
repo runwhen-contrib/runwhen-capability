@@ -107,7 +107,7 @@ class GitClient:
             git_args += ["-c", f"http.extraheader={header}"]
         git_args += args
 
-        proc = self._ctx.run(["git", *git_args], cwd=cwd, timeout=GIT_TIMEOUT)
+        proc = self._ctx.run(["git", *git_args], cwd=cwd, timeout=GIT_TIMEOUT, check=False)
         if check and proc.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
         return proc

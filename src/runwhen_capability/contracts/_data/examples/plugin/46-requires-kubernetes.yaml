@@ -1,0 +1,6 @@
+# source: 46-authoring-skills.md "## Extend or require"
+# plugin.yaml
+name: papi-skills        # fixture: added so the fragment is a complete plugin.yaml
+version: 0.1.0           # fixture: added
+description: Skills for papi.   # fixture: added
+requires: { kubernetes: ^0.2 }

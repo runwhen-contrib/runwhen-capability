@@ -1,0 +1,4 @@
+# expect: /root/canonicalKey/value should be non-empty
+counts: { cluster: 1 }
+root:
+  canonicalKey: { name: kubeSystemUid, value: "" }

@@ -1,0 +1,663 @@
+openapi: 3.1.0
+info:
+  title: RunWhen plugin registry
+  version: contracts-v1
+  description: |
+    DLV-0, frozen from lane D's proposal (contracts-v1). Changes go through a PR to runwhen-capability.
+
+    The install-local plugin registry (D32-D37). papi is its only online client: papi syncs the
+    index, installs versions by archive hash, and proxies archive bytes to runner-control, which
+    serves them to runners. The registry is cluster-internal (no ingress).
+
+    Hashes: the SHA-256 of the archive bytes (archive.md §1), `sha256:<hex>` in JSON, bare hex in paths.
+    Versions are semver 2.0 without a leading `v`. Plugin names match `^[a-z][a-z0-9-]{0,62}$`.
+    Everything a version returns is immutable once ingested, except `withdrawn`.
+servers:
+  - url: http://plugin-registry:8080
+security:
+  - bearerAuth: []
+tags:
+  - name: index
+  - name: archives
+  - name: runtimes
+  - name: sources
+  - name: admin
+paths:
+  /healthz:
+    get:
+      tags: [admin]
+      security: []
+      summary: Liveness
+      responses:
+        "200": {description: alive}
+  /readyz:
+    get:
+      tags: [admin]
+      security: []
+      summary: Readiness (database and blob store reachable)
+      responses:
+        "200": {description: ready}
+        "503": {$ref: "#/components/responses/Problem"}
+
+  /v1/index:
+    get:
+      tags: [index]
+      summary: The whole index in one document (papi's sync call)
+      description: |
+        Every plugin and every version's summary. `generation` increases on any change (ingest,
+        withdraw, import); papi stores it and sends `If-None-Match` with the last ETag.
+      parameters:
+        - $ref: "#/components/parameters/IfNoneMatch"
+        - name: includeWithdrawn
+          in: query
+          schema: {type: boolean, default: true}
+      responses:
+        "200":
+          description: The index
+          headers:
+            ETag: {$ref: "#/components/headers/ETag"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Index"}
+        "304": {description: Unchanged since the given ETag}
+
+  /v1/plugins:
+    get:
+      tags: [index]
+      summary: Plugins, with their latest non-withdrawn version
+      responses:
+        "200":
+          description: Plugins
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/PluginSummary"}
+  /v1/plugins/{name}/versions:
+    get:
+      tags: [index]
+      summary: Versions of one plugin, newest first (semver order)
+      parameters:
+        - $ref: "#/components/parameters/Name"
+      responses:
+        "200":
+          description: Versions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/VersionSummary"}
+        "404": {$ref: "#/components/responses/Problem"}
+  /v1/plugins/{name}/versions/{version}:
+    get:
+      tags: [index]
+      summary: One version's full index entry (includes the compiled plugin)
+      parameters:
+        - $ref: "#/components/parameters/Name"
+        - $ref: "#/components/parameters/Version"
+      responses:
+        "200":
+          description: The index entry
+          headers:
+            ETag: {$ref: "#/components/headers/ETag"}
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/IndexEntry"}
+        "404": {$ref: "#/components/responses/Problem"}
+  /v1/plugins/{name}/versions/{version}/archive:
+    get:
+      tags: [archives]
+      summary: The version's archive (same bytes as /v1/blobs/{sha256})
+      parameters:
+        - $ref: "#/components/parameters/Name"
+        - $ref: "#/components/parameters/Version"
+      responses:
+        "200": {$ref: "#/components/responses/Archive"}
+        "404": {$ref: "#/components/responses/Problem"}
+  /v1/plugins/{name}/versions/{version}:withdraw:
+    post:
+      tags: [admin]
+      summary: Withdraw a version (kill switch; the archive stays fetchable by hash for in-flight runs, D24)
+      parameters:
+        - $ref: "#/components/parameters/Name"
+        - $ref: "#/components/parameters/Version"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: {type: string, maxLength: 500}
+      responses:
+        "200":
+          description: Withdrawn
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VersionSummary"}
+        "404": {$ref: "#/components/responses/Problem"}
+
+  /v1/blobs/{sha256}:
+    parameters:
+      - $ref: "#/components/parameters/Sha256"
+    get:
+      tags: [archives]
+      summary: An archive by hash (the runner path, proxied by papi and runner-control)
+      description: "Served with `Cache-Control: public, max-age=31536000, immutable`; supports `Range`."
+      responses:
+        "200": {$ref: "#/components/responses/Archive"}
+        "404": {$ref: "#/components/responses/Problem"}
+    head:
+      tags: [archives]
+      summary: Whether the registry holds an archive
+      responses:
+        "200": {description: Present; `Content-Length` is the archive size}
+        "404": {description: Absent}
+
+  /v1/runtimes:
+    get:
+      tags: [runtimes]
+      summary: Runtime images, with references rewritten to the install's mirror
+      description: |
+        Skills say `runtime: kubernetes@1`; papi resolves `{image, digest}` for the lease here.
+        `image` is rewritten by the registry's mirror rules (longest matching prefix wins);
+        `upstreamImage` is the reference as published. Digests are never rewritten.
+      responses:
+        "200":
+          description: Runtimes
+          headers:
+            ETag: {$ref: "#/components/headers/ETag"}
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Runtime"}
+  /v1/runtimes/{name}/{major}:
+    get:
+      tags: [runtimes]
+      summary: One runtime major
+      parameters:
+        - {name: name, in: path, required: true, schema: {type: string, pattern: "^[a-z][a-z0-9-]{0,62}$"}}
+        - {name: major, in: path, required: true, schema: {type: integer, minimum: 0}}
+      responses:
+        "200":
+          description: The runtime
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Runtime"}
+        "404": {$ref: "#/components/responses/Problem"}
+
+  /v1/sources:
+    get:
+      tags: [sources]
+      summary: Configured sources and their sync status
+      responses:
+        "200":
+          description: Sources
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: "#/components/schemas/Source"}
+  /v1/sources/{id}:sync:
+    post:
+      tags: [sources]
+      summary: Sync a source now (asynchronous)
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        "202":
+          description: Sync queued; poll GET /v1/sources
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Source"}
+        "404": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
+
+  /v1/sources/{id}:publish:
+    post:
+      tags: [sources]
+      summary: Publish one plugin version to a git source (lane D M4 addendum)
+      description: |
+        Lane D M4 addendum to contracts-v1. The body is a plugin tree as a tar (gzip allowed). The
+        registry validates and compiles it as for an upload, commits it under the source's `path`
+        on `write.branch`, tags the commit with the source's `tagPattern`, pushes both atomically,
+        and ingests the tag exactly as a sync would. Only a source with a `write:` config accepts
+        it (`E_WRITE_DISABLED`, 403, otherwise). Nothing is pushed unless the tree is valid and
+        neither a name nor a version conflict is known.
+
+        The commit replaces the files under the plugin's directory with the tree. What the archive
+        leaves out (root `tests/`, `runwhen.lock`, `.runwhen/`, `skills/*/tests/`) is kept from the
+        branch when the tree carries none of it; a tree that carries any of it is authoritative for
+        the whole directory. A `:draft` commit follows the same rule.
+
+        201 when this call pushed the version; 200 when the tag already existed with the same
+        content (an idempotent retry). A tag that exists with other content is
+        `E_VERSION_CONFLICT`; a branch that moved twice during the call is `E_BRANCH_MOVED`; a
+        source busy for longer than the wait is `E_BUSY`. A git or credential failure is 502
+        `E_UNAVAILABLE`.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+        - name: message
+          in: query
+          required: false
+          description: Commit message. Default `<name> v<version>`. At most 4096 bytes, no NUL.
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/x-tar: {schema: {type: string, format: binary}}
+          application/gzip: {schema: {type: string, format: binary}}
+      responses:
+        "200":
+          description: The tag already existed with the same content
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/IndexEntry"}
+        "201":
+          description: Committed, tagged, pushed and ingested
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/IndexEntry"}
+        "403": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "502": {$ref: "#/components/responses/Problem"}
+
+  /v1/sources/{id}:draft:
+    post:
+      tags: [sources]
+      summary: Commit a work-in-progress plugin tree to a draft branch (lane D M4 addendum)
+      description: |
+        Lane D M4 addendum to contracts-v1. Build mode saves its work here. The body is a plugin
+        tree as a tar (gzip allowed). The registry normalises it (unsafe paths and the size limits
+        are `E_INVALID_PLUGIN` / `E_ARCHIVE_TOO_LARGE`), reads the plugin name from `plugin.yaml`
+        for the directory (`path` with `{name}` replaced), and commits the tree there on `branch`.
+        A draft is **not** compiled or validated as a plugin: it may be unfinished. Its paths must
+        still be part of the plugin layout (`E_INVALID_PLUGIN` with `E_PATH_NOT_ALLOWED` details).
+        Nothing is tagged and nothing is ingested, so the index and its generation do not change.
+        Only a source with a `write:` config accepts it (`E_WRITE_DISABLED`, 403, otherwise).
+
+        `branch` must start with the source's `write.draftPrefix` and pass git's branch-name rules
+        (`E_BAD_REQUEST` otherwise). A branch that does not exist yet starts from `write.branch`;
+        an existing one gets a new commit on top. A tree equal to the branch's tip commits nothing:
+        the answer is 201 with `changed: false` and the tip's commit; a branch that did not exist
+        yet is still created, at the base tip, so the branch always exists afterwards (nothing is
+        committed). A single-plugin source only takes a tree for its own plugin. A branch that
+        moved twice during the call is `E_BRANCH_MOVED`; a source busy for longer than the wait is
+        `E_BUSY`. A git or credential failure is 502 `E_UNAVAILABLE`.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+        - name: branch
+          in: query
+          required: true
+          description: The draft branch, starting with the source's `write.draftPrefix`.
+          schema: {type: string}
+        - name: message
+          in: query
+          required: false
+          description: 'Commit message. Default `draft: <name>`. At most 4096 bytes, no NUL.'
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/x-tar: {schema: {type: string, format: binary}}
+          application/gzip: {schema: {type: string, format: binary}}
+      responses:
+        "201":
+          description: The draft branch holds the tree (`changed` says whether a commit was pushed)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DraftResult"}
+        "403": {$ref: "#/components/responses/Problem"}
+        "404": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+        "502": {$ref: "#/components/responses/Problem"}
+
+  /v1/uploads:
+    post:
+      tags: [sources]
+      summary: Upload one plugin version (the no-git path, D33/D4)
+      description: |
+        The body is a plugin tree as a tar (gzip allowed). The registry normalises it per
+        archive.md §3, reads `plugin.yaml` for name and version, validates and compiles it with the
+        SDK, and ingests it under the `upload` source. Re-uploading identical content is a no-op
+        (200); different content for an existing version is `E_VERSION_CONFLICT`. Uploads,
+        publishes and drafts share a small number of processing slots; when none frees up within
+        a few seconds the answer is 409 `E_BUSY` and the caller retries.
+      requestBody:
+        required: true
+        content:
+          application/x-tar: {schema: {type: string, format: binary}}
+          application/gzip: {schema: {type: string, format: binary}}
+      responses:
+        "200":
+          description: Already present with the same hash
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/IndexEntry"}
+        "201":
+          description: Ingested
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/IndexEntry"}
+        "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+
+  /v1/snapshot:
+    get:
+      tags: [admin]
+      summary: Export a snapshot for an air-gapped install (archive.md §6)
+      description: |
+        `runtimes`: git-published runtimes only. The registry's own config-file runtimes are
+        install-local chart config and are not exported.
+      parameters:
+        - name: plugin
+          in: query
+          description: Restrict to these plugins (repeatable). Default all.
+          schema: {type: array, items: {type: string}}
+          style: form
+          explode: true
+        - name: latestOnly
+          in: query
+          description: Only the newest non-withdrawn release of each plugin, or its newest prerelease when it has no release (the index's `latest` rule).
+          schema: {type: boolean, default: false}
+        - name: release
+          in: query
+          description: Recorded as `snapshot.json` `release`.
+          schema: {type: string}
+      responses:
+        "200":
+          description: The snapshot tar
+          headers:
+            X-Snapshot-Sha256: {description: sha256 of the body, schema: {type: string}}
+          content:
+            application/x-tar: {schema: {type: string, format: binary}}
+        "404": {$ref: "#/components/responses/Problem"}
+        "409": {$ref: "#/components/responses/Problem"}
+  /v1/import:
+    post:
+      tags: [admin]
+      summary: Import a snapshot (air-gap and offline bundles between releases)
+      parameters:
+        - name: expectedSha256
+          in: query
+          description: The snapshot hash from the platform release manifest; when given, a mismatch rejects the import.
+          schema: {$ref: "#/components/schemas/Sha256"}
+      requestBody:
+        required: true
+        content:
+          application/x-tar: {schema: {type: string, format: binary}}
+          application/gzip: {schema: {type: string, format: binary}}
+      responses:
+        "200":
+          description: Imported (all or nothing)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ImportResult"}
+        "409": {$ref: "#/components/responses/Problem"}
+        "413": {$ref: "#/components/responses/Problem"}
+        "422": {$ref: "#/components/responses/Problem"}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        One service token per install (chart secret), held by papi. RC1 has no per-user auth: the
+        registry is cluster-internal and papi applies org policy and admin checks before calling
+        a write route.
+  parameters:
+    Name:
+      name: name
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/PluginName"}
+    Version:
+      name: version
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Semver"}
+    Sha256:
+      name: sha256
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Sha256Hex"}
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      schema: {type: string}
+  headers:
+    ETag:
+      description: Strong ETag; for archives it is the quoted sha256.
+      schema: {type: string}
+  responses:
+    Archive:
+      description: The archive bytes (archive.md); verify the sha256 before use
+      headers:
+        ETag: {description: '"<sha256>"', schema: {type: string}}
+        Content-Length: {schema: {type: integer}}
+        X-Archive-Sha256: {schema: {$ref: "#/components/schemas/Sha256"}}
+      content:
+        application/x-tar: {schema: {type: string, format: binary}}
+    Problem:
+      description: An error
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+  schemas:
+    PluginName: {$ref: "schemas/common.schema.json#/$defs/slug"}
+    Semver: {$ref: "schemas/common.schema.json#/$defs/semver"}
+    Sha256: {$ref: "schemas/common.schema.json#/$defs/sha256"}
+    Sha256Hex: {type: string, pattern: "^[0-9a-f]{64}$", description: Path form}
+    Problem:
+      type: object
+      required: [code, title, status]
+      properties:
+        code:
+          type: string
+          enum:
+            - E_NOT_FOUND
+            - E_UNAUTHORIZED
+            - E_INVALID_PLUGIN        # validation or compile failed (details[] has the SDK's findings)
+            - E_INCOMPATIBLE          # D22 check against the previous release failed
+            - E_VERSION_CONFLICT      # same name+version, different bytes
+            - E_NAME_CONFLICT         # the plugin name belongs to another source
+            - E_HASH_MISMATCH
+            - E_INVALID_SNAPSHOT      # a snapshot's layout or manifest is malformed
+            - E_ARCHIVE_TOO_LARGE
+            - E_SYNC_IN_PROGRESS
+            - E_BUSY                  # another export/import (or source write) is running
+            - E_UNAVAILABLE
+            - E_BRANCH_MOVED          # the branch moved twice during a publish or draft
+            - E_WRITE_DISABLED        # the source has no write: config
+            - E_BAD_REQUEST           # a request parameter or body that is malformed (not a plugin or snapshot problem) (any 4xx status)
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        details:
+          type: array
+          items:
+            type: object
+            required: [message]
+            properties:
+              path: {type: string}
+              message: {type: string}
+    SourceRef:
+      type: object
+      description: Where a version came from.
+      required: [kind, id]
+      properties:
+        kind: {type: string, enum: [public, git, upload, snapshot]}
+        id: {type: string, description: The source's configured id}
+        repo: {type: [string, "null"], description: Git URL without credentials}
+        path: {type: [string, "null"], description: Directory in the repo that is the archive root}
+        tag: {type: [string, "null"], description: "e.g. kubernetes/v1.4.0"}
+        commit: {type: [string, "null"], pattern: "^[0-9a-f]{40}$"}
+    ArchiveRef:
+      type: object
+      required: [sha256, size]
+      properties:
+        sha256: {$ref: "#/components/schemas/Sha256"}
+        size: {type: integer, minimum: 0}
+        files: {type: integer, minimum: 0}
+    Withdrawn:
+      type: [object, "null"]
+      required: [at, reason]
+      properties:
+        at: {type: string, format: date-time}
+        reason: {type: string}
+    PluginSummary:
+      type: object
+      required: [name, latest, description, hasIntegration, source]
+      properties:
+        name: {$ref: "#/components/schemas/PluginName"}
+        latest: {type: [string, "null"], description: Newest non-withdrawn, non-prerelease version}
+        latestPrerelease: {type: [string, "null"]}
+        description: {type: string}
+        hasIntegration: {type: boolean}
+        source: {$ref: "#/components/schemas/SourceRef"}
+    VersionSummary:
+      type: object
+      required: [name, version, archive, source, ingestedAt, withdrawn]
+      properties:
+        name: {$ref: "#/components/schemas/PluginName"}
+        version: {$ref: "#/components/schemas/Semver"}
+        archive: {$ref: "#/components/schemas/ArchiveRef"}
+        source: {$ref: "#/components/schemas/SourceRef"}
+        requires: {$ref: "#/components/schemas/Requires"}
+        runtimes:
+          type: array
+          description: Runtime majors the plugin's tasks use, e.g. ["kubernetes@1"]
+          items: {type: string, pattern: "^[a-z][a-z0-9-]*@\\d+$"}
+        ingestedAt: {type: string, format: date-time}
+        withdrawn: {$ref: "#/components/schemas/Withdrawn"}
+    Requires:
+      type: object
+      properties:
+        platform: {type: string, description: 'Semver range, e.g. ">=2026.11"'}
+        plugins:
+          type: object
+          additionalProperties: {type: string, description: Semver range}
+    IndexEntry:
+      allOf:
+        - $ref: "#/components/schemas/VersionSummary"
+        - type: object
+          required: [compiled, sdkVersion]
+          properties:
+            compiled:
+              description: The compiled plugin as `rwtask compile` emits it.
+              $ref: "schemas/compiled-plugin.schema.json"
+            sdkVersion: {type: string, description: runwhen-capability version that validated and compiled it}
+    Index:
+      type: object
+      required: [generation, plugins]
+      properties:
+        generation: {type: integer, minimum: 0}
+        plugins:
+          type: array
+          items:
+            type: object
+            required: [name, description, hasIntegration, versions]
+            properties:
+              name: {$ref: "#/components/schemas/PluginName"}
+              description: {type: string}
+              hasIntegration: {type: boolean}
+              versions:
+                type: array
+                items: {$ref: "#/components/schemas/VersionSummary"}
+    Runtime:
+      type: object
+      required: [name, major, image, upstreamImage, digests]
+      properties:
+        name: {type: string}
+        major: {type: integer, minimum: 0}
+        version: {type: string, description: Full version of the current image, e.g. 1.3.2}
+        image: {type: string, description: Repository reference after mirror rewrite, no tag or digest}
+        upstreamImage: {type: string}
+        digests:
+          type: object
+          description: Platform → manifest digest; a multi-arch index digest is under "index".
+          additionalProperties: {type: string, pattern: "^sha256:[0-9a-f]{64}$"}
+        tools:
+          type: object
+          description: Tool → version shipped in the image (kubectl, helm, oc, flux, argocd, git, ...).
+          additionalProperties: {type: string}
+        mirrored: {type: boolean, description: True when a mirror rule rewrote `image`}
+    Source:
+      type: object
+      required: [id, kind, status]
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [public, git, upload, snapshot]}
+        repo: {type: [string, "null"]}
+        tagPattern: {type: [string, "null"], description: 'Default "<name>/v<semver>" for multi-plugin repos, "v<semver>" for single-plugin repos'}
+        credentialRef:
+          type: [string, "null"]
+          description: Name of the git credential (a secret the registry reads); never the secret itself.
+        status: {type: string, enum: [idle, syncing, ok, error, disabled]}
+        lastSyncAt: {type: [string, "null"], format: date-time}
+        lastError: {type: [string, "null"]}
+        versionsIngested: {type: integer}
+        rejected:
+          type: array
+          description: Tags seen but not ingested at the last sync, with the reason.
+          items:
+            type: object
+            required: [tag, code]
+            properties:
+              tag: {type: string}
+              code: {type: string}
+              detail: {type: string}
+    DraftResult:
+      type: object
+      required: [source, branch, commit, path, changed]
+      properties:
+        source: {type: string}
+        branch: {type: string}
+        commit:
+          type: string
+          description: The draft branch's tip after the call.
+        path:
+          type: string
+          description: The plugin's directory in the repository; "" is the repository root.
+        changed:
+          type: boolean
+          description: False when the tree equalled the tip and nothing was pushed.
+    ImportResult:
+      type: object
+      required: [snapshotSha256, imported, skipped]
+      properties:
+        snapshotSha256: {$ref: "#/components/schemas/Sha256"}
+        release: {type: [string, "null"]}
+        imported:
+          type: array
+          items: {type: object, properties: {name: {type: string}, version: {type: string}, sha256: {type: string}}}
+        skipped:
+          type: array
+          description: Already present with the same hash.
+          items: {type: object, properties: {name: {type: string}, version: {type: string}, sha256: {type: string}}}
+        runtimes: {type: integer}

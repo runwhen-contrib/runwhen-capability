@@ -1,0 +1,11 @@
+# source: 42a-skill-spec.md "### The result envelope (D64)"
+status: partial   # fixture: placeholder `ok | partial | failed` filled (two errors, so partial)
+startedAt: 2026-11-03T09:14:02Z            # RFC 3339, filled by the platform
+finishedAt: 2026-11-03T09:14:09Z
+outputs: { rollout: [{ replicaSet: payments-api-7d9f, ready: false }], events: { artifact: "art_01HXYZ", truncated: true } }   # fixture: `[...]` and `art_…` filled
+errors:
+  - code: permission_denied
+    message: "pods is forbidden in namespace kube-system"
+  - code: unreachable
+    message: "metrics-server: dial tcp 10.0.0.12:443: i/o timeout"
+    scope: metrics-server

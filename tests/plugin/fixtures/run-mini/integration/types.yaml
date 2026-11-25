@@ -1,0 +1,4 @@
+types:
+  cluster: { root: true, rootKey: server, plural: clusters }
+  namespace: { parent: cluster, plural: namespaces }
+  deployment: { parent: namespace, plural: deployments }

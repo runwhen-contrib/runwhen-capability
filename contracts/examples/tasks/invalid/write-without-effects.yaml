@@ -1,0 +1,9 @@
+# expect: /tasks/0 'effects' is a required property
+apiVersion: runwhen.com/tasks/v1
+tasks:
+  - name: rollout-status
+    title: Rollout status
+    description: Is the latest rollout progressing, stuck or failed, and why?
+    script: scripts/rollout_status.py
+    readOnly: false
+    destructive: false

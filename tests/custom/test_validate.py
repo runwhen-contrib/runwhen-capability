@@ -1066,3 +1066,17 @@ def test_w_unused_input_accepts_a_read_under_the_legacy_env_name():
     assert _of(files, W_UNUSED_INPUT) == []
     files = _warn_bundle("tasks/t.sh", 'curl -H "$T_O_K_E_N"\n', "  TOKEN: { type: secret }")
     assert _of(files, W_UNUSED_INPUT) == []
+
+
+def test_e_undeclared_input_bash_rw_now_is_standard_environment():
+    files = {
+        "capability.yaml": """\
+apiVersion: runwhen.com/custom-capability/v1
+name: x
+tasks:
+  - name: t
+    file: tasks/t.sh
+""",
+        "tasks/t.sh": 'echo "$RW_NOW $RW_NOW_EPOCH"\n',
+    }
+    assert E_UNDECLARED_INPUT not in _codes(files)

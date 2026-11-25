@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/knowledge-frontmatter/v1.json",
+  "title": "KnowledgeFrontmatter",
+  "description": "knowledge/<name>.md frontmatter (D61). Never injected.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "appliesTo": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/appliesTo"
+    },
+    "resources": {
+      "type": "array",
+      "items": {
+        "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resourcePath"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "tags": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/tags"
+    }
+  },
+  "required": [
+    "name",
+    "description"
+  ],
+  "additionalProperties": false
+}

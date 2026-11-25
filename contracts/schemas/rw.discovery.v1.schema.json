@@ -1,0 +1,495 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/rw.discovery.v1/v1.json",
+  "title": "DiscoverySync",
+  "description": "The discovery sync contract (D66): a recorded sync is open + item batches + commit. Each wire body validates against its $def; papi mints paths and parents from identity chains, derives edges from dependency rules, and sweeps unseen resources only in `complete` partitions.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "const": "rw.discovery.v1"
+    },
+    "open": {
+      "$ref": "#/$defs/open"
+    },
+    "batches": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/itemsBatch"
+      },
+      "minItems": 1
+    },
+    "commit": {
+      "$ref": "#/$defs/commit"
+    }
+  },
+  "required": [
+    "apiVersion",
+    "open",
+    "batches",
+    "commit"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "syncCredential": {
+      "type": "object",
+      "properties": {
+        "apiBaseUrl": {
+          "type": "string",
+          "format": "uri"
+        },
+        "token": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "workspace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        }
+      },
+      "required": [
+        "apiBaseUrl",
+        "token",
+        "workspace",
+        "expiresAt",
+        "scopes"
+      ],
+      "additionalProperties": false,
+      "description": "The `runwhen/sync` credential: JSON in the file at $RW_SYNC_CREDENTIAL, minted per run (D44 exception)."
+    },
+    "discoveredType": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeName"
+        },
+        "parent": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
+        },
+        "plural": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$"
+        },
+        "native": {
+          "type": "object"
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "uniqueItems": true
+        },
+        "ephemeral": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "parent",
+        "plural"
+      ],
+      "additionalProperties": false
+    },
+    "item": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "type": "object",
+          "properties": {
+            "platform": {
+              "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+            },
+            "chain": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeName"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "additionalProperties": false
+              },
+              "minItems": 1
+            }
+          },
+          "required": [
+            "platform",
+            "chain"
+          ],
+          "additionalProperties": false
+        },
+        "providerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "labels": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/labels"
+        },
+        "document": {
+          "type": "object"
+        },
+        "status": {
+          "type": "object"
+        },
+        "rollups": {
+          "type": "object",
+          "additionalProperties": true,
+          "propertyNames": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/camelName"
+          }
+        }
+      },
+      "required": [
+        "identity",
+        "document"
+      ],
+      "additionalProperties": false
+    },
+    "open": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50
+        },
+        "scopePath": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resourcePath"
+        },
+        "mode": {
+          "const": "full"
+        },
+        "taskRun": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "configHash": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "discoveredTypes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeName"
+              },
+              "parent": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeRef"
+              },
+              "plural": {
+                "type": "string",
+                "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$"
+              },
+              "native": {
+                "type": "object"
+              },
+              "aliases": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                },
+                "uniqueItems": true
+              },
+              "ephemeral": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "parent",
+              "plural"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "source",
+        "scopePath",
+        "mode"
+      ],
+      "additionalProperties": false
+    },
+    "openResult": {
+      "type": "object",
+      "properties": {
+        "syncId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255
+        },
+        "leaseExpiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "syncId",
+        "leaseExpiresAt"
+      ],
+      "additionalProperties": false
+    },
+    "itemsBatch": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/item"
+          },
+          "minItems": 1,
+          "maxItems": 500
+        }
+      },
+      "required": [
+        "seq",
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "itemsResult": {
+      "type": "object",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "accepted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "created": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unchanged": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rejected": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "code": {
+                "enum": [
+                  "unknown_type",
+                  "bad_name",
+                  "parent_missing",
+                  "out_of_scope",
+                  "bad_rollup"
+                ]
+              },
+              "detail": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "index",
+              "code"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "seq",
+        "accepted",
+        "rejected"
+      ],
+      "additionalProperties": false
+    },
+    "partition": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeName"
+        },
+        "parentPath": {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resourcePath"
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "failed",
+            "forbidden",
+            "excluded"
+          ]
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "type",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "commit": {
+      "type": "object",
+      "properties": {
+        "partitions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/typeName"
+              },
+              "parentPath": {
+                "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/resourcePath"
+              },
+              "status": {
+                "enum": [
+                  "complete",
+                  "failed",
+                  "forbidden",
+                  "excluded"
+                ]
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              }
+            },
+            "required": [
+              "type",
+              "status"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "summary": {
+          "$ref": "https://schemas.runwhen.com/rw.discovery.summary.v1/v1.json"
+        }
+      },
+      "required": [
+        "partitions"
+      ],
+      "additionalProperties": false
+    },
+    "commitResult": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "committed",
+            "held"
+          ]
+        },
+        "counts": {
+          "type": "object",
+          "properties": {
+            "created": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "updated": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "unchanged": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "deleted": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "held": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "heldReason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "status",
+        "counts"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

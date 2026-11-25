@@ -1,0 +1,14 @@
+apiVersion: runwhen.com/integration/v1
+platform: kubernetes
+title: Kubernetes
+credentialTypes:
+  kubernetes/kubeconfig:
+    title: kubeconfig file
+    content: kubeconfig
+    materialize: { file: { env: KUBECONFIG, mode: "0600" } }
+authMethods:
+  kubeconfig:
+    title: kubeconfig Secret
+    produces: kubernetes/kubeconfig
+    accepts: [k8s-secret, vault, file]
+    native: passthrough

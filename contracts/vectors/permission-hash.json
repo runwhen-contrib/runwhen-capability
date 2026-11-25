@@ -1,0 +1,157 @@
+{
+  "description": "permission_hash(input): sha256 of the canonical JSON of the rule with None/empty-list keys dropped and every list de-duplicated and sorted by the canonical JSON of each item.",
+  "cases": [
+    {
+      "name": "apps deployments and replicasets",
+      "input": {
+        "apiGroups": [
+          "apps"
+        ],
+        "resources": [
+          "deployments",
+          "replicasets"
+        ],
+        "verbs": [
+          "get",
+          "list"
+        ]
+      },
+      "expected": "sha256:e31a56d4f4393463a6608de2fe00e729eb0f8ec70da528ba7b71ecd7244cc311"
+    },
+    {
+      "name": "same rule, shuffled lists and an empty key",
+      "input": {
+        "verbs": [
+          "list",
+          "get"
+        ],
+        "resources": [
+          "replicasets",
+          "deployments"
+        ],
+        "apiGroups": [
+          "apps"
+        ],
+        "nonResourceURLs": []
+      },
+      "expected": "sha256:e31a56d4f4393463a6608de2fe00e729eb0f8ec70da528ba7b71ecd7244cc311"
+    },
+    {
+      "name": "core group is the empty string, not an empty list",
+      "input": {
+        "apiGroups": [
+          ""
+        ],
+        "resources": [
+          "events"
+        ],
+        "verbs": [
+          "list"
+        ]
+      },
+      "expected": "sha256:fda36b2f5e241a82ddf967790196a3c8bdb1d3321b9a8d76f57ec40c5c8343ef"
+    },
+    {
+      "name": "empty apiGroups list is dropped",
+      "input": {
+        "apiGroups": [],
+        "resources": [
+          "events"
+        ],
+        "verbs": [
+          "list"
+        ]
+      },
+      "expected": "sha256:45b56e8890da3f3b9a6e43f1d75133f40838f138c82ba640322b7d583d19dedc"
+    },
+    {
+      "name": "non-resource URL",
+      "input": {
+        "nonResourceURLs": [
+          "/version"
+        ],
+        "verbs": [
+          "get"
+        ]
+      },
+      "expected": "sha256:138b07172decda6011599b21a17bc0b7e302c95082b7598427c83964b492987c"
+    },
+    {
+      "name": "wildcards",
+      "input": {
+        "apiGroups": [
+          "*"
+        ],
+        "resources": [
+          "*"
+        ],
+        "verbs": [
+          "get",
+          "list",
+          "watch"
+        ]
+      },
+      "expected": "sha256:a5893e0188a6e0da5360ffc9d9a156f1e2c3a58cf7d4c46d1a53b9b6991a2d50"
+    },
+    {
+      "name": "duplicates collapse",
+      "input": {
+        "apiGroups": [
+          "apps"
+        ],
+        "verbs": [
+          "get",
+          "get",
+          "list",
+          "get"
+        ]
+      },
+      "expected": "sha256:f019eb69f444e3e5af1738bcd245d209a3cdcf9d1ff58676d8027a0e6e702c6d"
+    },
+    {
+      "name": "null value is dropped",
+      "input": {
+        "apiGroups": [
+          "apps"
+        ],
+        "resourceNames": null,
+        "verbs": [
+          "get"
+        ]
+      },
+      "expected": "sha256:f6685ae7e71c477223687b8fef1f458d8ffa0040a1c9880459982ae8a6000f14"
+    },
+    {
+      "name": "nested dict with an empty list inside",
+      "input": {
+        "resources": [
+          "pods"
+        ],
+        "verbs": [
+          "get"
+        ],
+        "selector": {
+          "labels": [],
+          "ns": [
+            "b",
+            "a"
+          ]
+        }
+      },
+      "expected": "sha256:f19094347e02087194bb28fb8f085c1acef4d53bb7d4d5404db00de1d7f5d754"
+    },
+    {
+      "name": "unicode resource name",
+      "input": {
+        "resourceNames": [
+          "naïve",
+          "café"
+        ],
+        "verbs": [
+          "get"
+        ]
+      },
+      "expected": "sha256:b133f452813b85d4103c63043b5bd1162225da9f251c09598fc0e0557eb280c2"
+    }
+  ]
+}

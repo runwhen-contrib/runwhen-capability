@@ -1,0 +1,5 @@
+apiVersion: runwhen.com/plugin/v1
+name: kubernetes
+version: 0.1.0
+description: A small Kubernetes plugin - inventory, a read-only kubectl and workload health.
+license: Apache-2.0

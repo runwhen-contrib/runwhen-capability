@@ -1,0 +1,3 @@
+# expect: /code 'oops' is not one of
+code: oops
+message: something went wrong

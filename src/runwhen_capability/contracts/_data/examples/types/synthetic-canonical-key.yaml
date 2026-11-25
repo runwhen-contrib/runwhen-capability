@@ -1,0 +1,4 @@
+# source: synthetic (no wiki example); types.yaml with an identity-bearing canonicalKey on the root (contracts-v3, V2-3)
+types:
+  cluster:   { root: true, rootKey: server, canonicalKey: kubeSystemUid, plural: clusters }
+  namespace: { parent: cluster, plural: namespaces, aliases: [ns], native: { group: "", kind: Namespace } }

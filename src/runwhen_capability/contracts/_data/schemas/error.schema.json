@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/error/v1.json",
+  "title": "Error",
+  "description": "An execution failure: the task failed to look (D64). Not an issue.",
+  "type": "object",
+  "properties": {
+    "code": {
+      "enum": [
+        "permission_denied",
+        "not_found",
+        "unreachable",
+        "timeout",
+        "rate_limited",
+        "storage",
+        "invalid_input",
+        "dependency",
+        "internal"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "hint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "details": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "code",
+    "message"
+  ],
+  "additionalProperties": false
+}

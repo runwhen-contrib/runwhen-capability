@@ -1,0 +1,7 @@
+# expect: /errors is expected to be empty
+status: ok
+startedAt: 2026-11-03T09:14:02Z
+finishedAt: 2026-11-03T09:14:09Z
+outputs: {}
+errors:
+  - { code: timeout, message: "kubectl get pods timed out after 30s" }

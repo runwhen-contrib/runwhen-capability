@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "properties": {
+      "replicaSet": { "type": "string" },
+      "ready": { "type": "integer" },
+      "desired": { "type": "integer" }
+    },
+    "required": ["replicaSet"]
+  }
+}

@@ -1,0 +1,17 @@
+# source: synthetic (no wiki example); consistent with 42b-example-papi-skill.md (generic connection scoped by selector, D44)
+apiVersion: runwhen.com/connection/v1
+name: pgbouncer-papi
+integration: generic@1.0.0
+authMethod: env
+credentialRef:
+  kind: k8s-secret
+  ref: runwhen/pgbouncer-credentials
+  keys: { PGUSER: user, PGPASSWORD: password }
+runner: runner-a
+selector:
+  types: [kubernetes/deployment]
+  labels: { app.kubernetes.io/component: pgbouncer }
+priority: 10
+state: active
+origin: manual
+verified: { status: ok, at: 2026-11-03T09:05:00Z }

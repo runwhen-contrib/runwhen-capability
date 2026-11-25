@@ -1,0 +1,9 @@
+# source: synthetic (no wiki example); the reference material the runner sends for the gke script plan in ../synthetic-gke.yaml (contracts-v4)
+credentialType: kubernetes/kubeconfig
+reference:
+  files:
+    - key: key.json
+      content: '{"type": "service_account", "project_id": "acme-prod", "client_email": "rw-prod@acme-prod.iam.gserviceaccount.com"}'
+    - key: note
+      content: c3ludGhldGljIG5vdGU=
+      encoding: base64

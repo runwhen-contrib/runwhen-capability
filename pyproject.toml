@@ -16,7 +16,11 @@ dependencies = [
     "requests>=2.31",
     # An early 413/503 relay response is only readable mid-upload on urllib3 2.x.
     "urllib3>=2",
-    "jsonschema>=4.18",
+    "jsonschema[format-nongpl]>=4.23,<5",
+    # Plugin-authored JSON Schema `pattern`s run on RE2, never on backtracking `re` (S13).
+    # Newer releases ship cp312/cp313/cp314 wheels for macOS 13+ and manylinux_2_28; 1.1 covers
+    # older macOS and manylinux2014.
+    "google-re2>=1.1,<2",
 ]
 
 [project.urls]
@@ -26,11 +30,17 @@ Source = "https://github.com/runwhen-contrib/runwhen-capability"
 rwtask = "runwhen_capability.cli:main"
 
 [project.optional-dependencies]
+# `rwtask port` reads classic Robot bundles.
+port = ["robotframework>=7"]
 dev = [
     "build>=1",
+    # Generates contracts/models; the pin is exact because the output is committed.
+    "datamodel-code-generator==0.88.0",
+    "openapi-spec-validator==0.9.0",
     "pytest>=8",
     "responses>=0.25",
-    "ruff>=0.16",
+    "robotframework>=7",
+    "ruff==0.17.3",
 ]
 
 [tool.setuptools.dynamic]
@@ -38,6 +48,10 @@ version = { attr = "runwhen_capability.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The packaged copy of contracts/ (see scripts/sync_contracts.py).
+[tool.setuptools.package-data]
+"runwhen_capability.contracts" = ["_data/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

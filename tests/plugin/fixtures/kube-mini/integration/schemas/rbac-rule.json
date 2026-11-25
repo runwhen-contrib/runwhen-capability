@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "One Kubernetes RBAC rule",
+  "type": "object",
+  "properties": {
+    "apiGroups": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "resources": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "verbs": {
+      "type": "array",
+      "items": {
+        "enum": ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection", "*"]
+      },
+      "minItems": 1
+    },
+    "nonResourceURLs": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+  },
+  "required": ["verbs"],
+  "anyOf": [{ "required": ["resources"] }, { "required": ["nonResourceURLs"] }],
+  "additionalProperties": false
+}

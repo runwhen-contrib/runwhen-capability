@@ -1,0 +1,4 @@
+# expect: /types/namespace is not valid under any of
+types:
+  cluster: { root: true, rootKey: server, canonicalKey: kubeSystemUid, plural: clusters }
+  namespace: { parent: cluster, canonicalKey: kubeSystemUid, plural: namespaces }

@@ -1,0 +1,897 @@
+"""plugin/run.py: resolve_target, and execute() against the run-mini fixture plugin.
+Every envelope is checked against the result-envelope contract."""
+
+from __future__ import annotations
+
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from runwhen_capability.contracts import validate as validate_contract
+from runwhen_capability.plugin import compile_tree, load_dir
+from runwhen_capability.plugin.run import (
+    RunSpec,
+    coerce_value,
+    execute,
+    parse_quantity_bytes,
+    resolve_target,
+)
+
+HERE = Path(__file__).resolve().parent
+RUN_MINI = HERE / "fixtures" / "run-mini"
+KUBE_MINI = HERE / "fixtures" / "kube-mini"
+BASH_MAJOR = int(
+    subprocess.run(
+        ["bash", "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True, check=True
+    ).stdout
+)
+DEPLOYMENT = "kubernetes/clusters/kind/namespaces/runwhen/deployments/runwhen-papi"
+
+
+@pytest.fixture(scope="module")
+def plugin():
+    tree = load_dir(RUN_MINI)
+    compiled = compile_tree(tree)
+    return tree, {t["name"]: t for t in compiled["tasks"]}
+
+
+@pytest.fixture
+def run(plugin, tmp_path):
+    tree, tasks = plugin
+
+    def go(name, *, resource=DEPLOYMENT, inputs=None, settings=None, **kw):
+        target = (
+            resolve_target(resource, tree, identity_overrides={}) if resource is not None else None
+        )
+        if target is not None:
+            target.pop("warnings", None)
+        spec = RunSpec(
+            task=tasks[name],
+            files=tree.files,
+            executable=tree.executable,
+            target=target,
+            inputs=inputs or {},
+            settings=settings or {},
+            dry_run=kw.pop("dry_run", False),
+            timeout_s=kw.pop("timeout_s", None),
+        )
+        outcome = execute(spec, scope_dir=tmp_path / "scope", **kw)
+        assert validate_contract("result-envelope", outcome.envelope) == []
+        return outcome
+
+    return go
+
+
+def codes(envelope):
+    return [e["code"] for e in envelope["errors"]]
+
+
+# -- resolve_target ----------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def kube_tree():
+    return load_dir(KUBE_MINI)
+
+
+def test_resolves_a_deployment_through_the_plugins_own_types(kube_tree):
+    target = resolve_target(DEPLOYMENT, kube_tree, identity_overrides={})
+    assert target == {
+        "path": DEPLOYMENT,
+        "type": "kubernetes/deployment",
+        "identity": {"cluster": "kind", "namespace": "runwhen", "name": "runwhen-papi"},
+    }
+
+
+def test_the_root_type_has_only_its_name(kube_tree):
+    target = resolve_target("kubernetes/clusters/kind", kube_tree, identity_overrides={})
+    assert target["type"] == "kubernetes/cluster"
+    assert target["identity"] == {"name": "kind"}
+
+
+def test_names_are_percent_decoded_after_the_split(kube_tree):
+    path = "kubernetes/clusters/a%2Fb/namespaces/my%20ns/deployments/web"
+    target = resolve_target(path, kube_tree, identity_overrides={})
+    assert target["identity"] == {"cluster": "a/b", "namespace": "my ns", "name": "web"}
+    assert target["path"] == path
+
+
+def test_identity_overrides_replace_and_add_fields(kube_tree):
+    target = resolve_target(
+        DEPLOYMENT, kube_tree, identity_overrides={"cluster": "prod", "region": "eu"}
+    )
+    assert target["identity"] == {
+        "cluster": "prod",
+        "namespace": "runwhen",
+        "name": "runwhen-papi",
+        "region": "eu",
+    }
+
+
+@pytest.mark.parametrize(
+    ("plural", "type_name"),
+    [
+        ("repositories", "repositorie"),  # the rule is only "s"/"es": a guess, and a warned one
+        ("deployments", "deployment"),
+        ("ingresses", "ingress"),
+        ("batches", "batch"),
+        ("dishes", "dish"),
+        ("boxes", "box"),
+        ("data", "data"),
+    ],
+)
+def test_a_foreign_platform_guesses_the_type_from_the_plural(kube_tree, plural, type_name):
+    target = resolve_target(
+        f"github/organizations/acme/{plural}/web", kube_tree, identity_overrides={}
+    )
+    assert target["type"] == f"github/{type_name}"
+    assert target["identity"] == {"organization": "acme", "name": "web"}
+    assert any("not this plugin's" in w for w in target["warnings"])
+
+
+def test_an_unknown_plural_on_the_plugins_own_platform_is_guessed_and_warned(kube_tree):
+    target = resolve_target(
+        "kubernetes/clusters/kind/namespaces/a/widgets/w", kube_tree, identity_overrides={}
+    )
+    assert target["type"] == "kubernetes/widget"
+    assert any("'widgets'" in w and "guessed" in w for w in target["warnings"])
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "kubernetes",
+        "kubernetes/clusters",
+        "kubernetes/clusters/kind/namespaces",
+        "kubernetes/clusters//namespaces/x",
+        "kubernetes/namespaces/x",  # not a root
+        "kubernetes/clusters/kind/deployments/x",  # a deployment is not a child of a cluster
+    ],
+)
+def test_a_path_that_cannot_be_a_resource_is_refused(kube_tree, path):
+    with pytest.raises(ValueError):
+        resolve_target(path, kube_tree, identity_overrides={})
+
+
+def test_coerce_value_parses_json_types_and_keeps_text():
+    assert coerce_value("integer", "5") == 5
+    assert coerce_value("number", "1.5") == 1.5
+    assert coerce_value("boolean", "true") is True
+    assert coerce_value("string[]", '["a","b"]') == ["a", "b"]
+    assert coerce_value("object", '{"a":1}') == {"a": 1}
+    assert coerce_value("string", "5") == "5"
+    assert coerce_value("duration", "15m") == "15m"
+    assert coerce_value(None, "x") == "x"
+    with pytest.raises(ValueError, match="expected JSON for type integer"):
+        coerce_value("integer", "five")
+
+
+# -- what a script sees ---------------------------------------------------------------------
+
+
+def test_a_python_task_sees_resource_settings_inputs_and_lib(run):
+    env = run("py-ok", inputs={"since": "1h"}, settings={"hosts": ["a", "b"]}).envelope
+    assert env["status"] == "ok"
+    assert env["errors"] == []
+    assert env["outputs"]["summary"] == {
+        "namespace": "runwhen",
+        "name": "runwhen-papi",
+        "path": DEPLOYMENT,
+        "threshold": 1500,  # the compiled default
+        "since": "1h",  # the caller's value over the default
+        "limit": 3,
+        "label": "plain",
+        "hosts": ["a", "b"],
+        "dry": False,
+        "lib": "from-lib",
+    }
+
+
+def test_a_bash_task_sees_rw_resource_setting_input_and_out(run):
+    outcome = run("sh-ok", inputs={"count": 2, "note": "hi"}, settings={"latencyThresholdMs": 99})
+    env = outcome.envelope
+    assert env["status"] == "ok"
+    row = {"namespace": "runwhen", "name": "runwhen-papi", "threshold": 99, "note": "hi"}
+    assert env["outputs"]["probe"] == [row, row]
+    # the file the script wrote at $RW_OUT/events.json is the `events` artifact
+    assert env["outputs"]["events"] == {"artifact": "art_local_events"}
+    assert set(outcome.artifacts) == {"events"}
+    assert '"type":"kubernetes/deployment"' in outcome.artifacts["events"].read_text()
+    assert f'"path":"{DEPLOYMENT}"' in outcome.artifacts["events"].read_text()
+
+
+def test_a_dry_run_sets_rw_dry_run_and_the_envelope_says_so(run):
+    env = run("sh-write", dry_run=True).envelope
+    assert env["status"] == "ok"
+    assert env["outputs"]["result"] == {"dry": True}
+    assert env["dryRun"] is True
+    live = run("sh-write").envelope
+    assert live["outputs"]["result"] == {"dry": False}
+    assert "dryRun" not in live
+
+
+def test_a_python_task_sees_ctx_dry_run(run):
+    env = run("py-ok", dry_run=True).envelope
+    assert env["outputs"]["summary"]["dry"] is True
+
+
+def test_dry_run_is_refused_for_a_task_that_is_not_dryrun(run):
+    env = run("py-nothing", dry_run=True).envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["invalid_input"]
+    assert "dry run" in env["errors"][0]["message"]
+
+
+def test_a_workspace_wide_task_has_no_resource(run):
+    # py-ok reads ctx.resource, which is None without a target: that is the script's crash
+    env = run("py-ok", resource=None).envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["internal"]
+
+
+# -- inputs and settings ---------------------------------------------------------------------
+
+
+def test_a_missing_required_input_fails_without_starting_the_process(run, tmp_path):
+    outcome = run("py-need")
+    env = outcome.envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["invalid_input"]
+    assert "'reason'" in env["errors"][0]["message"]
+    assert env["errors"][0]["scope"] == "reason"
+    assert env["outputs"] == {}
+    assert not (tmp_path / "scope").exists()  # no scope was even prepared
+
+
+def test_a_required_input_is_accepted_when_given(run):
+    assert run("py-need", inputs={"reason": "because"}).envelope["status"] == "ok"
+
+
+def test_a_wrongly_typed_or_unknown_input_is_invalid_input(run):
+    env = run("py-ok", inputs={"limit": "many", "nope": 1}).envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["invalid_input", "invalid_input"]
+    messages = " ".join(e["message"] for e in env["errors"])
+    assert "limit" in messages
+    assert "nope" in messages
+
+
+def test_an_unknown_or_mistyped_setting_is_invalid_input(run):
+    env = run("py-ok", settings={"latencyThresholdMs": "slow", "ghost": 1}).envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["invalid_input", "invalid_input"]
+
+
+# -- how a run ends ------------------------------------------------------------------------
+
+
+def test_ctx_error_then_return_is_partial(run):
+    env = run("py-partial").envelope
+    assert env["status"] == "partial"
+    assert env["outputs"] == {"pools": []}
+    assert env["errors"] == [
+        {"code": "unreachable", "message": "could not reach pgbouncer", "scope": "pgbouncer:6432"}
+    ]
+
+
+def test_an_uncaught_rw_error_fails_with_its_code(run):
+    env = run("py-raise").envelope
+    assert env["status"] == "failed"
+    assert env["errors"] == [{"code": "not_found", "message": "no such deployment", "scope": "web"}]
+
+
+def test_ctx_run_of_a_failing_command_fails_under_v13(run):
+    env = run("py-run", inputs={"snippet": "false"}).envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["internal"]
+
+
+def test_ctx_run_classifies_the_commands_stderr(run):
+    env = run(
+        "py-run", inputs={"snippet": "echo 'Error from server (Forbidden): pods' >&2; exit 1"}
+    ).envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["permission_denied"]
+
+
+def test_bash_exit_3_without_rw_error_is_failed_with_the_last_stderr_line(run):
+    outcome = run("sh-exit3")
+    env = outcome.envelope
+    assert env["status"] == "failed"
+    assert env["errors"] == [{"code": "internal", "message": "boom: could not frobnicate"}]
+    assert "boom" in outcome.log_tail
+
+
+def test_rw_error_in_bash_is_partial_and_a_bad_code_becomes_internal(run):
+    env = run("sh-rw-error").envelope
+    assert env["status"] == "partial"
+    assert [e["code"] for e in env["errors"]] == ["permission_denied", "internal"]
+    assert env["errors"][0]["scope"] == "ns/web"
+    assert "not_a_code" in env["errors"][1]["hint"]
+
+
+@pytest.mark.skipif(BASH_MAJOR < 4, reason="command_not_found_handle needs bash 4 (macOS has 3.2)")
+def test_a_missing_tool_is_a_dependency_error(run):
+    env = run("sh-missing-tool").envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["dependency"]
+    assert "definitely-not-a-tool-xyz" in env["errors"][0]["message"]
+
+
+def test_a_python_crash_is_internal_with_the_exception_line(run):
+    env = run("py-crash").envelope
+    assert env["status"] == "failed"
+    assert env["errors"] == [{"code": "internal", "message": "ValueError: kaboom"}]
+
+
+def test_a_skipped_task_is_skipped_with_its_reason(run):
+    env = run("py-skip").envelope
+    assert env["status"] == "skipped"
+    assert env["reason"] == "nothing to check"
+    assert env["errors"] == []
+
+
+def test_a_task_that_writes_nothing_is_ok_with_empty_outputs(run):
+    # Review focus 3: outputs are optional, even a declared one
+    env = run("py-nothing").envelope
+    assert env["status"] == "ok"
+    assert env["outputs"] == {}
+    assert env["errors"] == []
+
+
+def test_a_task_past_its_deadline_is_failed_with_timeout(run):
+    env = run("py-slow", timeout_s=1).envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["timeout"]
+
+
+def test_the_compiled_timeout_is_the_default_deadline(run, plugin, monkeypatch):
+    tree, tasks = plugin
+    seen = {}
+    real = __import__("runwhen_capability.bundle", fromlist=["_execute"])._execute
+
+    def spy(**kw):
+        seen["deadline"] = kw["deadline_seconds"]
+        return real(**kw)
+
+    monkeypatch.setattr("runwhen_capability.bundle._execute", spy)
+    run("py-nothing")
+    assert seen["deadline"] == 30.0  # `timeout: 30s` in defaults
+
+
+# -- outputs -------------------------------------------------------------------------------
+
+
+def test_an_output_that_breaks_its_schema_is_dropped_and_named(run):
+    env = run("py-bad-output").envelope
+    assert env["status"] == "partial"
+    assert env["outputs"] == {"good": {"n": 1}}
+    [error] = env["errors"]
+    assert error["code"] == "internal"
+    assert error["scope"] == "summary"
+    assert "'summary'" in error["message"]
+    assert "namespace" in error["message"]
+
+
+def test_an_undeclared_output_is_dropped_with_an_internal_error(run):
+    env = run("py-undeclared").envelope
+    assert env["status"] == "partial"
+    assert env["outputs"] == {"summary": {"n": 1}}
+    assert [e["code"] for e in env["errors"]] == ["internal"]
+    assert "'extra'" in env["errors"][0]["message"]
+    assert "not declared" in env["errors"][0]["message"]
+
+
+def test_an_artifact_is_the_file_in_rw_out_and_scratch_files_are_not_outputs(run):
+    outcome = run("py-artifact")
+    env = outcome.envelope
+    assert env["status"] == "ok"
+    assert env["outputs"] == {"dump": {"artifact": "art_local_dump"}, "n": {"v": 1}}
+    assert outcome.artifacts["dump"].read_text() == "a dump\n"
+    assert set(outcome.artifacts) == {"dump"}  # scratch.txt and the unwritten output: not here
+
+
+# -- the child's environment (SEC-2) ----------------------------------------------------------
+
+
+def test_host_only_variables_never_reach_a_v13_task(run, monkeypatch):
+    monkeypatch.setenv("RELAY_URL", "http://relay.invalid")
+    monkeypatch.setenv("POOL_ID", "pool-1")
+    monkeypatch.setenv("EXECUTOR_TOKEN_FILE", "/var/run/executor/token")
+    monkeypatch.setenv("RW_EXECUTOR_TOKEN_FILE", "/run/rw/executor/token")
+    env = run("sh-env").envelope
+    assert env["status"] == "ok"
+    seen = env["outputs"]["env"]
+    assert seen["relay"] == "unset"
+    assert seen["pool"] == "unset"
+    assert seen["token"] == "unset"
+    assert seen["rwtoken"] == "unset"
+    assert seen["contract"] == "v13"
+
+
+def test_host_only_names_cannot_be_smuggled_in_through_extra_env(run):
+    for name in (
+        "RELAY_URL",
+        "POOL_ID",
+        "EXECUTOR_TOKEN_FILE",
+        "RW_EXECUTOR_TOKEN_FILE",
+        "RW_SDK",
+        "HOME",
+        "PATH",
+    ):
+        with pytest.raises(ValueError, match="extra_env may not set"):
+            run("py-nothing", extra_env={name: "x"})
+
+
+def test_the_task_gets_a_private_home_unless_the_caller_keeps_its_own(run, tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "real-home"))
+    private = run("sh-env").envelope["outputs"]["env"]["home"]
+    assert private == str(tmp_path / "scope" / ".rw-home")
+    assert run("sh-env", inherit_home=True).envelope["outputs"]["env"]["home"] == str(
+        tmp_path / "real-home"
+    )
+
+
+def test_extra_env_reaches_the_task_and_is_redacted_from_what_comes_back(run):
+    secret = "s3cr3t-value-12345"
+    env = run("py-secret", extra_env={"MY_API_TOKEN": secret}).envelope
+    assert env["status"] == "ok"
+    assert env["outputs"]["leaked"] == {"token": "***REDACTED***"}
+    assert secret not in str(env)
+
+
+def test_a_shell_the_script_starts_is_not_forced_into_strict_mode(run):
+    env = run("sh-nested").envelope
+    assert env["status"] == "ok"
+    assert env["outputs"]["nested"] == {"ok": True}
+
+
+def test_plugin_files_are_materialized_with_their_executable_bit(plugin, tmp_path):
+    tree, tasks = plugin
+    script = tasks["sh-ok"]["script"]
+    files = {**tree.files, "skills/probe/scripts/tool.sh": b"#!/bin/sh\n"}
+    spec = RunSpec(
+        task=tasks["py-nothing"],
+        files=files,
+        executable=frozenset({"skills/probe/scripts/tool.sh"}),
+    )
+    execute(spec, scope_dir=tmp_path / "s")
+    tool = tmp_path / "s" / "plugin" / "skills" / "probe" / "scripts" / "tool.sh"
+    assert tool.stat().st_mode & stat.S_IXUSR
+    assert not (tmp_path / "s" / "plugin" / script).stat().st_mode & stat.S_IXUSR
+
+
+def test_a_path_that_would_leave_the_scope_is_refused(plugin, tmp_path):
+    tree, tasks = plugin
+    spec = RunSpec(task=tasks["py-nothing"], files={**tree.files, "../evil": b"x"})
+    env = execute(spec, scope_dir=tmp_path / "s").envelope
+    assert env["status"] == "failed"
+    assert codes(env) == ["internal"]
+    assert "refusing to write" in env["errors"][0]["message"]
+    assert not (tmp_path / "evil").exists()
+
+
+# -- the wiki 42b scripts, as written --------------------------------------------------------
+
+
+def _stub(directory: Path, name: str, body: str) -> None:
+    directory.mkdir(exist_ok=True)
+    path = directory / name
+    path.write_text("#!/bin/sh\n" + body)
+    path.chmod(0o755)
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="the 42b script uses jq")
+def test_the_documented_api_probe_script_runs_with_the_documented_names(run, tmp_path, monkeypatch):
+    calls = tmp_path / "calls.log"
+    _stub(
+        tmp_path / "bin",
+        "kubectl",
+        f'printf "%s\\n" "$*" >> {calls}\n'
+        'case "$*" in\n'
+        "  *healthz) echo ok ;;\n"
+        "  *livez) echo 'Error from server (ServiceUnavailable)' >&2; exit 1 ;;\n"
+        "  *) echo '{\"items\":[]}' ;;\n"
+        "esac\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin:/usr/local/bin")
+    monkeypatch.setenv("FAKE_LATENCY_MS", "2000")
+    env = run("api-probe").envelope
+    assert env["status"] == "ok", env
+    probes = env["outputs"]["probe"]
+    assert [(p["path"], p["status"], p["slow"]) for p in probes] == [
+        ("healthz", 200, True),
+        ("livez", 503, True),
+    ]
+    assert all(p["latencyMs"] >= 2000 for p in probes)  # SECONDS ticks in whole seconds
+    logged = calls.read_text()
+    assert "get --raw /api/v1/namespaces/runwhen/services/runwhen-papi:8000/proxy/healthz" in logged
+    assert (
+        "-n runwhen get events --field-selector involvedObject.name=runwhen-papi,type=Warning"
+        in logged
+    )
+
+
+@pytest.mark.skipif(shutil.which("jq") is None, reason="the 42b script uses jq")
+def test_the_documented_api_probe_honours_a_setting_override(run, tmp_path, monkeypatch):
+    _stub(tmp_path / "bin", "kubectl", "echo ok\n")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin:/usr/local/bin")
+    monkeypatch.setenv("FAKE_LATENCY_MS", "2000")
+    env = run("api-probe", settings={"latencyThresholdMs": 5000}).envelope
+    assert [p["slow"] for p in env["outputs"]["probe"]] == [False, False]
+
+
+def test_the_documented_pool_saturation_script_reports_unreachable_not_healthy(
+    run, tmp_path, monkeypatch
+):
+    _stub(
+        tmp_path / "bin",
+        "psql",
+        "echo 'psql: error: connection to server failed: Connection refused' >&2\nexit 2\n",
+    )
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin:/usr/local/bin")
+    env = run("pool-saturation").envelope
+    assert env["status"] == "partial"
+    assert env["outputs"] == {"pools": []}
+    [error] = env["errors"]
+    assert error["code"] == "unreachable"  # the script chose it; the message is ctx.run's
+    assert error["scope"] == "runwhen-papi.runwhen.svc:5432"
+
+
+def test_the_documented_pool_saturation_script_reads_settings_in_snake_case(
+    run, tmp_path, monkeypatch
+):
+    _stub(tmp_path / "bin", "psql", "echo 7,0\n")
+    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}:/usr/bin:/bin:/usr/local/bin")
+    env = run("pool-saturation", settings={"host": "localhost:6432"}).envelope
+    assert env["status"] == "ok"
+    assert env["outputs"]["pools"] == [{"cl_waiting": 7, "sv_idle": 0, "saturated": True}]
+    env = run("pool-saturation", settings={"waitingClientsThreshold": 9}).envelope
+    assert env["outputs"]["pools"][0]["saturated"] is False
+
+
+# -- object-typed settings and inputs keep their keys -------------------------------------
+
+_OBJECT_SCRIPT = b"""\
+def main(ctx, probe_opts):
+    return {
+        "seen": {
+            "setting": dict(ctx.settings.patterns),
+            "setting_attr": ctx.settings.patterns.connRefused,
+            "input": probe_opts,
+        }
+    }
+"""
+
+
+def test_object_settings_and_inputs_keep_their_keys_end_to_end(tmp_path):
+    patterns = {"connRefused": "refused", "http5xx": "5\\d\\d"}
+    opts = {"maxRetries": 2, "nestedOpts": {"innerKey": [{"kK": 1}]}}
+    task = {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": "scripts/t.py",
+        "inputs": {"probeOpts": {"type": "object"}},
+        "inputSchema": {"type": "object", "properties": {"probeOpts": {"type": "object"}}},
+        "settings": {"patterns": {"type": "object", "default": {}}},
+        "outputs": {"seen": {"jsonSchema": {"type": "object"}}},
+    }
+    outcome = execute(
+        RunSpec(
+            task=task,
+            files={"scripts/t.py": _OBJECT_SCRIPT},
+            inputs={"probeOpts": opts},
+            settings={"patterns": patterns},
+        ),
+        scope_dir=tmp_path / "scope",
+    )
+    assert outcome.envelope["errors"] == []
+    assert outcome.envelope["outputs"]["seen"] == {
+        "setting": patterns,
+        "setting_attr": "refused",
+        "input": opts,
+    }
+
+
+# -- plugin-authored patterns run on RE2 (S13) --------------------------------------------
+
+_EVIL = "^(a+)+$"
+_EVIL_VALUE = "a" * 40 + "b"
+
+
+def _inline_run(tmp_path, *, input_schema=None, output_schema=None, inputs=None, returns="{}"):
+    task = {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": "scripts/t.py",
+        "inputs": {name: {"type": "string"} for name in (inputs or {})},
+        "inputSchema": input_schema or {"type": "object"},
+        "settings": {},
+        "outputs": {"out": {"jsonSchema": output_schema or {"type": "object"}}},
+    }
+    script = f"def main(ctx, **inputs):\n    return {{'out': {returns}}}\n".encode()
+    start = time.monotonic()
+    outcome = execute(
+        RunSpec(task=task, files={"scripts/t.py": script}, inputs=inputs or {}),
+        scope_dir=tmp_path / "scope",
+    )
+    return outcome.envelope, time.monotonic() - start
+
+
+def test_a_catastrophic_input_pattern_does_not_hang_the_run(tmp_path):
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string", "pattern": _EVIL}},
+        "required": ["name"],
+    }
+    env, seconds = _inline_run(
+        tmp_path, input_schema=schema, inputs={"name": _EVIL_VALUE}, returns="{}"
+    )
+    assert seconds < 5
+    assert env["status"] == "failed"
+    assert env["errors"][0]["code"] == "invalid_input"
+    assert "does not match" in env["errors"][0]["message"]
+
+
+def test_a_catastrophic_output_pattern_does_not_hang_the_run(tmp_path):
+    schema = {"type": "string", "pattern": _EVIL}
+    env, seconds = _inline_run(tmp_path, output_schema=schema, returns=repr(_EVIL_VALUE))
+    assert seconds < 5
+    assert "out" not in env["outputs"]
+    assert any("does not match" in e["message"] for e in env["errors"])
+
+
+def test_an_output_matching_its_pattern_passes(tmp_path):
+    schema = {"type": "string", "pattern": "^[a-z]+\\d$"}
+    env, _ = _inline_run(tmp_path, output_schema=schema, returns="'abc1'")
+    assert env["status"] == "ok" and env["outputs"] == {"out": "abc1"}
+
+
+def test_a_remote_ref_in_an_output_schema_is_not_fetched_and_drops_the_output(tmp_path):
+    schema = {"$ref": "https://example.invalid/schema.json"}
+    env, _ = _inline_run(tmp_path, output_schema=schema, returns="{}")
+    assert "out" not in env["outputs"]
+    assert any("could not be evaluated" in e["message"] for e in env["errors"])
+
+
+def test_a_remote_ref_in_an_input_schema_is_invalid_input_not_a_crash(tmp_path):
+    schema = {"type": "object", "properties": {"a": {"$ref": "https://example.invalid/a.json"}}}
+    env, _ = _inline_run(tmp_path, input_schema=schema, inputs={"a": "x"})
+    assert env["status"] == "failed"
+    assert env["errors"][0]["code"] == "invalid_input"
+    assert "could not be evaluated" in env["errors"][0]["message"]
+
+
+# -- CAP-7: the memory limit ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("quantity", "expected"),
+    [
+        ("1000000", 1_000_000),
+        ("0", 0),
+        ("512M", 512_000_000),
+        ("1G", 1_000_000_000),
+        ("2T", 2 * 10**12),
+        ("3k", 3000),
+        ("256Mi", 256 * 2**20),
+        ("1Gi", 2**30),
+        ("64Ki", 64 * 2**10),
+        ("1Ti", 2**40),
+        ("1.5Gi", 3 * 2**29),
+        ("0.5Mi", 2**19),
+        ("1500m", 2),  # milli-bytes round up
+        ("1m", 1),
+    ],
+)
+def test_parse_quantity_bytes_follows_the_kubernetes_suffixes(quantity, expected):
+    assert parse_quantity_bytes(quantity) == expected
+
+
+@pytest.mark.parametrize(
+    "quantity", ["", "Mi", "-1", "1e3", "1.Gi", "1 Gi", "256mi", "1KiB", "1GB"]
+)
+def test_parse_quantity_bytes_refuses_what_the_contract_refuses(quantity):
+    with pytest.raises(ValueError, match="not a quantity"):
+        parse_quantity_bytes(quantity)
+
+
+_ALLOCATE = b"""
+def main(ctx, **inputs):
+    block = bytearray(512 * 1024 * 1024)
+    block[-1] = 1
+    return {"out": {"size": len(block)}}
+"""
+
+
+def _memory_task(memory=None):
+    task = {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": "scripts/t.py",
+        "inputs": {},
+        "inputSchema": {"type": "object"},
+        "settings": {},
+        "outputs": {"out": {"jsonSchema": {"type": "object"}}},
+    }
+    if memory is not None:
+        task["resources"] = {"memory": memory}
+    return task
+
+
+def _run_allocating(tmp_path, *, spec_memory=None, task_memory=None):
+    outcome = execute(
+        RunSpec(
+            task=_memory_task(task_memory),
+            files={"scripts/t.py": _ALLOCATE},
+            memory=spec_memory,
+        ),
+        scope_dir=tmp_path / "scope",
+    )
+    assert validate_contract("result-envelope", outcome.envelope) == []
+    return outcome.envelope
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_DATA is enforced on Linux only")
+@pytest.mark.parametrize("where", ["spec", "task"])
+def test_a_task_that_allocates_past_its_memory_limit_fails_with_the_hint(tmp_path, where):
+    kw = {"spec_memory": "64Mi"} if where == "spec" else {"task_memory": "64Mi"}
+    envelope = _run_allocating(tmp_path, **kw)
+    assert envelope["status"] == "failed"
+    [error] = envelope["errors"]
+    assert error["code"] == "internal"
+    assert error["hint"] == "the task exceeded its memory limit (64Mi)"
+    assert envelope["outputs"] == {}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_DATA is enforced on Linux only")
+def test_a_task_within_its_memory_limit_runs_normally(tmp_path):
+    envelope = _run_allocating(tmp_path, spec_memory="2Gi")
+    assert envelope["status"] == "ok", envelope["errors"]
+    assert envelope["outputs"]["out"] == {"size": 512 * 1024 * 1024}
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="the limit is applied on Linux")
+def test_where_the_limit_cannot_be_applied_the_task_just_runs(tmp_path):
+    envelope = _run_allocating(tmp_path, spec_memory="64Mi")
+    assert envelope["status"] == "ok", envelope["errors"]
+
+
+def test_a_memory_limit_that_is_not_a_quantity_is_invalid_input(tmp_path):
+    envelope = _run_allocating(tmp_path, spec_memory="lots")
+    assert codes(envelope) == ["invalid_input"]
+    assert "not a quantity" in envelope["errors"][0]["message"]
+
+
+def test_a_failure_with_no_memory_limit_is_never_blamed_on_memory(run):
+    # py-raise fails on its own account; a limit that was not hit must not rewrite it
+    envelope = run("py-raise").envelope
+    assert envelope["status"] == "failed"
+    assert all("hint" not in e or "memory" not in e["hint"] for e in envelope["errors"])
+
+
+_GO_PROBE = b"#!/bin/bash\nkubectl version --client >/dev/null\n"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_DATA is enforced on Linux only")
+@pytest.mark.skipif(shutil.which("kubectl") is None, reason="needs a Go binary (kubectl) on PATH")
+def test_a_go_binary_starts_under_a_realistic_memory_limit(tmp_path):
+    """RLIMIT_AS would stop kubectl at 512Mi (Go reserves address space it never uses)."""
+    task = {**_memory_task("256Mi"), "script": "scripts/t.sh", "outputs": {}}
+    outcome = execute(
+        RunSpec(
+            task=task, files={"scripts/t.sh": _GO_PROBE}, executable=frozenset({"scripts/t.sh"})
+        ),
+        scope_dir=tmp_path / "scope",
+    )
+    assert validate_contract("result-envelope", outcome.envelope) == []
+    assert outcome.envelope["status"] == "ok", outcome.envelope["errors"]
+
+
+# -- the run's reference time (RW_NOW, RW_NOW_EPOCH, ctx.now) -------------------------------
+
+_NOW_FORMAT = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$")
+
+_NOW_PY = b"""\
+import os
+
+
+def main(ctx):
+    return {
+        "out": {
+            "env": os.environ.get("RW_NOW", "unset"),
+            "epoch": os.environ.get("RW_NOW_EPOCH", "unset"),
+            "ctx": ctx.now().isoformat(),
+            "tz": str(ctx.now().utcoffset()),
+        }
+    }
+"""
+
+_NOW_SH = b"""\
+rw_output_set out "{\\"env\\":\\"${RW_NOW-unset}\\",\\"epoch\\":\\"${RW_NOW_EPOCH-unset}\\"}"
+"""
+
+
+def _now_task(script):
+    return {
+        "ref": "p:s/t",
+        "skill": "s",
+        "name": "t",
+        "script": script,
+        "inputs": {},
+        "inputSchema": {"type": "object"},
+        "settings": {},
+        "outputs": {"out": {"jsonSchema": {"type": "object"}}},
+    }
+
+
+def _run_now(tmp_path, language="py", **spec_fields):
+    script = f"scripts/t.{language}"
+    body = _NOW_PY if language == "py" else _NOW_SH
+    outcome = execute(
+        RunSpec(task=_now_task(script), files={script: body}, **spec_fields),
+        scope_dir=tmp_path / "scope",
+    )
+    assert outcome.envelope["errors"] == [], outcome.log_tail
+    return outcome.envelope["outputs"]["out"]
+
+
+def test_a_python_task_gets_one_reference_time_for_the_whole_run(tmp_path):
+    before = datetime.now(UTC).replace(microsecond=0)
+    out = _run_now(tmp_path)
+    after = datetime.now(UTC)
+    assert _NOW_FORMAT.match(out["env"]), out
+    stamp = datetime.fromisoformat(out["env"])
+    assert before <= stamp <= after
+    assert out["epoch"] == str(int(stamp.timestamp()))
+    assert datetime.fromisoformat(out["ctx"]) == stamp
+    assert out["tz"] == "0:00:00"
+
+
+def test_a_bash_task_sees_rw_now_and_rw_now_epoch(tmp_path):
+    out = _run_now(tmp_path, "sh")
+    assert _NOW_FORMAT.match(out["env"]), out
+    assert out["epoch"] == str(int(datetime.fromisoformat(out["env"]).timestamp()))
+
+
+def test_an_explicit_now_is_what_the_task_sees(tmp_path):
+    fixed = datetime(2026, 11, 4, 9, 14, 2, 123456, tzinfo=UTC)
+    out = _run_now(tmp_path, now=fixed)
+    assert out["env"] == "2026-11-04T09:14:02.123Z"  # millisecond precision, truncated
+    assert out["epoch"] == "1793783642"
+    assert out["ctx"] == "2026-11-04T09:14:02.123000+00:00"
+
+
+def test_an_explicit_now_in_another_zone_is_given_in_utc(tmp_path):
+    fixed = datetime(2026, 11, 4, 11, 14, 2, tzinfo=timezone(timedelta(hours=2)))
+    assert _run_now(tmp_path, now=fixed)["env"] == "2026-11-04T09:14:02.000Z"
+
+
+def test_a_naive_explicit_now_is_refused():
+    with pytest.raises(ValueError, match="timezone"):
+        RunSpec(task={}, files={}, now=datetime(2026, 11, 4, 9, 0, 0))
+
+
+def test_a_task_cannot_be_given_rw_now_through_extra_env(tmp_path):
+    for name in ("RW_NOW", "RW_NOW_EPOCH"):
+        with pytest.raises(ValueError, match="may not set"):
+            execute(
+                RunSpec(task=_now_task("scripts/t.py"), files={"scripts/t.py": _NOW_PY}),
+                scope_dir=tmp_path / "scope",
+                extra_env={name: "x"},
+            )
+
+
+def test_a_host_rw_now_is_not_inherited(tmp_path, monkeypatch):
+    monkeypatch.setenv("RW_NOW", "1999-01-01T00:00:00.000Z")
+    assert _run_now(tmp_path)["env"] != "1999-01-01T00:00:00.000Z"

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.runwhen.com/plugin/v1.json",
+  "title": "Plugin",
+  "description": "plugin.yaml: the installable, versioned package (D16, D20).",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "const": "runwhen.com/plugin/v1"
+    },
+    "name": {
+      "allOf": [
+        {
+          "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/slug"
+        },
+        {
+          "not": {
+            "enum": [
+              "workspace",
+              "runwhen"
+            ]
+          }
+        }
+      ]
+    },
+    "version": {
+      "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/semver"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "requires": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/semverRange"
+      },
+      "propertyNames": {
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+      }
+    },
+    "extends": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "https://schemas.runwhen.com/common/v1.json#/$defs/semverRange"
+          },
+          "propertyNames": {
+            "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+          },
+          "minProperties": 1,
+          "maxProperties": 1
+        }
+      ]
+    }
+  },
+  "required": [
+    "name",
+    "version",
+    "description"
+  ],
+  "additionalProperties": false
+}

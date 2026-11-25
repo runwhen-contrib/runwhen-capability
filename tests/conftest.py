@@ -20,3 +20,13 @@ def relay_server():
 
     with RelayServer() as server:
         yield server
+
+
+@pytest.fixture(autouse=True)
+def _serve_does_not_make_the_test_process_non_dumpable(monkeypatch):
+    """`serve()` calls prctl(PR_SET_DUMPABLE, 0) on its own process (see serve.py); in a
+    test that would be the pytest process. tests/test_executor_token.py exercises the real
+    function (with a mocked libc) and a real `rwtask serve` subprocess."""
+    import runwhen_capability.serve as serve_mod
+
+    monkeypatch.setattr(serve_mod, "_make_non_dumpable", lambda *args, **kwargs: False)

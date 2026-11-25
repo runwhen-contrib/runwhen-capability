@@ -1,0 +1,4 @@
+# expect: /name should not be valid
+name: workspace
+version: 0.1.0
+description: Collides with the plugin name reserved for workspace skills.
