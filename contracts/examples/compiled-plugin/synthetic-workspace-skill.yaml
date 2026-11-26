@@ -19,7 +19,6 @@ skills:
       - skills/nightly-export-check/SKILL.md
       - skills/nightly-export-check/scripts/export_fresh.sh
       - skills/nightly-export-check/tasks.yaml
-    runtime: generic@1
     taskNames: [export-fresh]
 tasks:
   - ref: "workspace:nightly-export-check/export-fresh"
@@ -28,7 +27,6 @@ tasks:
     title: Export file is fresh
     description: Reports the age of the newest file in the export directory.
     script: skills/nightly-export-check/scripts/export_fresh.sh
-    runtime: generic@1
     role: cli
     readOnly: true
     idempotent: false
@@ -54,6 +52,6 @@ tasks:
             ageMinutes: { type: integer }
           required: [file, ageMinutes]
     tags: [exports]
-    hash: "sha256:dddc542092eac1d6d9d5f3dc29cf81d384953591101cd3ca23be44d6c3e3f8bf"
+    hash: "sha256:a6f01e8f09c74202247ca7082511ca4534fc4ad75b3701057a3e24f31ae93c58"
 rules: []
 knowledge: []

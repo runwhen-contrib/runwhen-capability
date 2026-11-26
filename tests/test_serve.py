@@ -60,6 +60,8 @@ def test_serve_processes_one_request_and_posts_the_result(tmp_path):
         capability_dir=FIXTURES / "echo",
         token_file=_token_file(tmp_path),
         max_iterations=1,
+        cgroup_dir=tmp_path
+        / "no-cgroup",  # memoryWorkingSetBytes is covered in test_serve_parallel
     )
 
     assert len(responses.calls) == 2

@@ -5,6 +5,24 @@ with the wheel and sdist attached to the GitHub Release.
 
 ## Unreleased
 
+## 0.6.0 (2026-11-26)
+
+Parallel task runs in one executor pod, and a compiler that leaves the runtime to the platform.
+
+### Added
+
+- **`rwtask serve --concurrency N` / `RW_MAX_CONCURRENT`** (`serve.py`): N poll workers (threads), default 1, minimum 1. The executor token is read once before they start and shared; each worker long-polls and runs one task run at a time in its own scope dir. The stateful-scope LRU is lock-guarded and never evicts a scope a worker is running in. SIGTERM stops polling and waits for the task runs in flight.
+- **Per-run tool caches** (`bundle.tool_cache_env`): the child's `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `KUBECACHEDIR`, `HELM_CACHE_HOME`, `HELM_CONFIG_HOME`, `HELM_DATA_HOME`, `AZURE_CONFIG_DIR`, `CLOUDSDK_CONFIG`, `PIP_CACHE_DIR`, `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` point inside the run's private `$HOME`, over an image's own ENV. A run's materialized credential env (`KUBECONFIG`, an AWS file) wins. The eight cache names (not `AZURE_CONFIG_DIR`, `CLOUDSDK_CONFIG` or the two AWS file names, which credentials set) join the reserved env names. Not applied to `rwtask run`'s caller-owned HOME.
+- **Per-run memory guard**: with more than one worker and a numeric cgroup v2 `memory.max`, each child gets `RLIMIT_DATA` = limit / concurrency; a smaller explicit per-run limit is kept. This is a per-process virtual-memory cap, not a per-run RSS limit; the runner's memory retirement is the pod-level backstop.
+- **`memoryWorkingSetBytes`** in the `POST /v1/tasks/next` body: the cgroup v2 working set, kubelet-style (`memory.current` minus `inactive_file` from `memory.stat`, floor 0); omitted when unreadable. The runner compares its per-pod high-water against the pod's memory limit.
+- **One run per scopeId at a time**: requests with the same `scopeId` are serialized per process (a per-scope lock taken before the scope dir is created, released after cleanup).
+- **Self-healing workers**: a poll worker whose loop raises logs the exception, backs off (1s doubling to 30s) and keeps polling. A task picked up before SIGTERM still runs to completion.
+- `serve` makes the workdir root 0711 at start-up (best effort; scopes stay 0700).
+
+### Changed
+
+- **A skill whose `tasks.yaml` has no `runtime:` compiles with no runtime** (it was `generic@1`): the compiled skill and tasks carry none and papi applies the workspace's default. `compiledTask.runtime` is optional in `compiled-plugin`; an explicit `runtime:` passes through unchanged. CONTRACTS.md F13, F14, V2-1.
+
 ## 0.5.0 (2026-11-25)
 
 The V13 plugins SDK: everything on `v13/plugins` since 0.4.0 (plugins, skills, `rwtask run|test|compile|pull`, the lease/v1 executor and contracts-v1 to v7). It includes the S20 `X-RW-Dispatch` echo that the V13 cut-2 runner requires on result, artifact and code calls. An executor on 0.4.0 has its results refused by that runner. Entries below were listed under Unreleased.

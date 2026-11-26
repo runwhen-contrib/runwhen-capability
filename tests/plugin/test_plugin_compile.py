@@ -527,7 +527,7 @@ def workspace_entries():
         ),
         TreeEntry(
             base + "tasks.yaml",
-            b"apiVersion: runwhen.com/tasks/v1\nruntime: generic@1\ntasks:\n"
+            b"apiVersion: runwhen.com/tasks/v1\ntasks:\n"
             b"  - name: export-fresh\n    title: Export file is fresh\n"
             b"    description: Reports the age of the newest file in the export directory.\n"
             b"    script: scripts/export_fresh.sh\n    readOnly: true\n    inputs:\n"
@@ -555,6 +555,28 @@ def test_a_workspace_skill_revision_compiles_as_the_workspace_plugin():
     assert [t["ref"] for t in doc["tasks"]] == ["workspace:nightly-export-check/export-fresh"]
     assert doc["tasks"][0]["script"] == "skills/nightly-export-check/scripts/export_fresh.sh"
     assert doc["rules"] == [] and doc["knowledge"] == []
+
+
+def test_no_runtime_in_tasks_yaml_compiles_to_no_runtime():
+    doc = compiled(workspace_entries(), workspace_revision=1)
+    check("compiled-plugin", doc)
+    assert "runtime" not in doc["tasks"][0]
+    assert "runtime" not in doc["skills"][0]
+
+
+def test_an_explicit_runtime_passes_through_unchanged():
+    entries = [
+        TreeEntry(
+            e.path, e.data.replace(b"tasks:\n", b"runtime: generic@1\ntasks:\n", 1), e.executable
+        )
+        if e.path.endswith("tasks.yaml")
+        else e
+        for e in workspace_entries()
+    ]
+    doc = compiled(entries, workspace_revision=1)
+    check("compiled-plugin", doc)
+    assert doc["tasks"][0]["runtime"] == "generic@1"
+    assert doc["skills"][0]["runtime"] == "generic@1"
 
 
 def test_the_workspace_example_is_what_compile_emits():

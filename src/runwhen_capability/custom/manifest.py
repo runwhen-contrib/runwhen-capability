@@ -245,6 +245,19 @@ RESERVED_ENV_NAMES = frozenset(
         "PS4",
         "SHELLOPTS",
         "BASHOPTS",
+        # Per-run tool caches the host points into the run's HOME (bundle.tool_cache_env).
+        # AZURE_CONFIG_DIR, CLOUDSDK_CONFIG, AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE
+        # are deliberately not here: a credential sets them (the azure plugin's auth script
+        # exports AZURE_CONFIG_DIR; see plugin/run.py CREDENTIAL_PATH_VARS), and that wins
+        # over the default.
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "KUBECACHEDIR",
+        "HELM_CACHE_HOME",
+        "HELM_CONFIG_HOME",
+        "HELM_DATA_HOME",
+        "PIP_CACHE_DIR",
     }
 )
 RESERVED_ENV_PREFIXES = ("RW_", "BASH", "LD_", "DYLD_", "PYTHON")

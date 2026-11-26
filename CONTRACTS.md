@@ -113,7 +113,7 @@ pinned as `generic@1.0.0` on its connections.
 no owner scope (D71).
 
 **`tasks.yaml`.** `apiVersion: runwhen.com/tasks/v1` (required), `runtime`
-(`<name>@<major>`, default `generic@1`), `defaults`, file-level `settings`,
+(`<name>@<major>`; optional: when absent the compiled skill and tasks carry no runtime and papi applies the workspace's default runtime), `defaults`, file-level `settings`,
 `tasks[]`. Rules beyond the schema:
 
 - `readOnly` is required; `readOnly: false` requires `effects` and `destructive` (D62).
@@ -548,8 +548,8 @@ every wiki example valid.
 | F10 | The archive is lane D's deterministic uncompressed ustar (no `contentHash`; the compiled plugin lives beside it, not in it). Limits 64 MiB, 10 000 files, 16 MiB per file. | One hash everywhere, independent of zlib; D35 puts limits on the archive. |
 | F11 | A connection has `root` xor `selector`; `selector` is for generic connections. | D50 (one root) and D44 (generic scoped by selector). |
 | F12 | Recognizer = `from` + `when` (label and JMESPath `doc` equalities, OR across matchers) + `propose`. | No predicate grammar anywhere (D70); page 51's `when:` string sketch predates D68/D69 and is superseded. |
-| F13 | `workspace` and `runwhen` are reserved plugin names; the generic integration is built in as `generic@1.0.0`. | `workspace:<skill>` references (SK5); one shared generic definition for lanes C and F. |
-| F14 | Workspace skill revisions lease as `skills/<skill>/**` trees, version `0.0.0-rev.<n>`, inline up to 256 KiB with the sha256 of the archive they would build. | One runner path for plugins and workspace skills (D35 allows inline). |
+| F13 | `workspace` and `runwhen` are reserved plugin names; the generic integration is built in as `generic@1.0.0`. | `workspace:<skill>` references (SK5); one shared generic definition for lanes C and F. A skill without `runtime:` compiles with no runtime (0.6.0; it was `generic@1`): papi picks the workspace default. |
+| F14 | Workspace skill revisions lease as `skills/<skill>/**` trees, version `0.0.0-rev.<n>`, inline up to 256 KiB with the sha256 of the archive they would build. | One runner path for plugins and workspace skills (D35 allows inline). A revision whose `tasks.yaml` has no `runtime:` leases with the workspace default runtime, chosen by papi at lease time. |
 | F15 | No author `retries` field: the platform retries infrastructure failures, and only for `idempotent: true` tasks (CAP-7). | 42a: "idempotent is a hint; the platform retries infrastructure failures only". |
 | F16 | Facet populator kinds are `projection`, `rollup` (a discovery-task output) and `agent`; `schema` is required. | D66/IN6; today's `task` kind becomes `rollup`. |
 | F17 | `apiVersion` is required only in `tasks.yaml`; optional elsewhere. | The wiki's `plugin.yaml` and one-file integration examples omit it. |
@@ -572,7 +572,7 @@ Additive: no field was removed and every document that validated under
 
 | # | Change | Affects |
 |---|---|---|
-| V2-1 | `compiled-plugin`'s `plugin` also accepts the synthetic workspace plugin `{name: workspace, version: 0.0.0-rev.<n>, description}`; `compile_tree` / `compile_entries` take `workspace_revision=` and compile a skill-only tree (refs `workspace:<skill>/<task>`, `integration: null`). `plugin.schema` is unchanged: authors still cannot name a plugin `workspace`. | B (ingest and lease of workspace skills), C |
+| V2-1 | `compiled-plugin`'s `plugin` also accepts the synthetic workspace plugin `{name: workspace, version: 0.0.0-rev.<n>, description}`; `compile_tree` / `compile_entries` take `workspace_revision=` and compile a skill-only tree (refs `workspace:<skill>/<task>`, `integration: null`). `compiledTask.runtime` and the compiled skill's `runtime` are optional (0.6.0): absent when `tasks.yaml` has no `runtime:`, passed through unchanged when it has one. `plugin.schema` is unchanged: authors still cannot name a plugin `workspace`. | B (ingest and lease of workspace skills), C |
 | V2-2 | Every path in a compiled-plugin document is plugin-root-relative (`skills/<skill>/scripts/x.sh`); the `synthetic-runwhen-platform-ops` example said skill-relative. Stated under "Compiled plugin"; a test checks every compiled-plugin example. | D (used the example as a template), B |
 | V2-5 | "What a script sees" names `RW_TASK_CONTRACT=v13`, the bash helpers (`rw_error`, `rw_output_append`, `rw_output_set`, ...), `$RW_OUT`, `$RW_LIB_DIR`, strict mode with `rw.sh` preloaded, and `runwhen_capability.testing`. Documentation only. | F (skill authors) |
 | V2-6 | S13: plugin-authored JSON Schemas (task input `pattern`, settings, output, facet and permission schemas, compact notation) are evaluated with RE2, not Python `re`: new dependency `google-re2`, `contracts.validator_for_plugin_schema(schema)` and `contracts.check_plugin_schema(schema)`, and `rwtask validate` / ingest report `E_SCHEMA_PATTERN` (a pattern RE2 cannot compile: lookaround, backreferences) and `E_SCHEMA_REF` (a `$ref` that leaves the schema). Plugins that used lookaround in a pattern must rewrite it. | B (papi re-validation, CAP-5), D (registry ingest), F (authors) |
