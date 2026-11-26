@@ -772,6 +772,7 @@ def _run_valid_lease(
                 plans,
                 parsed=parsed,
                 task_dir=task_dir,
+                scratch_root=scope_dir,
                 extra_env=extra_env,
                 redact=redact,
                 non_secret_env=non_secret_env,
@@ -861,12 +862,18 @@ def _run_script_plans(
     archive_cache: Path | None,
     remaining: Callable[[], float | None],
     log: logging.Logger,
+    scratch_root: Path | None = None,
 ) -> None:
     """Runs each script plan (plugin/auth_script.py) before the task script and adds what it
     produced to `extra_env`, its secret values to `redact` and the names its plan lists in
     `materialize.nonSecret` to `non_secret_env`. Raises LeaseError (scope `auth`)
     for the first plan that fails: the task script then never runs. Each plan gets
-    `<task_dir>/auth-<n>/`, which the caller deletes with the task's directory."""
+    `<task_dir>/auth-<n>/`, which the caller deletes with the task's directory.
+
+    `scratch_root` is where each plan's plugin ARCHIVE is unpacked (`<scratch_root>/auth-<n>/`);
+    `<task_dir>` keeps the secret side. The two are separate because `task_dir` lives on the
+    small credentials tmpfs: a kubeconfig fits there, a plugin archive does not. Pass the
+    task's writable workdir. Without it the archive stays beside the secrets, as before."""
     for number, plan in enumerate(plans):
         left = remaining()
         if left is not None and left <= 0:
@@ -887,6 +894,7 @@ def _run_script_plans(
                 executable=executable,
                 reference=parsed.references.get(plan["credentialType"], []),
                 work_dir=task_dir / f"auth-{number}",
+                scratch_dir=None if scratch_root is None else scratch_root / f"auth-{number}",
                 timeout_s=timeout_s,
                 redactor=Redactor([*redact]),
                 taken=extra_env,
