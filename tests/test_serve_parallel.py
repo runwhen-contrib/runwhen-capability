@@ -312,11 +312,15 @@ def test_credential_env_wins_over_the_tool_cache_defaults():
 def test_tool_cache_names_are_on_the_caller_env_deny_list_except_credential_files():
     from runwhen_capability.custom.manifest import is_reserved_env_name
 
-    cache_names = set(bundle.tool_cache_env("/h")) - {
+    credential_set = {
+        "AZURE_CONFIG_DIR",
+        "CLOUDSDK_CONFIG",
         "AWS_CONFIG_FILE",
         "AWS_SHARED_CREDENTIALS_FILE",
     }
+    cache_names = set(bundle.tool_cache_env("/h")) - credential_set
     assert all(is_reserved_env_name(n) for n in cache_names)
-    # a materialized AWS credential file sets these, and wins: they stay allowed
-    assert not is_reserved_env_name("AWS_SHARED_CREDENTIALS_FILE")
+    # a credential sets these (an azure auth script exports AZURE_CONFIG_DIR, a materialized
+    # AWS credential file the AWS names), and wins: they stay allowed
+    assert not any(is_reserved_env_name(n) for n in credential_set)
     assert not is_reserved_env_name("KUBECONFIG")

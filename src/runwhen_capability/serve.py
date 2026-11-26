@@ -531,7 +531,8 @@ def _retain_or_wipe_scope(
         return
 
     scope_id = scope_dir.name
-    evicted: list[str] = []
+    # The wipe stays under the lock: a worker marks its scope active (under the lock) before
+    # it creates the dir, so a victim is never deleted while a new request for it starts.
     with _SCOPES_LOCK:
         stateful_scopes.pop(scope_id, None)  # re-insert at the MRU end
         stateful_scopes[scope_id] = None
@@ -543,10 +544,8 @@ def _retain_or_wipe_scope(
             if victim is None:
                 break
             del stateful_scopes[victim]
-            evicted.append(victim)
-    for evicted_id in evicted:
-        log.info("evicting least-recently-used scope %r to bound stateful growth", evicted_id)
-        shutil.rmtree(workdir / evicted_id, ignore_errors=True)
+            log.info("evicting least-recently-used scope %r to bound stateful growth", victim)
+            shutil.rmtree(workdir / victim, ignore_errors=True)
 
 
 def _poll_once(
@@ -670,9 +669,10 @@ def _poll_once(
         return
 
     scope_dir = workdir / task_request.scopeId
-    scope_dir.mkdir(parents=True, exist_ok=True)
+    # Active before the dir exists, so another worker's LRU eviction cannot wipe it under us.
     with _SCOPES_LOCK:
         _ACTIVE_SCOPES[task_request.scopeId] = _ACTIVE_SCOPES.get(task_request.scopeId, 0) + 1
+    scope_dir.mkdir(parents=True, exist_ok=True)
     # One client per request: it carries the request id the artifact routes
     # are scoped to, and the executor's token source.
     relay_client = RelayClient(
@@ -736,12 +736,6 @@ def _poll_once(
         log.exception("request %s failed", task_request.requestId)
         payload = {"status": "failed", "error": str(exc)}
     finally:
-        with _SCOPES_LOCK:
-            remaining = _ACTIVE_SCOPES.get(task_request.scopeId, 1) - 1
-            if remaining > 0:
-                _ACTIVE_SCOPES[task_request.scopeId] = remaining
-            else:
-                _ACTIVE_SCOPES.pop(task_request.scopeId, None)
         if is_bundle or is_lease:
             # No execution.mode concept applies to a bundle or a lease -- it
             # never shares a scope with a later request, so it is always
@@ -751,6 +745,14 @@ def _poll_once(
             _retain_or_wipe_scope(
                 capability, scope_dir, workdir, stateful_scopes, max_stateful_scopes, log
             )
+        # Inactive only once the scope is back in the LRU: until then another worker's
+        # eviction must not wipe it and leave the LRU naming a dir that is gone.
+        with _SCOPES_LOCK:
+            remaining = _ACTIVE_SCOPES.get(task_request.scopeId, 1) - 1
+            if remaining > 0:
+                _ACTIVE_SCOPES[task_request.scopeId] = remaining
+            else:
+                _ACTIVE_SCOPES.pop(task_request.scopeId, None)
 
     body = _encode_result(payload, log, task_request.maxResultBytes)
     _post_result(session, relay, task_request.requestId, body, tokens, log, task_request.dispatch)
