@@ -55,6 +55,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -171,6 +172,9 @@ class TokenSource:
     ):
         self._token = token
         self._path = Path(path) if path is not None else None
+        # serve runs several poll workers on one source: adopting the file (read + unlink)
+        # and a re-read must not interleave.
+        self._lock = threading.Lock()
         self._log = log or logging.getLogger("runwhen_capability.relay")
 
     @classmethod
@@ -216,6 +220,10 @@ class TokenSource:
         return True
 
     def get(self) -> str:
+        with self._lock:
+            return self._get()
+
+    def _get(self) -> str:
         if self._token is None:
             if not self._adopt():
                 raise TokenNotPresent(f"executor token not present at {self._path}")

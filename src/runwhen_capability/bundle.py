@@ -1248,6 +1248,46 @@ _RLIMIT_DATA_LAUNCHER = (
 
 _memory_limit_noted = False
 
+#: A per-run memory ceiling every child gets (RLIMIT_DATA), set once by `rwtask serve` when
+#: it runs several task runs in one pod (serve.py: pod memory limit / concurrency). A run's
+#: own, explicit limit wins when it is smaller. None = no default.
+_default_memory_limit_bytes: int | None = None
+
+
+def set_default_memory_limit(limit_bytes: int | None) -> None:
+    """Sets (or, with None, clears) the process-wide default per-run memory limit."""
+    global _default_memory_limit_bytes  # noqa: PLW0603 -- process-wide serve setting
+    _default_memory_limit_bytes = limit_bytes if limit_bytes and limit_bytes > 0 else None
+
+
+def _effective_memory_limit(explicit: int | None) -> int | None:
+    default = _default_memory_limit_bytes
+    if default is None:
+        return explicit
+    return default if explicit is None else min(explicit, default)
+
+
+def tool_cache_env(home: Path | str) -> dict[str, str]:
+    """Per-run homes for the tools that cache or keep config under XDG_* or their own
+    variable, all inside the run's HOME so concurrent runs in one pod share nothing and the
+    scope wipe removes them. Overrides an image's own ENV (a CLOUDSDK_CONFIG under /work);
+    a run's credential materialization (extra_env) is applied after and wins."""
+    h = str(home)
+    return {
+        "XDG_CONFIG_HOME": f"{h}/.config",
+        "XDG_CACHE_HOME": f"{h}/.cache",
+        "XDG_DATA_HOME": f"{h}/.local/share",
+        "KUBECACHEDIR": f"{h}/.kube/cache",
+        "HELM_CACHE_HOME": f"{h}/.cache/helm",
+        "HELM_CONFIG_HOME": f"{h}/.config/helm",
+        "HELM_DATA_HOME": f"{h}/.local/share/helm",
+        "AZURE_CONFIG_DIR": f"{h}/.azure",
+        "CLOUDSDK_CONFIG": f"{h}/.config/gcloud",
+        "PIP_CACHE_DIR": f"{h}/.cache/pip",
+        "AWS_CONFIG_FILE": f"{h}/.aws/config",
+        "AWS_SHARED_CREDENTIALS_FILE": f"{h}/.aws/credentials",
+    }
+
 
 def _with_memory_limit(argv: list[str], limit_bytes: int) -> list[str]:
     return [sys.executable, "-I", "-S", "-c", _RLIMIT_DATA_LAUNCHER, str(limit_bytes), *argv]
@@ -1303,10 +1343,14 @@ def _execute(
     `memory_limit_bytes` (CAP-7: the child's RLIMIT_DATA on Linux, applied by a small stdlib
     launcher that execs the real argv, so nothing runs in a forked child of this threaded
     process; skipped, with one debug line, where it is not enforced)."""
+    run_home = home if home is not None else scope_dir / _HOME_DIR
     base_env = {
         **_inherited_env(),
+        # Only the scope's private HOME: `home=` is a developer's own, whose real tool
+        # config (and any variable they set) is the point of `rwtask run`.
+        **(tool_cache_env(run_home) if home is None else {}),
         **(extra_env or {}),
-        "HOME": str(home if home is not None else scope_dir / _HOME_DIR),
+        "HOME": str(run_home),
         "TMPDIR": str(scope_dir / _TMP_DIR),
         "RW_WORKDIR": str(scope_dir),
         # Not inherited (every RW_* is stripped): set here, for bash and Python alike.
@@ -1367,6 +1411,7 @@ def _execute(
             "RW_ALLOW_ANONYMOUS": "1" if allow_anonymous else "0",
         }
 
+    memory_limit_bytes = _effective_memory_limit(memory_limit_bytes)
     if memory_limit_bytes is not None:
         if sys.platform.startswith("linux"):
             argv = _with_memory_limit(argv, memory_limit_bytes)

@@ -106,7 +106,9 @@ import json
 import logging
 import os
 import shutil
+import signal
 import sys
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -114,7 +116,7 @@ from pathlib import Path
 import requests
 
 from .artifacts import ARTIFACT_CACHE_DIR
-from .bundle import run_bundle_request
+from .bundle import run_bundle_request, set_default_memory_limit
 from .host import run_request
 from .loader import discover_capability_dir, load_capability
 from .models import BundleRequestEnvelope, TaskHostRequest, V13LeaseRequest
@@ -155,6 +157,44 @@ BUNDLES_NOT_ALLOWED = (
 # checkouts, not dozens.
 DEFAULT_MAX_STATEFUL_SCOPES = 4
 
+# Parallel task runs per pod: the poll-worker count (RW_MAX_CONCURRENT / --concurrency).
+CONCURRENCY_ENV = "RW_MAX_CONCURRENT"
+DEFAULT_CGROUP_DIR = Path("/sys/fs/cgroup")  # cgroup v2; injectable for tests
+
+# Guards the stateful-scope LRU and the in-flight scope counts below, which every poll
+# worker touches.
+_SCOPES_LOCK = threading.Lock()
+_ACTIVE_SCOPES: dict[str, int] = {}
+
+
+def resolve_concurrency(value: int | str | None = None) -> int:
+    """The worker count: `value` (the --concurrency flag), else $RW_MAX_CONCURRENT, else 1.
+    Never below 1; an unparsable value is 1."""
+    raw = value if value not in (None, "") else os.environ.get(CONCURRENCY_ENV)
+    try:
+        return max(1, int(raw)) if raw not in (None, "") else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _read_int(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def cgroup_memory_limit(cgroup_dir: Path = DEFAULT_CGROUP_DIR) -> int | None:
+    """The pod's cgroup v2 memory limit in bytes, or None (no cgroup v2, or `max`)."""
+    return _read_int(Path(cgroup_dir) / "memory.max")
+
+
+def cgroup_memory_peak(cgroup_dir: Path = DEFAULT_CGROUP_DIR) -> int | None:
+    """The cgroup's memory high-water mark: memory.peak, else memory.current, else None."""
+    cgroup_dir = Path(cgroup_dir)
+    peak = _read_int(cgroup_dir / "memory.peak")
+    return peak if peak is not None else _read_int(cgroup_dir / "memory.current")
+
 
 def serve(
     relay: str,
@@ -167,6 +207,8 @@ def serve(
     log: logging.Logger | None = None,
     max_stateful_scopes: int = DEFAULT_MAX_STATEFUL_SCOPES,
     allow_bundles: bool = False,
+    concurrency: int | None = None,
+    cgroup_dir: Path = DEFAULT_CGROUP_DIR,
 ) -> None:
     """Runs the long-poll loop. `max_iterations` (None = forever) and
     `session` exist so tests can drive this deterministically without a real
@@ -181,7 +223,15 @@ def serve(
     capabilities should ever execute one. With it off, a bundle request
     is refused with a failed result before anything touches the
     filesystem. A V13 lease (plugin code carried inline or by archive) needs the
-    same opt-in and is refused the same way, as a failed envelope."""
+    same opt-in and is refused the same way, as a failed envelope.
+
+    `concurrency` (CLI: `--concurrency`, else RW_MAX_CONCURRENT, default 1, min 1) is the
+    number of poll workers (threads): each long-polls and runs one request at a time in its
+    own scope dir, so that many task runs proceed in parallel. The token is read once,
+    before the workers start, and they share it. SIGTERM stops further polling and waits
+    for the requests in flight. With more than one worker and a cgroup v2 memory limit
+    (`cgroup_dir`/memory.max), each run's child gets RLIMIT_DATA = limit / concurrency.
+    `max_iterations` counts per worker."""
     log = log or logging.getLogger("runwhen_capability.serve")
     # First, before the token can be in memory: see _make_non_dumpable.
     _make_non_dumpable(log)
@@ -208,21 +258,67 @@ def serve(
     # (or a runner restart, which wipes every executor) starts with none.
     stateful_scopes: OrderedDict[str, None] = OrderedDict()
 
-    iterations = 0
-    while max_iterations is None or iterations < max_iterations:
-        iterations += 1
-        _poll_once(
-            session,
-            relay,
-            pool_id,
-            workdir,
-            capability,
-            tokens,
-            log,
-            stateful_scopes,
-            max_stateful_scopes,
-            allow_bundles,
+    workers = resolve_concurrency(concurrency)
+    # Scopes are 0700; the root is 0711 so a run can traverse to its own scope but cannot
+    # list its siblings. Best effort: a mounted volume may refuse.
+    try:
+        os.chmod(workdir, 0o711)
+    except OSError as exc:
+        log.debug("could not chmod %s to 0711: %s", workdir, exc)
+    limit = cgroup_memory_limit(cgroup_dir) if workers > 1 else None
+    set_default_memory_limit(limit // workers if limit else None)
+    if workers > 1:
+        log.info(
+            "running %d task runs in parallel; per-run memory limit %s",
+            workers,
+            f"{limit // workers} bytes" if limit else "none (no cgroup v2 limit)",
         )
+
+    stop = threading.Event()
+
+    def worker() -> None:
+        iterations = 0
+        while not stop.is_set() and (max_iterations is None or iterations < max_iterations):
+            iterations += 1
+            _poll_once(
+                session,
+                relay,
+                pool_id,
+                workdir,
+                capability,
+                tokens,
+                log,
+                stateful_scopes,
+                max_stateful_scopes,
+                allow_bundles,
+                cgroup_dir,
+            )
+
+    on_main = threading.current_thread() is threading.main_thread()
+    previous = None
+    if on_main:
+
+        def on_sigterm(signum, frame):  # noqa: ARG001
+            log.info("SIGTERM: no further polls; waiting for in-flight requests")
+            stop.set()
+
+        previous = signal.signal(signal.SIGTERM, on_sigterm)
+    try:
+        if workers == 1:
+            worker()
+        else:
+            threads = [
+                threading.Thread(target=worker, name=f"rw-serve-{i}", daemon=False)
+                for i in range(workers)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                while thread.is_alive():  # a timed join keeps the main thread signal-responsive
+                    thread.join(timeout=1)
+    finally:
+        if on_main and previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
 
 def _make_non_dumpable(log: logging.Logger | None = None) -> bool:
@@ -435,10 +531,20 @@ def _retain_or_wipe_scope(
         return
 
     scope_id = scope_dir.name
-    stateful_scopes.pop(scope_id, None)  # re-insert at the MRU end
-    stateful_scopes[scope_id] = None
-    while len(stateful_scopes) > max_stateful_scopes:
-        evicted_id, _ = stateful_scopes.popitem(last=False)
+    evicted: list[str] = []
+    with _SCOPES_LOCK:
+        stateful_scopes.pop(scope_id, None)  # re-insert at the MRU end
+        stateful_scopes[scope_id] = None
+        while len(stateful_scopes) > max_stateful_scopes:
+            # The least recently used scope that no worker is running in right now.
+            victim = next(
+                (k for k in stateful_scopes if k != scope_id and k not in _ACTIVE_SCOPES), None
+            )
+            if victim is None:
+                break
+            del stateful_scopes[victim]
+            evicted.append(victim)
+    for evicted_id in evicted:
         log.info("evicting least-recently-used scope %r to bound stateful growth", evicted_id)
         shutil.rmtree(workdir / evicted_id, ignore_errors=True)
 
@@ -454,6 +560,7 @@ def _poll_once(
     stateful_scopes: OrderedDict[str, None],
     max_stateful_scopes: int,
     allow_bundles: bool = False,
+    cgroup_dir: Path = DEFAULT_CGROUP_DIR,
 ) -> None:
     try:
         token = tokens.get()
@@ -462,11 +569,16 @@ def _poll_once(
         time.sleep(RETRY_DELAY)
         return
     headers = {"Authorization": f"Bearer {token}"}
+    poll_body: dict = {"poolId": pool_id}
+    peak = cgroup_memory_peak(cgroup_dir)
+    if peak is not None:
+        # The runner retires a pod whose high-water mark nears its limit.
+        poll_body["memoryPeakBytes"] = peak
 
     try:
         resp = session.post(
             f"{relay}/v1/tasks/next",
-            json={"poolId": pool_id},
+            json=poll_body,
             timeout=POLL_TIMEOUT,
             headers=headers,
         )
@@ -559,6 +671,8 @@ def _poll_once(
 
     scope_dir = workdir / task_request.scopeId
     scope_dir.mkdir(parents=True, exist_ok=True)
+    with _SCOPES_LOCK:
+        _ACTIVE_SCOPES[task_request.scopeId] = _ACTIVE_SCOPES.get(task_request.scopeId, 0) + 1
     # One client per request: it carries the request id the artifact routes
     # are scoped to, and the executor's token source.
     relay_client = RelayClient(
@@ -622,6 +736,12 @@ def _poll_once(
         log.exception("request %s failed", task_request.requestId)
         payload = {"status": "failed", "error": str(exc)}
     finally:
+        with _SCOPES_LOCK:
+            remaining = _ACTIVE_SCOPES.get(task_request.scopeId, 1) - 1
+            if remaining > 0:
+                _ACTIVE_SCOPES[task_request.scopeId] = remaining
+            else:
+                _ACTIVE_SCOPES.pop(task_request.scopeId, None)
         if is_bundle or is_lease:
             # No execution.mode concept applies to a bundle or a lease -- it
             # never shares a scope with a later request, so it is always

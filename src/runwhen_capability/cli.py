@@ -119,6 +119,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "should enable this.",
     )
 
+    serve_p.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="task runs executed in parallel (poll workers); default: the RW_MAX_CONCURRENT "
+        "env var, else 1",
+    )
+
     run_p = sub.add_parser(
         "run",
         help="run a request against a capability directory, --local a bundle directory's "
@@ -1391,6 +1399,7 @@ def main(argv: list[str] | None = None) -> int:
             capability_dir=Path(args.capability_dir) if args.capability_dir else None,
             token_file=Path(args.token_file) if args.token_file else None,
             allow_bundles=bool(args.allow_bundles) or os.environ.get("RW_ALLOW_BUNDLES") == "1",
+            concurrency=args.concurrency,
         )
         return 0
 
