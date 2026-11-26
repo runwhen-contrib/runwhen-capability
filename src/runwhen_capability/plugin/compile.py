@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     from .deps import CompiledDependency
 
 API_VERSION = "runwhen.com/compiled-plugin/v1"
-DEFAULT_RUNTIME = "generic@1"
 WORKSPACE_PLUGIN = "workspace"
 JSON_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
@@ -172,7 +171,9 @@ def _compile_skill(tree: PluginTree, name: str) -> dict:
         "taskNames": [t["name"] for t in (skill.tasks or {}).get("tasks", [])],
     }
     if skill.tasks is not None:
-        out["runtime"] = skill.tasks.get("runtime", DEFAULT_RUNTIME)
+        # No runtime in tasks.yaml: none compiled, so papi applies the workspace default.
+        if "runtime" in skill.tasks:
+            out["runtime"] = skill.tasks["runtime"]
     return out
 
 
@@ -201,8 +202,9 @@ def _compile_tasks(tree: PluginTree, plugin_name: str, skill_name: str) -> list[
             "title": task["title"],
             "description": task["description"],
             "script": script,
-            "runtime": doc.get("runtime", DEFAULT_RUNTIME),
         }
+        if "runtime" in doc:
+            out["runtime"] = doc["runtime"]
         for key in ("role", "appliesTo"):
             if key in runwhen:
                 out[key] = copy.deepcopy(runwhen[key])

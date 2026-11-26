@@ -106,7 +106,7 @@ class Task(BaseModel):
     title: str = Field(..., max_length=80, min_length=1)
     description: str = Field(..., max_length=1024, min_length=1)
     script: common.RelPath
-    runtime: str = Field(..., pattern="^[a-z0-9]+(-[a-z0-9]+)*@[0-9]+$")
+    runtime: str | None = Field(None, pattern="^[a-z0-9]+(-[a-z0-9]+)*@[0-9]+$")
     role: Role | Role1 | None = None
     appliesTo: common.AppliesTo | None = None
     readOnly: bool
@@ -203,7 +203,7 @@ class CompiledTask(BaseModel):
     title: str = Field(..., max_length=80, min_length=1)
     description: str = Field(..., max_length=1024, min_length=1)
     script: common.RelPath
-    runtime: str = Field(..., pattern="^[a-z0-9]+(-[a-z0-9]+)*@[0-9]+$")
+    runtime: str | None = Field(None, pattern="^[a-z0-9]+(-[a-z0-9]+)*@[0-9]+$")
     role: Role2 | Role3 | None = None
     appliesTo: common.AppliesTo | None = None
     readOnly: bool
