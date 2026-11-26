@@ -165,6 +165,27 @@ DEFAULT_CGROUP_DIR = Path("/sys/fs/cgroup")  # cgroup v2; injectable for tests
 # worker touches.
 _SCOPES_LOCK = threading.Lock()
 _ACTIVE_SCOPES: dict[str, int] = {}
+# One lock per scopeId, so two requests for the same scope never run at the same time in
+# this process: [lock, holders-and-waiters]. Entries are dropped when nobody wants them.
+_SCOPE_LOCKS: dict[str, list] = {}
+WORKER_BACKOFF_START = 1.0
+WORKER_BACKOFF_MAX = 30.0
+
+
+def _acquire_scope(scope_id: str) -> None:
+    with _SCOPES_LOCK:
+        entry = _SCOPE_LOCKS.setdefault(scope_id, [threading.Lock(), 0])
+        entry[1] += 1
+    entry[0].acquire()
+
+
+def _release_scope(scope_id: str) -> None:
+    with _SCOPES_LOCK:
+        entry = _SCOPE_LOCKS[scope_id]
+        entry[1] -= 1
+        if entry[1] <= 0:
+            del _SCOPE_LOCKS[scope_id]
+    entry[0].release()
 
 
 def resolve_concurrency(value: int | str | None = None) -> int:
@@ -189,11 +210,21 @@ def cgroup_memory_limit(cgroup_dir: Path = DEFAULT_CGROUP_DIR) -> int | None:
     return _read_int(Path(cgroup_dir) / "memory.max")
 
 
-def cgroup_memory_peak(cgroup_dir: Path = DEFAULT_CGROUP_DIR) -> int | None:
-    """The cgroup's memory high-water mark: memory.peak, else memory.current, else None."""
+def cgroup_memory_working_set(cgroup_dir: Path = DEFAULT_CGROUP_DIR) -> int | None:
+    """The cgroup's working set, as the kubelet computes it: memory.current minus the
+    `inactive_file` line of memory.stat, floored at 0. None when either is unreadable."""
     cgroup_dir = Path(cgroup_dir)
-    peak = _read_int(cgroup_dir / "memory.peak")
-    return peak if peak is not None else _read_int(cgroup_dir / "memory.current")
+    current = _read_int(cgroup_dir / "memory.current")
+    if current is None:
+        return None
+    try:
+        for line in (cgroup_dir / "memory.stat").read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == "inactive_file":
+                return max(0, current - int(value))
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def serve(
@@ -265,6 +296,9 @@ def serve(
         os.chmod(workdir, 0o711)
     except OSError as exc:
         log.debug("could not chmod %s to 0711: %s", workdir, exc)
+    # NOTE: this per-run RLIMIT_DATA is a per-process virtual-memory cap (it bounds the
+    # data segment/heap mappings, not resident memory), not a per-run RSS limit. The
+    # runner's memory retirement, fed by memoryWorkingSetBytes, is the pod-level backstop.
     limit = cgroup_memory_limit(cgroup_dir) if workers > 1 else None
     set_default_memory_limit(limit // workers if limit else None)
     if workers > 1:
@@ -278,26 +312,34 @@ def serve(
 
     def worker() -> None:
         iterations = 0
+        backoff = WORKER_BACKOFF_START
         while not stop.is_set() and (max_iterations is None or iterations < max_iterations):
             iterations += 1
-            _poll_once(
-                session,
-                relay,
-                pool_id,
-                workdir,
-                capability,
-                tokens,
-                log,
-                stateful_scopes,
-                max_stateful_scopes,
-                allow_bundles,
-                cgroup_dir,
-            )
+            try:
+                _poll_once(
+                    session,
+                    relay,
+                    pool_id,
+                    workdir,
+                    capability,
+                    tokens,
+                    log,
+                    stateful_scopes,
+                    max_stateful_scopes,
+                    allow_bundles,
+                    cgroup_dir,
+                )
+                backoff = WORKER_BACKOFF_START
+            except Exception:  # noqa: BLE001 -- a worker must never silently disappear
+                log.exception("poll worker failed; backing off %.0fs and continuing", backoff)
+                stop.wait(backoff)
+                backoff = min(backoff * 2, WORKER_BACKOFF_MAX)
 
     on_main = threading.current_thread() is threading.main_thread()
     previous = None
     if on_main:
-
+        # A worker that has already picked a task up when SIGTERM arrives runs it to
+        # completion before it exits; only further polls are stopped.
         def on_sigterm(signum, frame):  # noqa: ARG001
             log.info("SIGTERM: no further polls; waiting for in-flight requests")
             stop.set()
@@ -569,10 +611,11 @@ def _poll_once(
         return
     headers = {"Authorization": f"Bearer {token}"}
     poll_body: dict = {"poolId": pool_id}
-    peak = cgroup_memory_peak(cgroup_dir)
-    if peak is not None:
-        # The runner retires a pod whose high-water mark nears its limit.
-        poll_body["memoryPeakBytes"] = peak
+    working_set = cgroup_memory_working_set(cgroup_dir)
+    if working_set is not None:
+        # The runner keeps the per-pod high-water of this and retires the pod as it nears
+        # the pod's memory limit.
+        poll_body["memoryWorkingSetBytes"] = working_set
 
     try:
         resp = session.post(
@@ -669,21 +712,24 @@ def _poll_once(
         return
 
     scope_dir = workdir / task_request.scopeId
+    # Two requests for one scopeId never overlap: taken before the dir is created or used,
+    # released after cleanup / the LRU return.
+    _acquire_scope(task_request.scopeId)
     # Active before the dir exists, so another worker's LRU eviction cannot wipe it under us.
     with _SCOPES_LOCK:
         _ACTIVE_SCOPES[task_request.scopeId] = _ACTIVE_SCOPES.get(task_request.scopeId, 0) + 1
-    scope_dir.mkdir(parents=True, exist_ok=True)
-    # One client per request: it carries the request id the artifact routes
-    # are scoped to, and the executor's token source.
-    relay_client = RelayClient(
-        relay,
-        None,
-        task_request.requestId,
-        session,
-        token_source=tokens,
-        dispatch=task_request.dispatch,
-    )
     try:
+        scope_dir.mkdir(parents=True, exist_ok=True)
+        # One client per request: it carries the request id the artifact routes
+        # are scoped to, and the executor's token source.
+        relay_client = RelayClient(
+            relay,
+            None,
+            task_request.requestId,
+            session,
+            token_source=tokens,
+            dispatch=task_request.dispatch,
+        )
         if is_lease:
             # A V13 lease: plugin code pinned by hash, the same hardened child runner
             # as a bundle, and the bare result envelope as the result.
@@ -753,6 +799,7 @@ def _poll_once(
                 _ACTIVE_SCOPES[task_request.scopeId] = remaining
             else:
                 _ACTIVE_SCOPES.pop(task_request.scopeId, None)
+        _release_scope(task_request.scopeId)
 
     body = _encode_result(payload, log, task_request.maxResultBytes)
     _post_result(session, relay, task_request.requestId, body, tokens, log, task_request.dispatch)

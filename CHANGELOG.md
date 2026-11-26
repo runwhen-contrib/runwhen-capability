@@ -13,8 +13,10 @@ Parallel task runs in one executor pod, and a compiler that leaves the runtime t
 
 - **`rwtask serve --concurrency N` / `RW_MAX_CONCURRENT`** (`serve.py`): N poll workers (threads), default 1, minimum 1. The executor token is read once before they start and shared; each worker long-polls and runs one task run at a time in its own scope dir. The stateful-scope LRU is lock-guarded and never evicts a scope a worker is running in. SIGTERM stops polling and waits for the task runs in flight.
 - **Per-run tool caches** (`bundle.tool_cache_env`): the child's `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `KUBECACHEDIR`, `HELM_CACHE_HOME`, `HELM_CONFIG_HOME`, `HELM_DATA_HOME`, `AZURE_CONFIG_DIR`, `CLOUDSDK_CONFIG`, `PIP_CACHE_DIR`, `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` point inside the run's private `$HOME`, over an image's own ENV. A run's materialized credential env (`KUBECONFIG`, an AWS file) wins. The eight cache names (not `AZURE_CONFIG_DIR`, `CLOUDSDK_CONFIG` or the two AWS file names, which credentials set) join the reserved env names. Not applied to `rwtask run`'s caller-owned HOME.
-- **Per-run memory guard**: with more than one worker and a numeric cgroup v2 `memory.max`, each child gets `RLIMIT_DATA` = limit / concurrency; a smaller explicit per-run limit is kept.
-- **`memoryPeakBytes`** in the `POST /v1/tasks/next` body, from cgroup `memory.peak` (else `memory.current`); omitted when unreadable.
+- **Per-run memory guard**: with more than one worker and a numeric cgroup v2 `memory.max`, each child gets `RLIMIT_DATA` = limit / concurrency; a smaller explicit per-run limit is kept. This is a per-process virtual-memory cap, not a per-run RSS limit; the runner's memory retirement is the pod-level backstop.
+- **`memoryWorkingSetBytes`** in the `POST /v1/tasks/next` body: the cgroup v2 working set, kubelet-style (`memory.current` minus `inactive_file` from `memory.stat`, floor 0); omitted when unreadable. The runner compares its per-pod high-water against the pod's memory limit.
+- **One run per scopeId at a time**: requests with the same `scopeId` are serialized per process (a per-scope lock taken before the scope dir is created, released after cleanup).
+- **Self-healing workers**: a poll worker whose loop raises logs the exception, backs off (1s doubling to 30s) and keeps polling. A task picked up before SIGTERM still runs to completion.
 - `serve` makes the workdir root 0711 at start-up (best effort; scopes stay 0700).
 
 ### Changed

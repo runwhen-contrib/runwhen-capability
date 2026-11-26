@@ -1,11 +1,12 @@
 """rwtask serve with several poll workers (RW_MAX_CONCURRENT / --concurrency): parallel
 task runs in one pod, per-run tool caches, the per-run memory guard and the poll's
-memoryPeakBytes. No relay and no container: a fake session, a fake cgroup directory."""
+memoryWorkingSetBytes. No relay and no container: a fake session, a fake cgroup directory."""
 
 from __future__ import annotations
 
 import json
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from runwhen_capability.serve import (
     _ACTIVE_SCOPES,
     _retain_or_wipe_scope,
     cgroup_memory_limit,
-    cgroup_memory_peak,
+    cgroup_memory_working_set,
     resolve_concurrency,
     serve,
 )
@@ -150,7 +151,7 @@ def test_the_token_is_read_once_before_the_workers_start(tmp_path):
     assert len(session.polls) == 6  # and every worker still polled, with the shared token
 
 
-def test_the_poll_body_carries_memory_peak_bytes_when_readable(tmp_path):
+def test_the_poll_body_carries_the_working_set_when_readable(tmp_path):
     session = _FakeSession(0)
     serve(
         relay=RELAY,
@@ -160,18 +161,32 @@ def test_the_poll_body_carries_memory_peak_bytes_when_readable(tmp_path):
         token_file=_token(tmp_path),
         session=session,
         max_iterations=1,
-        cgroup_dir=_cgroup(tmp_path, memory_peak="12345\n", memory_current="99\n"),
+        cgroup_dir=_cgroup(
+            tmp_path,
+            memory_current="1000\n",
+            memory_stat="anon 5\ninactive_file 300\nactive_file 9\n",
+        ),
     )
-    assert session.polls == [{"poolId": "pool-1", "memoryPeakBytes": 12345}]
+    assert session.polls == [{"poolId": "pool-1", "memoryWorkingSetBytes": 700}]
 
 
-def test_memory_peak_falls_back_to_current_and_is_omitted_when_unreadable(tmp_path):
-    assert cgroup_memory_peak(_cgroup(tmp_path, memory_current="77\n")) == 77
-    assert cgroup_memory_peak(tmp_path / "nowhere") is None
+def test_working_set_floors_at_zero_and_is_omitted_when_unreadable(tmp_path):
+    assert (
+        cgroup_memory_working_set(
+            _cgroup(tmp_path, memory_current="10\n", memory_stat="inactive_file 50\n")
+        )
+        == 0
+    )
+    assert cgroup_memory_working_set(tmp_path / "nowhere") is None
+    no_stat = tmp_path / "nostat"
+    no_stat.mkdir()
+    (no_stat / "memory.current").write_text("77\n")
+    assert cgroup_memory_working_set(no_stat) is None
     junk = tmp_path / "junk"
     junk.mkdir()
-    (junk / "memory.peak").write_text("max\n")
-    assert cgroup_memory_peak(junk) is None
+    (junk / "memory.current").write_text("max\n")
+    (junk / "memory.stat").write_text("inactive_file 1\n")
+    assert cgroup_memory_working_set(junk) is None
     session = _FakeSession(0)
     serve(
         relay=RELAY,
@@ -184,6 +199,76 @@ def test_memory_peak_falls_back_to_current_and_is_omitted_when_unreadable(tmp_pa
         cgroup_dir=tmp_path / "nowhere",
     )
     assert session.polls == [{"poolId": "pool-1"}]
+
+
+def test_two_requests_for_one_scope_never_overlap(tmp_path, monkeypatch):
+    inside = 0
+    peak = 0
+    guard = threading.Lock()
+
+    def fake_run_request(capability, request, credentials, scope_dir, **kwargs):
+        nonlocal inside, peak
+        with guard:
+            inside += 1
+            peak = max(peak, inside)
+        time.sleep(0.2)
+        with guard:
+            inside -= 1
+        return ResultEnvelope(setup=SetupResult(status="ok", outputs={}), tasks=[])
+
+    class SameScope(_FakeSession):
+        def post(self, url, json=None, data=None, timeout=None, headers=None):
+            resp = super().post(url, json, data, timeout, headers)
+            if resp.status_code == 200 and resp._body and "scopeId" in resp._body:
+                resp._body["scopeId"] = "shared"
+            return resp
+
+    monkeypatch.setattr(serve_mod, "run_request", fake_run_request)
+    session = SameScope(2)
+    serve(
+        relay=RELAY,
+        pool_id="pool-1",
+        workdir=tmp_path / "work",
+        capability_dir=FIXTURES / "echo",
+        token_file=_token(tmp_path),
+        session=session,
+        max_iterations=1,
+        concurrency=2,
+        cgroup_dir=_cgroup(tmp_path),
+    )
+    assert len(session.results) == 2
+    assert peak == 1
+    assert not serve_mod._SCOPE_LOCKS
+
+
+def test_a_worker_whose_poll_raises_backs_off_and_keeps_polling(tmp_path, monkeypatch):
+    monkeypatch.setattr(serve_mod, "WORKER_BACKOFF_START", 0.01)
+    real = serve_mod._poll_once
+    boom = {"left": 1}
+    calls = []
+
+    def flaky(*args, **kwargs):
+        calls.append(threading.current_thread().name)
+        if boom["left"] > 0:
+            boom["left"] -= 1
+            raise RuntimeError("transient")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(serve_mod, "_poll_once", flaky)
+    session = _FakeSession(0)
+    serve(
+        relay=RELAY,
+        pool_id="pool-1",
+        workdir=tmp_path / "work",
+        capability_dir=FIXTURES / "echo",
+        token_file=_token(tmp_path),
+        session=session,
+        max_iterations=3,
+        concurrency=2,
+        cgroup_dir=_cgroup(tmp_path),
+    )
+    assert len(calls) == 6  # both workers completed all three iterations
+    assert len(session.polls) == 5  # one iteration raised before polling
 
 
 @pytest.mark.parametrize(
